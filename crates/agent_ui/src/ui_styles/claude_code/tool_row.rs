@@ -4,10 +4,9 @@ use gpui::{
     AnyElement, App, ClickEvent, ElementId, FontWeight, Hsla, SharedString, Window, hsla,
     linear_color_stop, linear_gradient, px,
 };
-use itertools::Itertools as _;
 use ui::prelude::*;
 
-use super::{StepStatus, TIMELINE_GUTTER, TimelineDot, timeline_row};
+use super::{StepStatus, TIMELINE_GUTTER, TimelineDot, display_lines, timeline_row};
 
 const IO_LABEL_WIDTH: Pixels = px(36.);
 const COLLAPSED_OUTPUT_LINES: usize = 3;
@@ -123,14 +122,40 @@ fn io_label(label: &'static str) -> impl IntoElement {
     )
 }
 
-fn io_text(text: SharedString, cx: &App) -> impl IntoElement {
-    div()
+/// One row per line, so that every line starts at the left edge however the
+/// text was produced.
+fn io_text(lines: Vec<SharedString>, cx: &App) -> impl IntoElement {
+    v_flex()
         .flex_1()
         .min_w_0()
         .font_buffer(cx)
         .text_xs()
         .text_color(cx.theme().colors().text)
-        .child(text)
+        .children(lines.into_iter().map(|line| {
+            // An empty row would collapse to zero height.
+            let line = if line.is_empty() { " ".into() } else { line };
+            div().w_full().min_w_0().child(line)
+        }))
+}
+
+/// The lines of tool input or output that a row shows.
+pub(crate) fn visible_io_lines(text: &str, clamped: bool, max_lines: usize) -> Vec<SharedString> {
+    let lines = display_lines(text);
+    let line_count = lines.len();
+    let limit = if clamped {
+        COLLAPSED_OUTPUT_LINES
+    } else {
+        max_lines
+    };
+    let mut visible = lines
+        .into_iter()
+        .take(limit)
+        .map(SharedString::from)
+        .collect::<Vec<_>>();
+    if !clamped && line_count > limit {
+        visible.push(format!("… {} more lines", line_count - limit).into());
+    }
+    visible
 }
 
 fn output_background(cx: &App) -> Hsla {
@@ -168,29 +193,14 @@ impl RenderOnce for ToolRow {
         let output_line_count = self
             .output
             .as_ref()
-            .map(|output| output.lines().count())
+            .map(|output| display_lines(output).len())
             .unwrap_or(0);
         let is_collapsible = output_line_count > COLLAPSED_OUTPUT_LINES;
         let is_clamped = is_collapsible && !self.output_expanded;
         let output_background = output_background(cx);
 
         let output_row = self.output.map(|output| {
-            let visible_output: SharedString = if is_clamped {
-                output
-                    .lines()
-                    .take(COLLAPSED_OUTPUT_LINES)
-                    .join("\n")
-                    .into()
-            } else if output_line_count > MAX_EXPANDED_OUTPUT_LINES {
-                format!(
-                    "{}\n… {} more lines",
-                    output.lines().take(MAX_EXPANDED_OUTPUT_LINES).join("\n"),
-                    output_line_count - MAX_EXPANDED_OUTPUT_LINES
-                )
-                .into()
-            } else {
-                output
-            };
+            let visible_output = visible_io_lines(&output, is_clamped, MAX_EXPANDED_OUTPUT_LINES);
 
             h_flex()
                 .id("output")
@@ -258,7 +268,14 @@ impl RenderOnce for ToolRow {
                                         .px_2p5()
                                         .py_1p5()
                                         .child(io_label("IN"))
-                                        .child(io_text(input, cx)),
+                                        .child(io_text(
+                                            visible_io_lines(
+                                                &input,
+                                                false,
+                                                MAX_EXPANDED_OUTPUT_LINES,
+                                            ),
+                                            cx,
+                                        )),
                                 )
                             })
                             .when_some(output_row, |this, output_row| {
@@ -275,5 +292,52 @@ impl RenderOnce for ToolRow {
                 this.child(div().pl(TIMELINE_GUTTER).child(body))
             })
             .children(self.footer)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn as_strings(lines: Vec<SharedString>) -> Vec<String> {
+        lines.into_iter().map(|line| line.to_string()).collect()
+    }
+
+    #[test]
+    fn test_multi_line_output_rows_start_at_left_edge() {
+        let output = "On branch vszed-main\r\nYour branch is up to date with 'origin/vszed-main'.\r\n\r\nnothing to commit, working tree clean\r\n";
+        assert_eq!(
+            as_strings(visible_io_lines(output, true, MAX_EXPANDED_OUTPUT_LINES)),
+            vec![
+                "On branch vszed-main",
+                "Your branch is up to date with 'origin/vszed-main'.",
+                "",
+            ]
+        );
+        assert_eq!(
+            as_strings(visible_io_lines(output, false, MAX_EXPANDED_OUTPUT_LINES)),
+            vec![
+                "On branch vszed-main",
+                "Your branch is up to date with 'origin/vszed-main'.",
+                "",
+                "nothing to commit, working tree clean",
+            ]
+        );
+        assert_eq!(
+            as_strings(visible_io_lines("a\nb\nc\nd", false, 2)),
+            vec!["a", "b", "… 2 more lines"]
+        );
+    }
+
+    #[test]
+    fn test_multi_line_input_rows() {
+        assert_eq!(
+            as_strings(visible_io_lines(
+                "git status &&\n\tgit log -1",
+                false,
+                MAX_EXPANDED_OUTPUT_LINES
+            )),
+            vec!["git status &&", "    git log -1"]
+        );
     }
 }
