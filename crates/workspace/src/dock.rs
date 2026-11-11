@@ -919,6 +919,11 @@ impl Dock {
         self.panel_entries.len()
     }
 
+    /// Returns the dock's panels in activation priority order.
+    pub fn panels(&self) -> impl Iterator<Item = &Arc<dyn PanelHandle>> {
+        self.panel_entries.iter().map(|entry| &entry.panel)
+    }
+
     pub fn activate_panel(&mut self, panel_ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         if Some(panel_ix) != self.active_panel_index {
             self.restoration.discard_pending();
