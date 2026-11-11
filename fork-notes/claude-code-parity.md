@@ -42,24 +42,26 @@ There is no Thinking toggle option: per the docs Thinking lives in the `/` menu,
 
 | Behavior | Extension | vszed mapping | Status |
 |---|---|---|---|
-| Spark icon in the activity bar opens the sessions list | yes | Session Manager panel in the left dock (B6), surfaced by the Track A activity bar | todo |
+| Spark icon in the activity bar opens the sessions list | yes | "Claude Code" panel in the left dock (B6, `agent::ToggleClaudeCodeSessions`), present only in the Claude Code style; the Track A activity bar picks it up | done |
 | `✻ Claude Code` status bar item, bottom right | yes | status item (B6) | todo |
 | Spark icon in the editor toolbar, top right, when a file is open | yes | pane tab-bar button | todo |
-| Default location: editor tab (`preferredLocation: panel`), or right sidebar | yes | `agent.thread_location: editor` (default for this style) / `panel` | todo |
-| Multiple conversations as separate tabs | yes | one `AgentThreadItem` per session (B5) | todo |
-| Tab status dot: blue = permission pending, orange = finished while hidden | yes | tab icon indicator (B5) | todo |
-| Clicking a session that is already open focuses its tab | yes | B5/B6 | todo |
+| Default location: editor tab (`preferredLocation: panel`), or right sidebar | yes | `agent.thread_location: editor` / `panel`; the style does not switch it yet (the preset action is still todo) | partial |
+| Multiple conversations as separate tabs | yes | one `AgentThreadItem` per session (B5); tabs restore after restart from the saved session id | done |
+| Tab status dot: blue = permission pending, orange = finished while hidden | yes | dot on the tab's agent icon (B5) | done |
+| Clicking a session that is already open focuses its tab | yes | B5/B6: tabs are matched by session id or Zed thread id | done |
 
 ## Sessions
 
+Closing a thread tab while a turn runs asks for confirmation when closed with `pane::CloseActiveItem` (Cmd+W); the tab's close button closes without asking (gap: Zed has no per-item close veto).
+
 | Behavior | Extension | vszed mapping | Status |
 |---|---|---|---|
-| Session list scoped to the current project (user requirement; matches `claude --resume`) | per screenshot and user | ACP `session/list` with `cwd` = each worktree root, filtered by `work_dirs` (B6) | todo |
-| Search by keyword, browse by time | yes | B6 | todo |
-| AI-generated titles from the first message | yes | use the session title from ACP | todo |
-| Hover actions: Rename, Archive; "Archived sessions" group with "Unarchive session" | yes | B6 (archive state in `ThreadMetadataStore`) | todo |
+| Session list scoped to the current project (user requirement; matches `claude --resume`) | per screenshot and user | ACP `session/list` with `cwd` = each visible worktree root (the adapter matches it exactly), results filtered again by `work_dirs` (B6) | done |
+| Search by keyword, browse by time | yes | title search; rows sorted by update time with "now", "5m", "2h", "Yesterday", "3d", dates (B6) | done |
+| AI-generated titles from the first message | yes | the session title from `session/list` (Claude's transcript summary); a Zed rename overrides it | done |
+| Hover actions: Rename, Archive; "Archived sessions" group with "Unarchive session" | yes | B6: Zed-side rename (title override) and archive in `ThreadMetadataStore`; not written back to Claude's store (the adapter's `_session/rename` / `_session/archive` are v1 extensions Zed doesn't call) | partial |
 | Auto-archive inactive sessions after 14 days (setting, 0 = off) | yes | setting + B6 | todo |
-| Sessions started in the terminal CLI appear and resume | yes | comes from ACP `session/list` | todo |
+| Sessions started in the terminal CLI appear and resume | yes | from ACP `session/list`; resume through `ConversationView::new` with the session id | done (not verified against a live CLI session) |
 | "Open here anyway" notice when the session is open in another Claude process | yes | | gap? (check adapter) |
 | Web tab (claude.ai cloud sessions), Account & usage header | yes | | gap (not in ACP) |
 | Resume restores the permission mode, including plan mode | yes | ACP session mode on load | todo |
@@ -123,12 +125,12 @@ User messages render as plain UI-font text in the bordered box (the read-only me
 
 | Command | Binding | Status |
 |---|---|---|
-| Focus input / toggle between editor and Claude | Cmd+Esc / Ctrl+Esc | todo |
-| Open in new tab | Cmd+Shift+Esc / Ctrl+Shift+Esc | todo |
+| Focus input / toggle between editor and Claude | Cmd+Esc / Ctrl+Esc | done (`agent::ToggleThreadTabFocus`; overrides `menu::Cancel` on Cmd/Ctrl+Esc only while the feature is on; on Windows Ctrl+Esc opens the Start menu) |
+| Open in new tab | Cmd+Shift+Esc / Ctrl+Shift+Esc | done (`agent::NewThreadTab`; on Windows Ctrl+Shift+Esc opens Task Manager before Zed sees it) |
 | New conversation (opt-in setting) | Cmd+N / Ctrl+N | todo |
 | Reopen closed session (default on) | Cmd+Shift+T / Ctrl+Shift+T | todo (conflicts with Zed reopen closed item: scope to the Claude tab context) |
 | Insert @-mention of the selection | Option+K / Alt+K | todo |
-| Stop current turn | Esc | todo |
+| Stop current turn | Esc | done (stock `editor::Cancel` in the message editor) |
 
 ## Extension settings to mirror (under `agent.claude_code.*` or similar)
 
