@@ -927,6 +927,11 @@ impl Dock {
         self.panel_entries.len()
     }
 
+    /// Returns the dock's panels in activation priority order.
+    pub fn panels(&self) -> impl Iterator<Item = &Arc<dyn PanelHandle>> {
+        self.panel_entries.iter().map(|entry| &entry.panel)
+    }
+
     pub fn has_agent_panel(&self, cx: &App) -> bool {
         self.panel_entries
             .iter()
