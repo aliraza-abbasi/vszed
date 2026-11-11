@@ -61,6 +61,9 @@ use super::subagent_card::{
 };
 use super::*;
 
+#[path = "../ui_styles/claude_code/thread.rs"]
+mod claude_code_thread;
+
 /// How a parent's view names a subagent. An ACP parent's own title for the subagent
 /// describes it in that view, so it wins over the subagent's title for itself.
 pub(super) fn subagent_label(thread: &AcpThread) -> SharedString {
@@ -7406,6 +7409,9 @@ fn sandbox_network_rows(network: &SandboxNetPolicy) -> Vec<SandboxRow> {
 
 impl ThreadView {
     fn render_entries(&mut self, cx: &mut Context<Self>) -> List {
+        if crate::ui_styles::claude_code_style_enabled(cx) {
+            return self.render_claude_code_entries(cx);
+        }
         let max_content_width = AgentSettings::get_global(cx).max_content_width;
         let centered_container = move |content: AnyElement| {
             h_flex().w_full().justify_center().child(
