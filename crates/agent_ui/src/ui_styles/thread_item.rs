@@ -123,6 +123,7 @@ pub(crate) struct AgentThreadItem {
     conversation_view: Entity<ConversationView>,
     request: ThreadTabRequest,
     workspace: WeakEntity<Workspace>,
+    last_title: Option<SharedString>,
     finished_while_hidden: bool,
     _root_thread_subscription: Option<Subscription>,
     _subscriptions: Vec<Subscription>,
@@ -171,9 +172,14 @@ impl AgentThreadItem {
         });
 
         let subscriptions = vec![
-            cx.observe(&conversation_view, |_, _, cx| {
-                cx.emit(ItemEvent::UpdateTab);
-                cx.notify();
+            // The conversation view notifies on every streamed update; only a
+            // title change needs the tab (and its saved state) updated.
+            cx.observe(&conversation_view, |this, conversation_view, cx| {
+                let title = conversation_view.read(cx).title(cx);
+                if this.last_title.as_ref() != Some(&title) {
+                    this.last_title = Some(title);
+                    cx.emit(ItemEvent::UpdateTab);
+                }
             }),
             cx.subscribe_in(
                 &conversation_view,
@@ -191,6 +197,7 @@ impl AgentThreadItem {
                 ..request
             },
             workspace: workspace_handle,
+            last_title: None,
             finished_while_hidden: false,
             _root_thread_subscription: None,
             _subscriptions: subscriptions,
