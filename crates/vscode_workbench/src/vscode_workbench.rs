@@ -2,10 +2,12 @@
 
 mod activity_bar;
 mod dock_header;
+mod preset;
 mod workbench_settings;
 
 pub use activity_bar::ActivityBar;
 pub use dock_header::DockHeader;
+pub use preset::{RestorePreviousLayout, UseVsCodeLayout};
 pub use workbench_settings::{ActivityBarSettings, WorkbenchSettings};
 
 use std::sync::Arc;
@@ -24,6 +26,7 @@ const TERMINAL_PANEL_KEY: &str = "TerminalPanel";
 pub fn init(cx: &mut App) {
     activity_bar::init(cx);
     dock_header::init(cx);
+    preset::init(cx);
 }
 
 /// The VS Code name of the view a panel stands for, used for side bar titles and
