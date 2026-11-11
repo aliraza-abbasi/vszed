@@ -394,10 +394,19 @@ impl LayoutSnapshot {
         self.tab_diagnostics = Some(ShowDiagnostics::Errors);
         self.minimap = Some(ShowMinimap::Always);
         self.breadcrumbs = Some(true);
-        // VS Code's defaults on macOS.
-        self.buffer_font_family = Some(FontFamilyName("Menlo".into()));
-        self.buffer_font_size = Some(FontSize(12.));
-        self.ui_font_size = Some(FontSize(13.));
+        // VS Code's per-platform editor defaults, from its `fontInfo.ts`.
+        let (buffer_font_family, buffer_font_size) = if cfg!(target_os = "macos") {
+            ("Menlo", 12.)
+        } else if cfg!(target_os = "windows") {
+            ("Consolas", 14.)
+        } else {
+            ("Droid Sans Mono", 14.)
+        };
+        self.buffer_font_family = Some(FontFamilyName(buffer_font_family.into()));
+        self.buffer_font_size = Some(FontSize(buffer_font_size));
+        // Zed renders most UI labels at 0.875 of `ui_font_size`, so 15 gives
+        // VS Code's 13px workbench text.
+        self.ui_font_size = Some(FontSize(15.));
     }
 }
 
@@ -507,9 +516,16 @@ mod tests {
         assert_eq!(applied["tabs"]["show_diagnostics"], json!("errors"));
         assert_eq!(applied["minimap"]["show"], json!("always"));
         assert_eq!(applied["toolbar"]["breadcrumbs"], json!(true));
-        assert_eq!(applied["buffer_font_family"], json!("Menlo"));
-        assert_eq!(applied["buffer_font_size"], json!(12.0));
-        assert_eq!(applied["ui_font_size"], json!(13.0));
+        let (expected_font_family, expected_font_size) = if cfg!(target_os = "macos") {
+            ("Menlo", 12.0)
+        } else if cfg!(target_os = "windows") {
+            ("Consolas", 14.0)
+        } else {
+            ("Droid Sans Mono", 14.0)
+        };
+        assert_eq!(applied["buffer_font_family"], json!(expected_font_family));
+        assert_eq!(applied["buffer_font_size"], json!(expected_font_size));
+        assert_eq!(applied["ui_font_size"], json!(15.0));
         assert_eq!(
             applied["theme"],
             json!("One Dark"),
