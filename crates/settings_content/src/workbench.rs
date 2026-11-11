@@ -14,6 +14,22 @@ pub struct WorkbenchSettingsContent {
     ///
     /// Default: false
     pub dock_headers: Option<bool>,
+    /// Whether to show the command center in the middle of the title bar: back
+    /// and forward buttons and a search box that opens the file finder.
+    ///
+    /// Default: false
+    pub command_center: Option<bool>,
+    /// Whether to show buttons at the end of the title bar that toggle the side
+    /// bars and the panel, next to a menu for customizing the layout.
+    ///
+    /// Default: false
+    pub layout_controls: Option<bool>,
+    /// Whether to show VS Code's status bar items (a remote indicator, the git
+    /// branch, problem counts and a notifications bell) and to order the editor
+    /// items like VS Code does.
+    ///
+    /// Default: false
+    pub status_bar: Option<bool>,
 }
 
 #[with_fallible_options]
