@@ -8,6 +8,12 @@ use settings_macros::{MergeFrom, with_fallible_options};
 pub struct WorkbenchSettingsContent {
     /// Settings for the activity bar shown on the left edge of the workspace.
     pub activity_bar: Option<ActivityBarSettingsContent>,
+    /// Whether to show VS Code style headers above the docks: a view title for
+    /// the left dock, an icon tab strip for the right dock and text tabs for the
+    /// bottom dock.
+    ///
+    /// Default: false
+    pub dock_headers: Option<bool>,
 }
 
 #[with_fallible_options]
