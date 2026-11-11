@@ -138,6 +138,7 @@ pub(crate) struct ClaudeCodeSessionsPanel {
     show_archived: bool,
     renaming: Option<(acp_v2::SessionId, Entity<Editor>)>,
     position: DockPosition,
+    has_requested_sessions: bool,
     _refresh_task: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
@@ -178,6 +179,7 @@ impl ClaudeCodeSessionsPanel {
             show_archived: false,
             renaming: None,
             position: DockPosition::Left,
+            has_requested_sessions: false,
             _refresh_task: Task::ready(()),
             _subscriptions: subscriptions,
         }
@@ -197,6 +199,7 @@ impl ClaudeCodeSessionsPanel {
         let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
+        self.has_requested_sessions = true;
         let roots = self.project_roots(cx);
         let agent = claude_agent();
         let thread_store = global_thread_store(cx);
@@ -288,7 +291,7 @@ impl ClaudeCodeSessionsPanel {
             })
             .filter(|row| query.is_empty() || row.title.to_lowercase().contains(&query))
             .collect::<Vec<_>>();
-        rows.sort_by(|left, right| right.session.updated_at.cmp(&left.session.updated_at));
+        rows.sort_by_key(|row| std::cmp::Reverse(row.session.updated_at));
         rows
     }
 
@@ -333,7 +336,7 @@ impl ClaudeCodeSessionsPanel {
                     panel.load_agent_thread(
                         claude_agent(),
                         thread_id,
-                        Some(PathList::new(&[session.cwd.clone()])),
+                        Some(PathList::new(std::slice::from_ref(&session.cwd))),
                         Some(title),
                         true,
                         AgentThreadSource::AgentPanel,
@@ -454,6 +457,7 @@ impl ClaudeCodeSessionsPanel {
             .as_ref()
             .filter(|(session_id, _)| session_id == &session.session_id)
             .map(|(_, editor)| editor.clone());
+        let is_renaming = renaming_editor.is_some();
         let time = row
             .session
             .updated_at
@@ -497,7 +501,7 @@ impl ClaudeCodeSessionsPanel {
             .child(
                 h_flex()
                     .flex_none()
-                    .visible_on_hover(group.clone())
+                    .visible_on_hover(group)
                     .gap_0p5()
                     .when(!row.archived, |this| {
                         this.child(
@@ -545,9 +549,11 @@ impl ClaudeCodeSessionsPanel {
                     .color(Color::Muted)
                     .flex_none(),
             )
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.open_session(&session, title.clone(), window, cx);
-            }))
+            .when(!is_renaming, |this| {
+                this.on_click(cx.listener(move |this, _, window, cx| {
+                    this.open_session(&session, title.clone(), window, cx);
+                }))
+            })
     }
 }
 
@@ -598,9 +604,9 @@ fn ensure_metadata(
                 updated_at,
                 created_at: None,
                 interacted_at: None,
-                worktree_paths: project::WorktreePaths::from_folder_paths(&PathList::new(&[
-                    session.cwd.clone(),
-                ])),
+                worktree_paths: project::WorktreePaths::from_folder_paths(&PathList::new(
+                    std::slice::from_ref(&session.cwd),
+                )),
                 remote_connection: None,
                 archived: false,
             },
@@ -673,7 +679,12 @@ impl Panel for ClaudeCodeSessionsPanel {
 }
 
 impl Render for ClaudeCodeSessionsPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Listing starts the Claude agent, so wait until the panel is first shown.
+        if !self.has_requested_sessions {
+            self.has_requested_sessions = true;
+            cx.defer_in(window, |this, window, cx| this.refresh(window, cx));
+        }
         let rows = self.rows(cx);
         let (archived, active): (Vec<_>, Vec<_>) = rows.into_iter().partition(|row| row.archived);
         let archived_count = archived.len();
