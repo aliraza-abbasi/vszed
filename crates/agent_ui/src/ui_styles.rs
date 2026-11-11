@@ -1,4 +1,5 @@
 pub(crate) mod claude_code;
+pub(crate) mod thread_item;
 
 use gpui::App;
 use settings::{AgentThreadLocation, AgentUiStyle, RegisterSetting, Settings, SettingsContent};
@@ -12,7 +13,6 @@ use settings::{AgentThreadLocation, AgentUiStyle, RegisterSetting, Settings, Set
 #[derive(Clone, Copy, Debug, RegisterSetting)]
 pub(crate) struct AgentUiStyleSettings {
     pub ui_style: AgentUiStyle,
-    #[allow(dead_code, reason = "read once threads can open as editor tabs")]
     pub thread_location: AgentThreadLocation,
 }
 
@@ -34,4 +34,5 @@ pub(crate) fn claude_code_style_enabled(cx: &App) -> bool {
 
 pub(crate) fn init(cx: &mut App) {
     claude_code::init(cx);
+    thread_item::init(cx);
 }
