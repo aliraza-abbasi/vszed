@@ -5566,6 +5566,9 @@ impl ThreadView {
                 )
                 .into_any_element();
         }
+        if crate::ui_styles::claude_code_style_enabled(cx) {
+            return self.render_claude_code_message_editor(window, cx);
+        }
 
         let focus_handle = self.message_editor.focus_handle(cx);
         let editor_bg_color = cx.theme().colors().editor_background;
