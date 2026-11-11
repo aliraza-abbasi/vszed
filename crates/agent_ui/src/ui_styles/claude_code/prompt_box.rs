@@ -94,7 +94,7 @@ impl ThreadView {
         let config_options = self.claude_code_config_options(cx);
         let model_chip = match &config_options {
             Some(config_options) => self
-                .render_claude_code_model_chip(config_options, cx)
+                .render_claude_code_model_chip(config_options)
                 .map(IntoElement::into_any_element),
             None => self
                 .model_selector
@@ -103,7 +103,7 @@ impl ThreadView {
         };
         let mode_chip = match &config_options {
             Some(config_options) => self
-                .render_claude_code_mode_chip(config_options, cx)
+                .render_claude_code_mode_chip(config_options)
                 .map(IntoElement::into_any_element),
             None => self
                 .mode_selector
@@ -165,13 +165,6 @@ impl ThreadView {
             .border_1()
             .border_color(border_color)
             .bg(editor_background)
-            .cursor_text()
-            .on_click(cx.listener(|this, _, window, cx| {
-                let focus_handle = this.message_editor.focus_handle(cx);
-                if !focus_handle.contains_focused(window, cx) {
-                    window.focus(&focus_handle, cx);
-                }
-            }))
             .child(
                 div()
                     .w_full()
@@ -293,7 +286,6 @@ impl ThreadView {
     fn render_claude_code_model_chip(
         &self,
         config_options: &ConfigOptionsHandle,
-        _cx: &Context<Self>,
     ) -> Option<impl IntoElement> {
         let options = config_options.options();
         let label = model_chip_label(&options)?;
@@ -323,7 +315,6 @@ impl ThreadView {
     fn render_claude_code_mode_chip(
         &self,
         config_options: &ConfigOptionsHandle,
-        _cx: &Context<Self>,
     ) -> Option<impl IntoElement> {
         let options = config_options.options();
         let mode_option =
