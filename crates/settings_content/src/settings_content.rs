@@ -11,6 +11,7 @@ mod serde_helper;
 mod terminal;
 mod theme;
 mod title_bar;
+mod workbench;
 mod workspace;
 
 pub use action::{ActionName, ActionWithArguments, CommandAliasTarget};
@@ -31,6 +32,7 @@ use settings_json::parse_json_with_comments;
 pub use terminal::*;
 pub use theme::*;
 pub use title_bar::*;
+pub use workbench::*;
 pub use workspace::*;
 
 use collections::{HashMap, IndexMap, IndexSet};
@@ -323,6 +325,9 @@ pub struct SettingsContent {
     /// Settings related to Vim mode in Zed.
     pub vim: Option<VimSettingsContent>,
 
+    /// Settings for the optional VS Code style workbench.
+    pub workbench: Option<WorkbenchSettingsContent>,
+
     /// Number of lines to search for modelines at the beginning and end of files.
     /// Modelines contain editor directives (e.g., vim/emacs settings) that configure
     /// the editor behavior for specific files.
@@ -413,7 +418,7 @@ fallible_options::flattened_deserialize!(SettingsContent {
         journal, log, line_indicator_format, language_models, copilot, outline_panel, project_panel,
         node, proxy, reduce_motion, server_url, credentials_url, session, telemetry, terminal,
         title_bar, vim_mode, calls, which_key, vim, modeline_lines, feature_flags,
-        instrumentation,
+        instrumentation, workbench,
     },
     defaults: {},
 });
