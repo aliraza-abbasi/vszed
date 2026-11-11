@@ -10,8 +10,8 @@ use workspace::{
 };
 
 use crate::{
-    DEBUG_PANEL_KEY, GIT_PANEL_KEY, PROJECT_PANEL_KEY, WorkbenchSettings, is_active_panel,
-    reveal_panel,
+    DEBUG_PANEL_KEY, GIT_PANEL_KEY, PROJECT_PANEL_KEY, UseVsCodeLayout, WorkbenchSettings,
+    is_active_panel, reveal_panel,
 };
 
 const ACTIVITY_BAR_WIDTH: Pixels = px(48.);
@@ -422,6 +422,8 @@ fn render_manage_menu() -> impl IntoElement {
                     "Extensions",
                     zed_actions::Extensions::default().boxed_clone(),
                 )
+                .separator()
+                .action("Use VS Code Layout", UseVsCodeLayout.boxed_clone())
                 .separator()
                 .action("Check for Updates", auto_update::Check.boxed_clone())
             }))
