@@ -1822,4 +1822,13 @@
       "escape": "tabular_data::ClearSelection",
     },
   },
+  {
+    // Agent thread tabs (`agent.thread_location: "editor"`), as in the Claude Code extension.
+    // The actions defer to the stock bindings unless thread tabs or the Claude Code style are on.
+    "context": "Workspace",
+    "bindings": {
+      "cmd-escape": "agent::ToggleThreadTabFocus",
+      "cmd-shift-escape": "agent::NewThreadTab",
+    },
+  },
 ]
