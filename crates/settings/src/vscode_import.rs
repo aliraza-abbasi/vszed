@@ -242,6 +242,7 @@ impl VsCodeSettings {
             title_bar: None,
             vim: None,
             vim_mode: None,
+            workbench: None,
             workspace: self.workspace_settings_content(),
             which_key: None,
             modeline_lines: None,
