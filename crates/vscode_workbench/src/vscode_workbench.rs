@@ -1,22 +1,48 @@
 //! An optional VS Code style workbench layered on top of the Zed workspace.
 
 mod activity_bar;
+mod dock_header;
 mod workbench_settings;
 
 pub use activity_bar::ActivityBar;
+pub use dock_header::DockHeader;
 pub use workbench_settings::{ActivityBarSettings, WorkbenchSettings};
 
 use std::sync::Arc;
 
-use gpui::{App, Entity, Focusable as _, Window};
-use workspace::dock::{Dock, PanelHandle};
+use gpui::{App, Entity, Focusable as _, SharedString, Window};
+use workspace::dock::{Dock, DockPosition, PanelHandle};
 
 const PROJECT_PANEL_KEY: &str = "ProjectPanel";
 const GIT_PANEL_KEY: &str = "GitPanel";
 const DEBUG_PANEL_KEY: &str = "DebugPanel";
+const OUTLINE_PANEL_KEY: &str = "OutlinePanel";
+const COLLABORATION_PANEL_KEY: &str = "CollaborationPanel";
+const AGENT_PANEL_KEY: &str = "agent_panel";
+const TERMINAL_PANEL_KEY: &str = "TerminalPanel";
 
 pub fn init(cx: &mut App) {
     activity_bar::init(cx);
+    dock_header::init(cx);
+}
+
+/// The VS Code name of the view a panel stands for, used for side bar titles and
+/// bottom panel tabs.
+fn panel_title(panel: &dyn PanelHandle, position: DockPosition) -> SharedString {
+    let title = match panel.panel_key() {
+        PROJECT_PANEL_KEY => "EXPLORER",
+        GIT_PANEL_KEY => "SOURCE CONTROL",
+        // Zed has a single debugger panel. VS Code calls it Run and Debug in a side
+        // bar and Debug Console in the bottom panel.
+        DEBUG_PANEL_KEY if position == DockPosition::Bottom => "DEBUG CONSOLE",
+        DEBUG_PANEL_KEY => "RUN AND DEBUG",
+        OUTLINE_PANEL_KEY => "OUTLINE",
+        COLLABORATION_PANEL_KEY => "COLLABORATION",
+        AGENT_PANEL_KEY => "AGENT",
+        TERMINAL_PANEL_KEY => "TERMINAL",
+        _ => return panel.persistent_name().to_uppercase().into(),
+    };
+    title.into()
 }
 
 fn is_active_panel(dock: &Dock, panel: &Arc<dyn PanelHandle>) -> bool {
