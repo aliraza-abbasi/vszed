@@ -3,12 +3,18 @@
 // `ThreadView`'s private state and render helpers without widening their
 // visibility upstream.
 
+#[path = "prompt_box.rs"]
+mod claude_code_prompt_box;
+
 use super::*;
 use crate::ui_styles::claude_code::{
     ClaudeCodeSpinnerElement, StepStatus, TIMELINE_GUTTER, TimelineDot, ToolRow, edit_line_stats,
     format_timestamp, summarize_tool_call, thought_label, thread_activity, timeline_row,
     tool_output_text,
 };
+use editor::{EditorElement, EditorStyle};
+use gpui::TextStyle;
+use theme_settings::ThemeSettings;
 
 impl ThreadView {
     pub(super) fn render_claude_code_entries(&mut self, cx: &mut Context<Self>) -> List {
@@ -318,12 +324,52 @@ impl ThreadView {
                                         style.border_color(focus_border.opacity(0.8))
                                     })
                                 })
-                                .child(editor),
+                                .child(if editing {
+                                    editor.into_any_element()
+                                } else {
+                                    Self::render_claude_code_sent_message(&editor, cx)
+                                }),
                         )
                         .children(edit_controls),
                 )
                 .into_any_element(),
         )
+    }
+
+    /// A sent message reads as plain UI text directly inside its box, like
+    /// Claude Code. The message's own editor still renders it, so mention
+    /// creases stay, and clicking it focuses the editor to start editing,
+    /// which switches to the full `MessageEditor`.
+    fn render_claude_code_sent_message(
+        message_editor: &Entity<MessageEditor>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let editor = message_editor.read(cx).editor().clone();
+        let settings = ThemeSettings::get_global(cx);
+        let text_style = TextStyle {
+            color: cx.theme().colors().text,
+            font_family: settings.ui_font.family.clone(),
+            font_fallbacks: settings.ui_font.fallbacks.clone(),
+            font_features: settings.ui_font.features.clone(),
+            font_size: settings.agent_ui_font_size(cx).into(),
+            font_weight: settings.ui_font.weight,
+            line_height: relative(1.5),
+            ..Default::default()
+        };
+        div()
+            .w_full()
+            .child(EditorElement::new(
+                &editor,
+                EditorStyle {
+                    background: gpui::transparent_black(),
+                    local_player: cx.theme().players().local(),
+                    text: text_style,
+                    syntax: cx.theme().syntax().clone(),
+                    inlay_hints_style: editor::make_inlay_hints_style(cx),
+                    ..Default::default()
+                },
+            ))
+            .into_any_element()
     }
 
     fn render_claude_code_assistant_message(
@@ -986,6 +1032,76 @@ mod tests {
         set_ui_style("zed", cx);
         assert!(cx.debug_bounds("claude-code-user-message-0").is_none());
         assert!(cx.debug_bounds("claude-code-tool-1").is_none());
+    }
+
+    fn placeholder(message_editor: &Entity<MessageEditor>, cx: &mut VisualTestContext) -> String {
+        message_editor.update(cx, |message_editor, cx| {
+            message_editor
+                .editor()
+                .update(cx, |editor, cx| editor.placeholder_text(cx))
+                .unwrap_or_default()
+        })
+    }
+
+    #[gpui::test]
+    async fn test_claude_code_prompt_box(cx: &mut TestAppContext) {
+        let connection = StubAgentConnection::new();
+        let (thread_view, cx) = setup_thread_view(connection.clone(), cx).await;
+        let message_editor = thread_view.read_with(cx, |view, _| view.message_editor.clone());
+        let zed_placeholder = placeholder(&message_editor, cx);
+        assert!(cx.debug_bounds("claude-code-prompt-box").is_none());
+
+        set_ui_style("claude_code", cx);
+        assert!(cx.debug_bounds("claude-code-prompt-box").is_some());
+        assert_eq!(placeholder(&message_editor, cx), "Message Test…");
+
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("Hello", window, cx);
+        });
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+        assert_eq!(placeholder(&message_editor, cx), "Queue another message…");
+
+        let session_id =
+            thread_view.read_with(cx, |view, cx| view.thread.read(cx).session_id().clone());
+        connection.end_turn(session_id, acp_v1::StopReason::EndTurn);
+        cx.run_until_parked();
+        assert_eq!(placeholder(&message_editor, cx), "Message Test…");
+
+        set_ui_style("zed", cx);
+        assert!(cx.debug_bounds("claude-code-prompt-box").is_none());
+        assert_eq!(placeholder(&message_editor, cx), zed_placeholder);
+    }
+
+    #[gpui::test]
+    async fn test_claude_code_slash_button_opens_commands(cx: &mut TestAppContext) {
+        let (thread_view, cx) = setup_thread_view(StubAgentConnection::new(), cx).await;
+        set_ui_style("claude_code", cx);
+        let message_editor = thread_view.read_with(cx, |view, _| view.message_editor.clone());
+
+        thread_view.update_in(cx, |view, window, cx| {
+            view.open_claude_code_slash_menu(window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            message_editor.read_with(cx, |editor, cx| editor.text(cx)),
+            "/"
+        );
+
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("explain", window, cx);
+            editor.editor().update(cx, |editor, cx| {
+                editor.move_to_end(&editor::actions::MoveToEnd, window, cx)
+            });
+        });
+        thread_view.update_in(cx, |view, window, cx| {
+            view.open_claude_code_slash_menu(window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            message_editor.read_with(cx, |editor, cx| editor.text(cx)),
+            "explain /"
+        );
     }
 
     #[gpui::test]

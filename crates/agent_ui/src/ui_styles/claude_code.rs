@@ -16,7 +16,7 @@ use gpui::{
     Animation, AnimationExt as _, App, Context, ElementId, EntityId, Global, Hsla, Pixels,
     pulsating_between, px,
 };
-use settings::{Settings as _, SettingsStore};
+use settings::{AgentUiStyle, Settings as _, SettingsStore};
 use ui::prelude::*;
 
 use super::AgentUiStyleSettings;
@@ -29,6 +29,42 @@ const TIMELINE_DOT_SIZE: Pixels = px(7.);
 /// The `_meta` namespace claude-agent-acp uses for Claude Code specific data.
 const CLAUDE_CODE_META_KEY: &str = "claudeCode";
 const CLAUDE_CODE_TOOL_NAME_KEY: &str = "toolName";
+/// claude-agent-acp's config option id for Ultracode (`src/session-config-ids.ts`).
+const ULTRACODE_CONFIG_ID: &str = "ultracode";
+/// The built-in tools claude-agent-acp reports by name (`src/tool-calls/reporters`).
+const CLAUDE_CODE_TOOL_NAMES: &[&str] = &[
+    "Agent",
+    "AskUserQuestion",
+    "Bash",
+    "BashOutput",
+    "Edit",
+    "EnterPlanMode",
+    "ExitPlanMode",
+    "Glob",
+    "Grep",
+    "KillShell",
+    "ListAgents",
+    "Monitor",
+    "MultiEdit",
+    "NotebookEdit",
+    "PowerShell",
+    "Read",
+    "ReportFindings",
+    "SendMessage",
+    "Skill",
+    "Task",
+    "TaskCreate",
+    "TaskGet",
+    "TaskList",
+    "TaskStop",
+    "TaskUpdate",
+    "TodoWrite",
+    "WebFetch",
+    "WebSearch",
+    "Write",
+];
+/// Tab stops used when laying out tool input and output as plain text.
+const TAB_WIDTH: usize = 4;
 
 /// Skip computing line stats for edits whose text is too large to diff on every render.
 const MAX_DIFF_STATS_INPUT_BYTES: usize = 256 * 1024;
@@ -151,6 +187,9 @@ pub(crate) fn timeline_row(
 /// when each user message was sent and how long each thought streamed for.
 #[derive(Default)]
 pub(crate) struct ThreadActivity {
+    /// The placeholder Zed's own style set on the message editor, restored when
+    /// switching back from the Claude Code style.
+    zed_placeholder: Option<String>,
     last_activity_at: Option<Instant>,
     thoughts: HashMap<(usize, usize), ThoughtTiming>,
     user_messages_sent_at: HashMap<usize, DateTime<Local>>,
@@ -268,8 +307,8 @@ pub(crate) fn thread_activity(thread_view_id: EntityId, cx: &App) -> Option<&Thr
 }
 
 pub(crate) fn init(cx: &mut App) {
-    cx.observe_new(|thread_view: &mut ThreadView, _window, cx| {
-        track_thread_view(thread_view, cx);
+    cx.observe_new(|thread_view: &mut ThreadView, window, cx| {
+        track_thread_view(thread_view, window, cx);
     })
     .detach();
 }
@@ -278,7 +317,11 @@ pub(crate) fn init(cx: &mut App) {
 /// so that switching to the Claude Code style mid-thread still knows recent
 /// timings. Also re-measures the list when the style changes, because every
 /// row changes height.
-fn track_thread_view(thread_view: &mut ThreadView, cx: &mut Context<ThreadView>) {
+fn track_thread_view(
+    thread_view: &mut ThreadView,
+    window: Option<&mut Window>,
+    cx: &mut Context<ThreadView>,
+) {
     let thread_view_id = cx.entity_id();
     cx.default_global::<ClaudeCodeActivity>()
         .threads
@@ -298,14 +341,32 @@ fn track_thread_view(thread_view: &mut ThreadView, cx: &mut Context<ThreadView>)
     });
 
     let mut ui_style = AgentUiStyleSettings::get_global(cx).ui_style;
-    let settings_subscription = cx.observe_global::<SettingsStore>(move |thread_view, cx| {
+    let on_settings_changed = move |thread_view: &mut ThreadView,
+                                    window: Option<&mut Window>,
+                                    cx: &mut Context<ThreadView>| {
         let new_ui_style = AgentUiStyleSettings::get_global(cx).ui_style;
-        if new_ui_style != ui_style {
-            ui_style = new_ui_style;
-            thread_view.list_state.remeasure();
-            cx.notify();
+        if new_ui_style == ui_style {
+            return;
         }
-    });
+        ui_style = new_ui_style;
+        thread_view.list_state.remeasure();
+        if new_ui_style != AgentUiStyle::ClaudeCode
+            && let Some(window) = window
+        {
+            restore_zed_placeholder(thread_view, window, cx);
+        }
+        cx.notify();
+    };
+    let settings_subscription = match window {
+        Some(window) => cx.observe_global_in::<SettingsStore>(window, {
+            let mut on_settings_changed = on_settings_changed;
+            move |thread_view, window, cx| on_settings_changed(thread_view, Some(window), cx)
+        }),
+        None => cx.observe_global::<SettingsStore>({
+            let mut on_settings_changed = on_settings_changed;
+            move |thread_view, cx| on_settings_changed(thread_view, None, cx)
+        }),
+    };
 
     let release_subscription = cx.on_release(move |_, cx| {
         cx.default_global::<ClaudeCodeActivity>()
@@ -318,6 +379,25 @@ fn track_thread_view(thread_view: &mut ThreadView, cx: &mut Context<ThreadView>)
         settings_subscription,
         release_subscription,
     ]);
+}
+
+fn restore_zed_placeholder(
+    thread_view: &mut ThreadView,
+    window: &mut Window,
+    cx: &mut Context<ThreadView>,
+) {
+    let thread_view_id = cx.entity_id();
+    let Some(placeholder) = cx
+        .default_global::<ClaudeCodeActivity>()
+        .threads
+        .get_mut(&thread_view_id)
+        .and_then(|activity| activity.zed_placeholder.take())
+    else {
+        return;
+    };
+    thread_view.message_editor.update(cx, |message_editor, cx| {
+        message_editor.set_placeholder_text(&placeholder, window, cx);
+    });
 }
 
 pub(crate) fn thought_label(duration: Option<Duration>, is_streaming: bool) -> SharedString {
@@ -376,12 +456,26 @@ pub(crate) struct ToolCallSummary {
     pub input: Option<SharedString>,
 }
 
+/// Whether `name` is a tool name Claude Code itself shows. claude-agent-acp
+/// reports it as the ACP v2 tool call `name` (and as `_meta.claudeCode.toolName`
+/// over ACP v1), while other agents report their own internal names there.
+fn is_claude_code_tool_name(name: &str) -> bool {
+    CLAUDE_CODE_TOOL_NAMES.contains(&name) || name.starts_with("mcp__")
+}
+
 pub(crate) fn summarize_tool_call(tool_call: &ToolCall, label: &str) -> ToolCallSummary {
     let label = label.trim();
     let is_execute = matches!(tool_call.kind(), acp_v2::ToolKind::Execute);
 
-    let name =
-        claude_code_tool_name(tool_call.meta.as_ref()).unwrap_or_else(|| match tool_call.kind() {
+    let reported_name = tool_call
+        .name
+        .as_ref()
+        .or(tool_call.tool_name.as_ref())
+        .filter(|name| is_claude_code_tool_name(name.trim()))
+        .map(|name| SharedString::from(name.trim().to_string()));
+    let name = claude_code_tool_name(tool_call.meta.as_ref())
+        .or(reported_name)
+        .unwrap_or_else(|| match tool_call.kind() {
             acp_v2::ToolKind::Execute => "Bash".into(),
             acp_v2::ToolKind::Read => "Read".into(),
             acp_v2::ToolKind::Edit | acp_v2::ToolKind::Delete | acp_v2::ToolKind::Move => {
@@ -432,19 +526,63 @@ pub(crate) fn summarize_tool_call(tool_call: &ToolCall, label: &str) -> ToolCall
 }
 
 /// Removes a single fenced code block wrapper, which agents commonly use to
-/// send tool output as markdown.
+/// send tool output as markdown. claude-agent-acp lengthens the fence when the
+/// text itself contains backtick runs, so the closing fence must match the
+/// opening one's length.
 fn strip_code_fence(text: &str) -> &str {
     let trimmed = text.trim();
-    let Some(after_fence) = trimmed.strip_prefix("```") else {
+    let fence_len = trimmed
+        .chars()
+        .take_while(|character| *character == '`')
+        .count();
+    if fence_len < 3 {
         return trimmed;
-    };
+    }
+    let (fence, after_fence) = trimmed.split_at(fence_len);
     let Some((_info, body)) = after_fence.split_once('\n') else {
         return trimmed;
     };
-    body.trim_end()
-        .strip_suffix("```")
-        .map(|body| body.trim_end_matches('\n'))
-        .unwrap_or(trimmed)
+    let body = body.trim_end();
+    let Some(body) = body.strip_suffix(fence) else {
+        return trimmed;
+    };
+    if body.ends_with('`') {
+        return trimmed;
+    }
+    body.trim_end_matches(['\n', '\r'])
+}
+
+/// Splits tool input or output into the lines to display. CRLF and lone CR
+/// line endings both end a line, and tabs are expanded to spaces, because the
+/// text is laid out one row per line rather than by a terminal.
+pub(crate) fn display_lines(text: &str) -> Vec<String> {
+    let text = text.trim_end_matches(['\n', '\r']);
+    if text.is_empty() {
+        return Vec::new();
+    }
+    text.split('\n')
+        .flat_map(|line| line.strip_suffix('\r').unwrap_or(line).split('\r'))
+        .map(expand_tabs)
+        .collect()
+}
+
+fn expand_tabs(line: &str) -> String {
+    if !line.contains('\t') {
+        return line.to_string();
+    }
+    let mut expanded = String::with_capacity(line.len() + TAB_WIDTH);
+    let mut column = 0;
+    for character in line.chars() {
+        if character == '\t' {
+            let spaces = TAB_WIDTH - column % TAB_WIDTH;
+            expanded.extend(std::iter::repeat_n(' ', spaces));
+            column += spaces;
+        } else {
+            expanded.push(character);
+            column += 1;
+        }
+    }
+    expanded
 }
 
 /// Plain-text output of a tool call for the OUT row. Diffs, images and other
@@ -553,6 +691,198 @@ pub(crate) fn edit_line_stats(tool_call: &ToolCall) -> Option<(usize, usize)> {
                 (added + pair_added, removed + pair_removed)
             }),
     )
+}
+
+/// The value of one entry of a select config option.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ConfigOptionEntry {
+    pub value: acp_v2::SessionConfigValueId,
+    pub name: String,
+    pub description: Option<String>,
+}
+
+pub(crate) fn select_entries(select: &acp_v2::SessionConfigSelect) -> Vec<ConfigOptionEntry> {
+    let to_entry = |option: &acp_v2::SessionConfigSelectOption| ConfigOptionEntry {
+        value: option.value.clone(),
+        name: option.name.clone(),
+        description: option.description.clone(),
+    };
+    match &select.options {
+        acp_v2::SessionConfigSelectOptions::Ungrouped(options) => {
+            options.iter().map(to_entry).collect()
+        }
+        acp_v2::SessionConfigSelectOptions::Grouped(groups) => groups
+            .iter()
+            .flat_map(|group| group.options.iter().map(to_entry))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn current_select_entry(option: &acp_v2::SessionConfigOption) -> Option<ConfigOptionEntry> {
+    let acp_v2::SessionConfigKind::Select(select) = &option.kind else {
+        return None;
+    };
+    select_entries(select)
+        .into_iter()
+        .find(|entry| entry.value == select.current_value)
+}
+
+pub(crate) fn first_select_option<'a>(
+    options: &'a [acp_v2::SessionConfigOption],
+    category: &acp_v2::SessionConfigOptionCategory,
+) -> Option<&'a acp_v2::SessionConfigOption> {
+    options.iter().find(|option| {
+        option.category.as_ref() == Some(category)
+            && matches!(option.kind, acp_v2::SessionConfigKind::Select(_))
+    })
+}
+
+/// Whether a toggle-like option is on. claude-agent-acp sends Fast mode and
+/// Ultracode as booleans to clients that support them, and as an "on"/"off"
+/// select otherwise.
+pub(crate) fn toggle_option_state(option: &acp_v2::SessionConfigOption) -> Option<bool> {
+    match &option.kind {
+        acp_v2::SessionConfigKind::Boolean(boolean) => Some(boolean.current_value),
+        acp_v2::SessionConfigKind::Select(select) => {
+            let entries = select_entries(select);
+            let is_on_off = entries.len() == 2
+                && entries
+                    .iter()
+                    .all(|entry| matches!(entry.value.0.as_ref(), "on" | "off"));
+            is_on_off.then(|| select.current_value.0.as_ref() == "on")
+        }
+        _ => None,
+    }
+}
+
+/// The value that flips a toggle-like option.
+pub(crate) fn toggled_option_value(
+    option: &acp_v2::SessionConfigOption,
+    enabled: bool,
+) -> Option<acp_v2::SessionConfigOptionValue> {
+    match &option.kind {
+        acp_v2::SessionConfigKind::Boolean(_) => {
+            Some(acp_v2::SessionConfigOptionValue::boolean(enabled))
+        }
+        acp_v2::SessionConfigKind::Select(_) => {
+            Some(acp_v2::SessionConfigOptionValue::id(if enabled {
+                "on"
+            } else {
+                "off"
+            }))
+        }
+        _ => None,
+    }
+}
+
+/// Claude Code's name for an effort level. claude-agent-acp title-cases the
+/// SDK's level ids, which turns `xhigh` into "Xhigh".
+pub(crate) fn effort_display_name(entry: &ConfigOptionEntry) -> SharedString {
+    match entry.value.0.as_ref() {
+        "xhigh" => "Extra high".into(),
+        _ => entry.name.clone().into(),
+    }
+}
+
+/// The model name the chip shows. claude-agent-acp lists the account default
+/// as "Default (recommended)" and puts the model it resolves to in the
+/// description, which is what Claude Code shows.
+fn model_display_name(entry: &ConfigOptionEntry) -> SharedString {
+    if entry.value.0.as_ref() == "default"
+        && let Some(description) = entry
+            .description
+            .as_deref()
+            .map(str::trim)
+            .filter(|description| !description.is_empty())
+    {
+        return description.to_string().into();
+    }
+    entry
+        .name
+        .strip_suffix(" (recommended)")
+        .unwrap_or(&entry.name)
+        .to_string()
+        .into()
+}
+
+/// The label of the model chip: "Opus 5.5 Extra high · Ultracode".
+pub(crate) fn model_chip_label(options: &[acp_v2::SessionConfigOption]) -> Option<SharedString> {
+    let model = first_select_option(options, &acp_v2::SessionConfigOptionCategory::Model)
+        .and_then(current_select_entry)
+        .map(|entry| model_display_name(&entry));
+    let effort = first_select_option(options, &acp_v2::SessionConfigOptionCategory::ThoughtLevel)
+        .and_then(current_select_entry)
+        .filter(|entry| entry.value.0.as_ref() != "default")
+        .map(|entry| effort_display_name(&entry));
+    let ultracode = options
+        .iter()
+        .find(|option| option.config_id.0.as_ref() == ULTRACODE_CONFIG_ID)
+        .and_then(toggle_option_state)
+        .unwrap_or(false);
+    if model.is_none() && effort.is_none() {
+        return None;
+    }
+    let mut label = model.map(|model| model.to_string()).unwrap_or_default();
+    if let Some(effort) = effort {
+        if !label.is_empty() {
+            label.push(' ');
+        }
+        label.push_str(&effort);
+    }
+    if ultracode {
+        label.push_str(" · Ultracode");
+    }
+    Some(label.into())
+}
+
+/// The Claude Code VS Code extension's names for the permission modes, keyed by
+/// the claude-agent-acp mode ids. The adapter's own names differ for
+/// `acceptEdits` ("Accept edits").
+pub(crate) fn mode_display_name(mode_id: &str, adapter_name: &str) -> SharedString {
+    match mode_id {
+        "default" => "Manual".into(),
+        "acceptEdits" => "Edit automatically".into(),
+        "plan" => "Plan".into(),
+        "auto" => "Auto".into(),
+        "bypassPermissions" => "Bypass permissions".into(),
+        _ => adapter_name.to_string().into(),
+    }
+}
+
+pub(crate) fn mode_icon(mode_id: &str) -> IconName {
+    match mode_id {
+        "default" => IconName::UserCheck,
+        "acceptEdits" => IconName::Pencil,
+        "plan" => IconName::ListTodo,
+        "auto" => IconName::Sparkle,
+        "bypassPermissions" => IconName::Warning,
+        _ => IconName::Circle,
+    }
+}
+
+pub(crate) const QUEUE_PLACEHOLDER: &str = "Queue another message…";
+
+pub(crate) fn idle_placeholder(agent_display_name: &str) -> String {
+    format!("Message {agent_display_name}…")
+}
+
+pub(crate) fn is_claude_code_placeholder(text: &str) -> bool {
+    text == QUEUE_PLACEHOLDER || (text.starts_with("Message ") && text.ends_with('…'))
+}
+
+pub(crate) fn remember_zed_placeholder(
+    thread_view_id: EntityId,
+    placeholder: String,
+    cx: &mut App,
+) {
+    if let Some(activity) = cx
+        .default_global::<ClaudeCodeActivity>()
+        .threads
+        .get_mut(&thread_view_id)
+    {
+        activity.zed_placeholder = Some(placeholder);
+    }
 }
 
 /// The "✻ Spinning…" indicator shown at the end of a running turn.
@@ -672,6 +1002,179 @@ mod tests {
         assert_eq!(strip_code_fence("```\nbar\n```\n"), "bar");
         assert_eq!(strip_code_fence("plain output"), "plain output");
         assert_eq!(strip_code_fence("```unterminated"), "```unterminated");
+        assert_eq!(
+            strip_code_fence("````\n```rust\nfn main() {}\n```\n````"),
+            "```rust\nfn main() {}\n```"
+        );
+        assert_eq!(strip_code_fence("```\r\nwindows\r\n```"), "windows");
+    }
+
+    #[test]
+    fn test_display_lines() {
+        assert_eq!(
+            display_lines(
+                "On branch main\nYour branch is up to date.\n\nnothing to commit, working tree clean\n"
+            ),
+            vec![
+                "On branch main",
+                "Your branch is up to date.",
+                "",
+                "nothing to commit, working tree clean",
+            ]
+        );
+        assert_eq!(
+            display_lines("one\r\ntwo\rthree"),
+            vec!["one", "two", "three"]
+        );
+        assert_eq!(
+            display_lines("1\tfn main() {\n10\t}"),
+            vec!["1   fn main() {", "10  }"]
+        );
+        assert!(display_lines("\n\n").is_empty());
+    }
+
+    fn select_option(
+        id: &str,
+        category: acp_v2::SessionConfigOptionCategory,
+        current_value: &str,
+        entries: &[(&str, &str, Option<&str>)],
+    ) -> acp_v2::SessionConfigOption {
+        let options = entries
+            .iter()
+            .map(|(value, name, description)| {
+                let option = acp_v2::SessionConfigSelectOption::new(*value, *name);
+                match description {
+                    Some(description) => option.description(*description),
+                    None => option,
+                }
+            })
+            .collect::<Vec<_>>();
+        acp_v2::SessionConfigOption::select(id, id, current_value, options).category(category)
+    }
+
+    /// The options claude-agent-acp 0.106 sends to a client with boolean config
+    /// options (see `src/session-config-options.ts`).
+    fn adapter_options(
+        model: &str,
+        effort: &str,
+        ultracode: bool,
+    ) -> Vec<acp_v2::SessionConfigOption> {
+        vec![
+            select_option(
+                "mode",
+                acp_v2::SessionConfigOptionCategory::Mode,
+                "plan",
+                &[
+                    ("default", "Manual", None),
+                    ("acceptEdits", "Accept edits", None),
+                    ("plan", "Plan", None),
+                    ("auto", "Auto", None),
+                ],
+            ),
+            select_option(
+                "model",
+                acp_v2::SessionConfigOptionCategory::Model,
+                model,
+                &[
+                    ("default", "Default (recommended)", Some("Opus 5.5")),
+                    ("sonnet", "Sonnet 5", None),
+                ],
+            ),
+            select_option(
+                "effort",
+                acp_v2::SessionConfigOptionCategory::ThoughtLevel,
+                effort,
+                &[
+                    ("default", "Default", None),
+                    ("high", "High", None),
+                    ("xhigh", "Xhigh", None),
+                ],
+            ),
+            acp_v2::SessionConfigOption::boolean("fast", "Fast mode", false)
+                .category(acp_v2::SessionConfigOptionCategory::ModelConfig),
+            acp_v2::SessionConfigOption::boolean("ultracode", "Ultracode", ultracode)
+                .category(acp_v2::SessionConfigOptionCategory::ModelConfig),
+        ]
+    }
+
+    #[test]
+    fn test_model_chip_label() {
+        assert_eq!(
+            model_chip_label(&adapter_options("default", "xhigh", false)).as_deref(),
+            Some("Opus 5.5 Extra high")
+        );
+        assert_eq!(
+            model_chip_label(&adapter_options("sonnet", "high", true)).as_deref(),
+            Some("Sonnet 5 High · Ultracode")
+        );
+        assert_eq!(
+            model_chip_label(&adapter_options("sonnet", "default", false)).as_deref(),
+            Some("Sonnet 5")
+        );
+        assert_eq!(model_chip_label(&[]), None);
+    }
+
+    #[test]
+    fn test_toggle_options() {
+        let options = adapter_options("default", "default", true);
+        let ultracode = options
+            .iter()
+            .find(|option| option.config_id.0.as_ref() == "ultracode")
+            .expect("ultracode option");
+        assert_eq!(toggle_option_state(ultracode), Some(true));
+        assert_eq!(
+            toggled_option_value(ultracode, false),
+            Some(acp_v2::SessionConfigOptionValue::boolean(false))
+        );
+
+        let select_fallback = select_option(
+            "fast",
+            acp_v2::SessionConfigOptionCategory::ModelConfig,
+            "on",
+            &[("on", "On", None), ("off", "Off", None)],
+        );
+        assert_eq!(toggle_option_state(&select_fallback), Some(true));
+        assert_eq!(
+            toggled_option_value(&select_fallback, false),
+            Some(acp_v2::SessionConfigOptionValue::id("off"))
+        );
+        let mode = options.first().expect("mode option");
+        assert_eq!(toggle_option_state(mode), None);
+    }
+
+    #[test]
+    fn test_mode_display_names() {
+        assert_eq!(mode_display_name("default", "Manual").as_ref(), "Manual");
+        assert_eq!(
+            mode_display_name("acceptEdits", "Accept edits").as_ref(),
+            "Edit automatically"
+        );
+        assert_eq!(mode_display_name("plan", "Plan").as_ref(), "Plan");
+        assert_eq!(mode_display_name("auto", "Auto").as_ref(), "Auto");
+        assert_eq!(
+            mode_display_name("bypassPermissions", "Bypass permissions").as_ref(),
+            "Bypass permissions"
+        );
+        assert_eq!(mode_display_name("custom", "Custom").as_ref(), "Custom");
+    }
+
+    #[test]
+    fn test_placeholders() {
+        assert!(is_claude_code_placeholder(QUEUE_PLACEHOLDER));
+        assert!(is_claude_code_placeholder(&idle_placeholder(
+            "Claude Agent"
+        )));
+        assert!(!is_claude_code_placeholder(
+            "Message Claude Agent — @ to include context, / for commands"
+        ));
+    }
+
+    #[test]
+    fn test_is_claude_code_tool_name() {
+        assert!(is_claude_code_tool_name("Bash"));
+        assert!(is_claude_code_tool_name("mcp__github__create_issue"));
+        assert!(!is_claude_code_tool_name("terminal"));
+        assert!(!is_claude_code_tool_name("read_file"));
     }
 
     #[test]
