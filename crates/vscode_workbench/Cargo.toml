@@ -16,12 +16,20 @@ doctest = false
 default = []
 
 [dependencies]
+anyhow.workspace = true
 auto_update.workspace = true
 client.workspace = true
+db.workspace = true
+extension_host.workspace = true
+fs.workspace = true
+futures.workspace = true
 gpui.workspace = true
 log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 settings.workspace = true
 ui.workspace = true
+util.workspace = true
 workspace.workspace = true
 zed_actions.workspace = true
 
@@ -29,6 +37,7 @@ zed_actions.workspace = true
 db = { workspace = true, features = ["test-support"] }
 fs = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
+paths.workspace = true
 project = { workspace = true, features = ["test-support"] }
 settings = { workspace = true, features = ["test-support"] }
 theme.workspace = true
