@@ -12,6 +12,9 @@ use crate::ExtendingVec;
 
 use crate::DockPosition;
 
+mod ui_style;
+pub use ui_style::*;
+
 /// Where to position the threads sidebar.
 #[derive(
     Clone,
@@ -372,6 +375,14 @@ pub struct AgentSettingsContent {
     ///
     /// Default: automatic
     pub thinking_display: Option<ThinkingBlockDisplay>,
+    /// The visual style used to render agent threads.
+    ///
+    /// Default: zed
+    pub ui_style: Option<AgentUiStyle>,
+    /// Where agent threads are opened.
+    ///
+    /// Default: panel
+    pub thread_location: Option<AgentThreadLocation>,
     /// Whether clicking the stop button on a running terminal tool should also cancel the agent's generation.
     /// Note that this only applies to the stop button, not to ctrl+c inside the terminal.
     ///
