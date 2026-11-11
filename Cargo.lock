@@ -19747,6 +19747,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "vscode_workbench"
+version = "0.1.0"
+dependencies = [
+ "auto_update",
+ "client",
+ "db",
+ "fs",
+ "gpui",
+ "project",
+ "settings",
+ "theme",
+ "theme_settings",
+ "ui",
+ "workspace",
+ "zed_actions",
+]
+
+[[package]]
 name = "vsimd"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -22658,6 +22676,7 @@ dependencies = [
  "uuid",
  "vim",
  "vim_mode_setting",
+ "vscode_workbench",
  "watch",
  "web_search",
  "web_search_providers",
