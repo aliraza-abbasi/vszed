@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use client::{SignIn, SignOut, UserStore};
-use gpui::{Action, Anchor, ClickEvent, Empty, Entity, Focusable, Subscription, WeakEntity};
+use gpui::{Action, Anchor, ClickEvent, Empty, Entity, Subscription, WeakEntity};
 use settings::{Settings, SettingsStore};
 use ui::{ContextMenu, CountBadge, IconButtonShape, PopoverMenu, Tooltip, prelude::*};
 use workspace::{
@@ -9,11 +9,13 @@ use workspace::{
     dock::{Dock, PanelButtons, PanelHandle},
 };
 
-use crate::WorkbenchSettings;
+use crate::{
+    DEBUG_PANEL_KEY, GIT_PANEL_KEY, PROJECT_PANEL_KEY, WorkbenchSettings, is_active_panel,
+    reveal_panel,
+};
 
 const ACTIVITY_BAR_WIDTH: Pixels = px(48.);
 const ACTIVE_INDICATOR_WIDTH: Pixels = px(2.);
-const PROJECT_PANEL_KEY: &str = "ProjectPanel";
 
 pub(crate) fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
@@ -106,19 +108,39 @@ fn restore_panel_buttons(
 }
 
 enum ActivityBarEntry {
-    Panel {
-        dock: Entity<Dock>,
-        panel: Arc<dyn PanelHandle>,
-    },
+    Panel(Arc<dyn PanelHandle>),
     Search,
     Extensions,
 }
 
+#[derive(Clone, Copy)]
+enum PrimarySideBarSlot {
+    Panel(&'static str),
+    Search,
+    Extensions,
+}
+
+/// The fixed order of VS Code's built-in view containers. Left dock panels without
+/// a slot follow in activation priority order.
+const PRIMARY_SIDE_BAR_ORDER: [PrimarySideBarSlot; 5] = [
+    PrimarySideBarSlot::Panel(PROJECT_PANEL_KEY),
+    PrimarySideBarSlot::Search,
+    PrimarySideBarSlot::Panel(GIT_PANEL_KEY),
+    PrimarySideBarSlot::Panel(DEBUG_PANEL_KEY),
+    PrimarySideBarSlot::Extensions,
+];
+
+fn has_fixed_slot(panel: &Arc<dyn PanelHandle>) -> bool {
+    PRIMARY_SIDE_BAR_ORDER.iter().any(|slot| {
+        matches!(slot, PrimarySideBarSlot::Panel(panel_key) if *panel_key == panel.panel_key())
+    })
+}
+
+/// Switches the primary side bar, which is the left dock. Panels in the right and
+/// bottom docks are reached through the dock headers instead, as in VS Code.
 pub struct ActivityBar {
     workspace: WeakEntity<Workspace>,
     left_dock: Entity<Dock>,
-    right_dock: Entity<Dock>,
-    bottom_dock: Entity<Dock>,
     user_store: Entity<UserStore>,
     _subscriptions: Vec<Subscription>,
 }
@@ -126,54 +148,55 @@ pub struct ActivityBar {
 impl ActivityBar {
     fn new(workspace: &Workspace, cx: &mut Context<Self>) -> Self {
         let left_dock = workspace.left_dock().clone();
-        let right_dock = workspace.right_dock().clone();
-        let bottom_dock = workspace.bottom_dock().clone();
         let user_store = workspace.user_store().clone();
 
-        let mut subscriptions = [&left_dock, &right_dock, &bottom_dock]
-            .into_iter()
-            .map(|dock| cx.observe(dock, |_, _, cx| cx.notify()))
-            .collect::<Vec<_>>();
-        subscriptions.push(cx.observe(&user_store, |_, _, cx| cx.notify()));
-        subscriptions.push(cx.observe_global::<SettingsStore>(|_, cx| cx.notify()));
+        let subscriptions = vec![
+            cx.observe(&left_dock, |_, _, cx| cx.notify()),
+            cx.observe(&user_store, |_, _, cx| cx.notify()),
+            cx.observe_global::<SettingsStore>(|_, cx| cx.notify()),
+        ];
 
         Self {
             workspace: workspace.weak_handle(),
             left_dock,
-            right_dock,
-            bottom_dock,
             user_store,
             _subscriptions: subscriptions,
         }
     }
 
     fn entries(&self, cx: &App) -> Vec<ActivityBarEntry> {
-        let mut entries = Vec::new();
-        let mut search_index = 0;
-        for panel in self.left_dock.read(cx).panels() {
-            entries.push(ActivityBarEntry::Panel {
-                dock: self.left_dock.clone(),
-                panel: panel.clone(),
-            });
-            if panel.panel_key() == PROJECT_PANEL_KEY {
-                search_index = entries.len();
+        let left_panels = self
+            .left_dock
+            .read(cx)
+            .panels()
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let mut entries = Vec::with_capacity(left_panels.len() + 2);
+        for slot in PRIMARY_SIDE_BAR_ORDER {
+            match slot {
+                PrimarySideBarSlot::Panel(panel_key) => entries.extend(
+                    left_panels
+                        .iter()
+                        .find(|panel| panel.panel_key() == panel_key)
+                        .cloned()
+                        .map(ActivityBarEntry::Panel),
+                ),
+                PrimarySideBarSlot::Search => entries.push(ActivityBarEntry::Search),
+                PrimarySideBarSlot::Extensions => entries.push(ActivityBarEntry::Extensions),
             }
         }
-        entries.insert(search_index, ActivityBarEntry::Search);
-        entries.push(ActivityBarEntry::Extensions);
-
-        for dock in [&self.right_dock, &self.bottom_dock] {
-            entries.extend(dock.read(cx).panels().map(|panel| ActivityBarEntry::Panel {
-                dock: dock.clone(),
-                panel: panel.clone(),
-            }));
-        }
+        entries.extend(
+            left_panels
+                .into_iter()
+                .filter(|panel| !has_fixed_slot(panel))
+                .map(ActivityBarEntry::Panel),
+        );
         entries
     }
 
     fn toggle_panel(
         &mut self,
-        dock: &Entity<Dock>,
         panel: &Arc<dyn PanelHandle>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -182,13 +205,9 @@ impl ActivityBar {
             return;
         };
 
-        let (position, is_visible, focus_handle) = {
-            let dock = dock.read(cx);
-            let focus_handle = dock
-                .zoomed_panel(window, cx)
-                .map(|zoomed_panel| zoomed_panel.panel_focus_handle(cx))
-                .unwrap_or_else(|| dock.focus_handle(cx));
-            (dock.position(), is_active_panel(dock, panel), focus_handle)
+        let (position, is_visible) = {
+            let dock = self.left_dock.read(cx);
+            (dock.position(), is_active_panel(dock, panel))
         };
 
         if is_visible {
@@ -196,17 +215,12 @@ impl ActivityBar {
                 workspace.toggle_dock(position, window, cx);
             });
         } else {
-            // Opening goes through the panel's own toggle action, like the status bar
-            // panel buttons do, so focus, zoom and serialization behave exactly as with
-            // the panel's keybinding. Focusing the dock first makes the action reach
-            // the workspace even when focus is currently outside of it.
-            window.focus(&focus_handle, cx);
-            window.dispatch_action(panel.toggle_action(window, cx), cx);
+            reveal_panel(&self.left_dock, panel, window, cx);
         }
     }
 
     fn render_panel_entry(
-        dock: Entity<Dock>,
+        &self,
         panel: Arc<dyn PanelHandle>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -215,7 +229,7 @@ impl ActivityBar {
         let label = panel
             .icon_tooltip(window, cx)
             .unwrap_or_else(|| panel.persistent_name());
-        let is_active = is_active_panel(dock.read(cx), &panel);
+        let is_active = is_active_panel(self.left_dock.read(cx), &panel);
         let badge = panel
             .icon_label(window, cx)
             .filter(|_| !is_active)
@@ -228,7 +242,7 @@ impl ActivityBar {
             .aria_label(label)
             .tooltip(move |_window, cx| Tooltip::for_action(label, &*toggle_action, cx))
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                this.toggle_panel(&dock, &panel, window, cx);
+                this.toggle_panel(&panel, window, cx);
             }));
 
         Some(render_entry_cell(is_active, button, badge, cx))
@@ -271,9 +285,7 @@ impl Render for ActivityBar {
             .entries(cx)
             .into_iter()
             .filter_map(|entry| match entry {
-                ActivityBarEntry::Panel { dock, panel } => {
-                    Self::render_panel_entry(dock, panel, window, cx)
-                }
+                ActivityBarEntry::Panel(panel) => self.render_panel_entry(panel, window, cx),
                 ActivityBarEntry::Search => Some(render_action_entry(
                     "activity-bar-search",
                     IconName::MagnifyingGlass,
@@ -320,13 +332,6 @@ impl Render for ActivityBar {
                     .child(render_entry_cell(false, render_manage_menu(), None, cx)),
             )
     }
-}
-
-fn is_active_panel(dock: &Dock, panel: &Arc<dyn PanelHandle>) -> bool {
-    dock.is_open()
-        && dock
-            .active_panel()
-            .is_some_and(|active_panel| active_panel.panel_id() == panel.panel_id())
 }
 
 fn activity_bar_button(id: impl Into<ElementId>, icon: IconName, is_active: bool) -> IconButton {
@@ -426,16 +431,13 @@ fn render_manage_menu() -> impl IntoElement {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fs::FakeFs;
     use gpui::{EntityId, TestAppContext, VisualTestContext};
-    use project::Project;
-    use settings::{ActivityBarSettingsContent, WorkbenchSettingsContent};
-    use workspace::{
-        MultiWorkspace,
-        dock::{
-            DockPosition,
-            test::{TestPanel, ToggleTestPanel},
-        },
+    use workspace::dock::{DockPosition, Panel as _};
+
+    use crate::test_support::{
+        AgentTestPanel, DebugTestPanel, ExplorerTestPanel, OutlineTestPanel,
+        SourceControlTestPanel, TerminalTestPanel, init_test, open_workspace,
+        update_workbench_settings,
     };
 
     #[derive(Debug, PartialEq)]
@@ -467,38 +469,10 @@ mod tests {
         }
     }
 
-    fn init_test(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            let settings_store = SettingsStore::test(cx);
-            cx.set_global(settings_store);
-            cx.set_global(db::AppDatabase::test_new());
-            theme_settings::init(theme::LoadThemes::JustBase, cx);
-            crate::init(cx);
-        });
-    }
-
-    async fn open_workspace(
-        cx: &mut TestAppContext,
-    ) -> (Entity<Workspace>, &mut VisualTestContext) {
-        let fs = FakeFs::new(cx.executor());
-        let project = Project::test(fs, [], cx).await;
-        let (multi_workspace, cx) =
-            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
-        let workspace =
-            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
-        (workspace, cx)
-    }
-
     fn set_activity_bar_visible(visible: bool, cx: &mut VisualTestContext) {
         cx.update(|_window, cx| {
-            cx.update_global::<SettingsStore, _>(|store, cx| {
-                store.update_user_settings(cx, |settings| {
-                    settings.workbench = Some(WorkbenchSettingsContent {
-                        activity_bar: Some(ActivityBarSettingsContent {
-                            visible: Some(visible),
-                        }),
-                    });
-                });
+            update_workbench_settings(cx, |workbench| {
+                workbench.activity_bar.get_or_insert_default().visible = Some(visible);
             });
         });
         cx.run_until_parked();
@@ -512,6 +486,23 @@ mod tests {
             workspace
                 .leading_item()
                 .and_then(|item| item.downcast::<ActivityBar>().ok())
+        })
+    }
+
+    fn entry_kinds(
+        activity_bar: &Entity<ActivityBar>,
+        cx: &mut VisualTestContext,
+    ) -> Vec<EntryKind> {
+        activity_bar.read_with(cx, |activity_bar, cx| {
+            activity_bar
+                .entries(cx)
+                .into_iter()
+                .map(|entry| match entry {
+                    ActivityBarEntry::Panel(panel) => EntryKind::Panel(panel.panel_id()),
+                    ActivityBarEntry::Search => EntryKind::Search,
+                    ActivityBarEntry::Extensions => EntryKind::Extensions,
+                })
+                .collect()
         })
     }
 
@@ -583,14 +574,8 @@ mod tests {
     async fn test_activity_bar_installed_for_new_workspace(cx: &mut TestAppContext) {
         init_test(cx);
         cx.update(|cx| {
-            cx.update_global::<SettingsStore, _>(|store, cx| {
-                store.update_user_settings(cx, |settings| {
-                    settings.workbench = Some(WorkbenchSettingsContent {
-                        activity_bar: Some(ActivityBarSettingsContent {
-                            visible: Some(true),
-                        }),
-                    });
-                });
+            update_workbench_settings(cx, |workbench| {
+                workbench.activity_bar.get_or_insert_default().visible = Some(true);
             });
         });
         let (workspace, cx) = open_workspace(cx).await;
@@ -608,14 +593,7 @@ mod tests {
         let (workspace, cx) = open_workspace(cx).await;
         set_activity_bar_visible(true, cx);
 
-        let panel = workspace.update_in(cx, |workspace, window, cx| {
-            let panel = cx.new(|cx| TestPanel::new(DockPosition::Left, 100, cx));
-            workspace.add_panel(panel.clone(), window, cx);
-            workspace.register_action(|workspace, _: &ToggleTestPanel, window, cx| {
-                workspace.toggle_panel_focus::<TestPanel>(window, cx);
-            });
-            panel
-        });
+        let panel = ExplorerTestPanel::add(&workspace, DockPosition::Left, 100, cx);
         cx.run_until_parked();
 
         let activity_bar =
@@ -631,7 +609,7 @@ mod tests {
         assert!(!left_dock.read_with(cx, |dock, _| dock.is_open()));
 
         activity_bar.update_in(cx, |activity_bar, window, cx| {
-            activity_bar.toggle_panel(&left_dock, &panel_handle, window, cx);
+            activity_bar.toggle_panel(&panel_handle, window, cx);
         });
         cx.run_until_parked();
         left_dock.read_with(cx, |dock, _| {
@@ -644,7 +622,7 @@ mod tests {
         });
 
         activity_bar.update_in(cx, |activity_bar, window, cx| {
-            activity_bar.toggle_panel(&left_dock, &panel_handle, window, cx);
+            activity_bar.toggle_panel(&panel_handle, window, cx);
         });
         cx.run_until_parked();
         assert!(
@@ -659,40 +637,51 @@ mod tests {
         let (workspace, cx) = open_workspace(cx).await;
         set_activity_bar_visible(true, cx);
 
-        let (left_panel, right_panel, bottom_panel) =
-            workspace.update_in(cx, |workspace, window, cx| {
-                let left_panel = cx.new(|cx| TestPanel::new(DockPosition::Left, 100, cx));
-                let right_panel = cx.new(|cx| TestPanel::new(DockPosition::Right, 101, cx));
-                let bottom_panel = cx.new(|cx| TestPanel::new(DockPosition::Bottom, 102, cx));
-                workspace.add_panel(bottom_panel.clone(), window, cx);
-                workspace.add_panel(right_panel.clone(), window, cx);
-                workspace.add_panel(left_panel.clone(), window, cx);
-                (left_panel, right_panel, bottom_panel)
-            });
+        let agent = AgentTestPanel::add(&workspace, DockPosition::Left, 5, cx);
+        let outline = OutlineTestPanel::add(&workspace, DockPosition::Left, 10, cx);
+        let debug = DebugTestPanel::add(&workspace, DockPosition::Left, 20, cx);
+        let explorer = ExplorerTestPanel::add(&workspace, DockPosition::Left, 30, cx);
+        let source_control = SourceControlTestPanel::add(&workspace, DockPosition::Left, 40, cx);
+        TerminalTestPanel::add(&workspace, DockPosition::Bottom, 1, cx);
         cx.run_until_parked();
 
         let activity_bar =
             installed_activity_bar(&workspace, cx).expect("activity bar should be installed");
-        let entries = activity_bar.read_with(cx, |activity_bar, cx| {
-            activity_bar
-                .entries(cx)
-                .into_iter()
-                .map(|entry| match entry {
-                    ActivityBarEntry::Panel { panel, .. } => EntryKind::Panel(panel.panel_id()),
-                    ActivityBarEntry::Search => EntryKind::Search,
-                    ActivityBarEntry::Extensions => EntryKind::Extensions,
-                })
-                .collect::<Vec<_>>()
-        });
         assert_eq!(
-            entries,
+            entry_kinds(&activity_bar, cx),
+            vec![
+                EntryKind::Panel(explorer.entity_id()),
+                EntryKind::Search,
+                EntryKind::Panel(source_control.entity_id()),
+                EntryKind::Panel(debug.entity_id()),
+                EntryKind::Extensions,
+                EntryKind::Panel(agent.entity_id()),
+                EntryKind::Panel(outline.entity_id()),
+            ],
+            "VS Code's containers come first in their fixed order, then the remaining \
+             left dock panels by activation priority; other docks are left out"
+        );
+
+        explorer.update_in(cx, |panel, window, cx| {
+            panel.set_position(DockPosition::Right, window, cx);
+        });
+        debug.update_in(cx, |panel, window, cx| {
+            panel.set_position(DockPosition::Right, window, cx);
+        });
+        agent.update_in(cx, |panel, window, cx| {
+            panel.set_position(DockPosition::Right, window, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            entry_kinds(&activity_bar, cx),
             vec![
                 EntryKind::Search,
-                EntryKind::Panel(left_panel.entity_id()),
+                EntryKind::Panel(source_control.entity_id()),
                 EntryKind::Extensions,
-                EntryKind::Panel(right_panel.entity_id()),
-                EntryKind::Panel(bottom_panel.entity_id()),
-            ]
+                EntryKind::Panel(outline.entity_id()),
+            ],
+            "panels moved out of the left dock disappear, Search and Extensions stay"
         );
     }
 }
