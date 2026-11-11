@@ -44,6 +44,9 @@ use crate::terminal_thread_metadata_store::{
     normalize_terminal_custom_title, terminal_title_without_prefix,
 };
 use crate::thread_metadata_store::{ThreadId, ThreadMetadataStore, ThreadMetadataStoreEvent};
+use crate::ui_styles::thread_item::{
+    ThreadTabRequest, new_thread_tab, route_to_thread_tab, threads_open_in_editor,
+};
 use crate::{
     Agent, AgentInitialContent, AgentThreadSource, ExternalSourcePrompt, NewExternalAgentThread,
     NewNativeAgentThreadFromSummary,
@@ -364,6 +367,10 @@ pub fn init(cx: &mut App) {
         |workspace: &mut Workspace, _window, _cx: &mut Context<Workspace>| {
             workspace
                 .register_action(|workspace, _: &NewThread, window, cx| {
+                    if threads_open_in_editor(cx) {
+                        new_thread_tab(workspace, None, window, cx);
+                        return;
+                    }
                     if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
                         panel.update(cx, |panel, cx| {
                             panel.new_thread_with_workspace(Some(workspace), window, cx)
@@ -1668,6 +1675,10 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let tab = ThreadTabRequest::for_session(&session_id, &work_dirs, &title, cx);
+        if route_to_thread_tab(&self.workspace, Some(tab), window, cx) {
+            return;
+        }
         // Share links / clipboard imports enter with only a session id. If
         // this machine already has a metadata row for the session, route
         // through the normal thread-id path.
@@ -1752,6 +1763,10 @@ impl AgentPanel {
 
     pub fn new_thread(&mut self, _action: &NewThread, window: &mut Window, cx: &mut Context<Self>) {
         if !self.has_open_project(cx) {
+            return;
+        }
+        let tab = ThreadTabRequest::new_thread(self.selected_agent(cx));
+        if route_to_thread_tab(&self.workspace, Some(tab), window, cx) {
             return;
         }
 
@@ -4510,6 +4525,11 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let tab =
+            focus.then(|| ThreadTabRequest::for_thread(&agent, thread_id, &work_dirs, &title, cx));
+        if route_to_thread_tab(&self.workspace, tab, window, cx) {
+            return;
+        }
         if let Some(store) = ThreadMetadataStore::try_global(cx) {
             store.update(cx, |store, cx| {
                 store.unarchive(thread_id, cx);
