@@ -19755,6 +19755,7 @@ dependencies = [
  "db",
  "fs",
  "gpui",
+ "log",
  "project",
  "settings",
  "theme",
