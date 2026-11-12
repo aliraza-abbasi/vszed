@@ -284,6 +284,11 @@ struct LayoutSnapshot {
     bottom_dock_layout: Option<BottomDockLayout>,
     activity_bar_visible: Option<bool>,
     dock_headers: Option<bool>,
+    command_center: Option<bool>,
+    layout_controls: Option<bool>,
+    status_bar: Option<bool>,
+    title_bar_project_items: Option<bool>,
+    title_bar_branch_name: Option<bool>,
     tab_file_icons: Option<bool>,
     tab_git_status: Option<bool>,
     tab_diagnostics: Option<ShowDiagnostics>,
@@ -299,6 +304,7 @@ struct LayoutSnapshot {
 impl LayoutSnapshot {
     fn read_from(content: &SettingsContent) -> Self {
         let workbench = content.workbench.as_ref();
+        let title_bar = content.title_bar.as_ref();
         let tabs = content.tabs.as_ref();
         Self {
             base_keymap: content.base_keymap,
@@ -317,6 +323,11 @@ impl LayoutSnapshot {
                 .and_then(|workbench| workbench.activity_bar.as_ref())
                 .and_then(|activity_bar| activity_bar.visible),
             dock_headers: workbench.and_then(|workbench| workbench.dock_headers),
+            command_center: workbench.and_then(|workbench| workbench.command_center),
+            layout_controls: workbench.and_then(|workbench| workbench.layout_controls),
+            status_bar: workbench.and_then(|workbench| workbench.status_bar),
+            title_bar_project_items: title_bar.and_then(|title_bar| title_bar.show_project_items),
+            title_bar_branch_name: title_bar.and_then(|title_bar| title_bar.show_branch_name),
             tab_file_icons: tabs.and_then(|tabs| tabs.file_icons),
             tab_git_status: tabs.and_then(|tabs| tabs.git_status),
             tab_diagnostics: tabs.and_then(|tabs| tabs.show_diagnostics),
@@ -365,6 +376,13 @@ impl LayoutSnapshot {
                 activity_bar.visible = self.activity_bar_visible;
             });
             workbench.dock_headers = self.dock_headers;
+            workbench.command_center = self.command_center;
+            workbench.layout_controls = self.layout_controls;
+            workbench.status_bar = self.status_bar;
+        });
+        update_nested(&mut content.title_bar, |title_bar| {
+            title_bar.show_project_items = self.title_bar_project_items;
+            title_bar.show_branch_name = self.title_bar_branch_name;
         });
         update_nested(&mut content.tabs, |tabs| {
             tabs.file_icons = self.tab_file_icons;
@@ -398,6 +416,12 @@ impl LayoutSnapshot {
         self.bottom_dock_layout = Some(BottomDockLayout::Contained);
         self.activity_bar_visible = Some(true);
         self.dock_headers = Some(true);
+        self.command_center = Some(true);
+        self.layout_controls = Some(true);
+        self.status_bar = Some(true);
+        // VS Code's title bar shows neither, the status bar has the branch.
+        self.title_bar_project_items = Some(false);
+        self.title_bar_branch_name = Some(false);
         self.tab_file_icons = Some(true);
         self.tab_git_status = Some(true);
         self.tab_diagnostics = Some(ShowDiagnostics::Errors);
@@ -446,7 +470,8 @@ mod tests {
         "theme": "One Dark",
         "vim_mode": true,
         "project_panel": { "dock": "right", "default_width": 300 },
-        "tabs": { "close_position": "left", "file_icons": false }
+        "tabs": { "close_position": "left", "file_icons": false },
+        "title_bar": { "show_branch_name": true, "show_user_picture": false }
     }"#;
 
     async fn init_settings(cx: &mut TestAppContext) -> Arc<FakeFs> {
@@ -520,6 +545,11 @@ mod tests {
         assert_eq!(applied["bottom_dock_layout"], json!("contained"));
         assert_eq!(applied["workbench"]["activity_bar"]["visible"], json!(true));
         assert_eq!(applied["workbench"]["dock_headers"], json!(true));
+        assert_eq!(applied["workbench"]["command_center"], json!(true));
+        assert_eq!(applied["workbench"]["layout_controls"], json!(true));
+        assert_eq!(applied["workbench"]["status_bar"], json!(true));
+        assert_eq!(applied["title_bar"]["show_project_items"], json!(false));
+        assert_eq!(applied["title_bar"]["show_branch_name"], json!(false));
         assert_eq!(applied["tabs"]["file_icons"], json!(true));
         assert_eq!(applied["tabs"]["git_status"], json!(true));
         assert_eq!(applied["tabs"]["show_diagnostics"], json!("errors"));
@@ -543,6 +573,7 @@ mod tests {
         assert_eq!(applied["vim_mode"], json!(true));
         assert_eq!(applied["project_panel"]["default_width"], json!(300));
         assert_eq!(applied["tabs"]["close_position"], json!("left"));
+        assert_eq!(applied["title_bar"]["show_user_picture"], json!(false));
 
         assert!(restore(&fs, cx).await);
         let (restored, restored_settings) = load_settings_file(&fs).await;
