@@ -152,7 +152,7 @@ impl DockHeader {
             .min_w_0()
             .truncate()
             .text_size(TITLE_FONT_SIZE)
-            .font_weight(FontWeight::SEMIBOLD)
+            .font_weight(FontWeight::NORMAL)
             .text_color(cx.theme().colors().text)
             .child(title)
     }

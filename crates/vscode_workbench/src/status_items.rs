@@ -248,8 +248,8 @@ fn left_dock_buttons_position(workspace: &Workspace, cx: &App) -> Option<usize> 
     .min()
 }
 
-/// VS Code's remote indicator: an accent colored button at the start of the
-/// status bar that names the remote host and offers ways to open remote projects.
+/// VS Code's remote indicator: a button at the start of the status bar that
+/// names the remote host and offers ways to open remote projects.
 pub struct RemoteIndicator {
     project: Entity<Project>,
 }
@@ -280,9 +280,11 @@ impl Render for RemoteIndicator {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let remote_name = self.remote_name(cx);
         let is_local = self.project.read(cx).is_local();
-        let colors = cx.theme().colors();
-        let background = colors.text_accent;
-        let foreground = Color::Custom(colors.status_bar_background);
+        // VS Code's Dark 2026 theme gives the remote indicator no background of
+        // its own (only Dark Modern paints it blue), and Zed themes have no
+        // token for it, so it renders like the other status bar items.
+        let hover_background = cx.theme().colors().element_hover;
+        let foreground = Color::Default;
         let tooltip = remote_name
             .clone()
             .unwrap_or_else(|| "Open a Remote Window".into());
@@ -290,8 +292,7 @@ impl Render for RemoteIndicator {
         div()
             .id("vscode-remote-indicator")
             .rounded_sm()
-            .bg(background)
-            .hover(move |style| style.bg(background.opacity(0.85)))
+            .hover(move |style| style.bg(hover_background))
             .child(
                 PopoverMenu::new("vscode-remote-menu")
                     .anchor(Anchor::BottomLeft)
