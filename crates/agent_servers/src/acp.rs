@@ -277,6 +277,25 @@ impl AgentExtNotifications {
     }
 }
 
+/// The `_meta.claudeCode.options` claude-agent-acp passes on to the Claude Agent SDK
+/// for a new or resumed session. Claude Code ignores `showThinkingSummaries` in SDK
+/// sessions, and without summaries recent models stream empty thinking, which the
+/// adapter drops. Like the Claude Code extension, ask for summaries when the user's
+/// Claude Code settings turn them on.
+fn claude_session_options() -> Option<serde_json::Value> {
+    let config_dir = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| util::paths::home_dir().join(".claude"));
+    let settings = std::fs::read(config_dir.join("settings.json")).ok()?;
+    claude_session_options_for_settings(&settings)
+}
+
+fn claude_session_options_for_settings(settings: &[u8]) -> Option<serde_json::Value> {
+    let settings = serde_json::from_slice::<serde_json::Value>(settings).ok()?;
+    let show_summaries = settings.get("showThinkingSummaries")?.as_bool()?;
+    show_summaries.then(|| serde_json::json!({ "extraArgs": { "thinking-display": "summarized" } }))
+}
+
 fn dispatch_queue_closed_error() -> agent_client_protocol::Error {
     agent_client_protocol::Error::internal_error().data("ACP foreground dispatch queue closed")
 }
@@ -1208,6 +1227,28 @@ fn set_acp_beta(enabled: bool, cx: &mut App) {
         });
     });
     assert_eq!(cx.has_flag::<AcpBetaFeatureFlag>(), enabled);
+}
+
+#[cfg(test)]
+mod claude_session_options_tests {
+    use super::*;
+
+    #[test]
+    fn claude_session_options_follow_show_thinking_summaries() {
+        assert_eq!(
+            claude_session_options_for_settings(br#"{"showThinkingSummaries": true}"#),
+            Some(serde_json::json!({ "extraArgs": { "thinking-display": "summarized" } }))
+        );
+        assert_eq!(
+            claude_session_options_for_settings(br#"{"showThinkingSummaries": false}"#),
+            None
+        );
+        assert_eq!(
+            claude_session_options_for_settings(br#"{"model": "opus"}"#),
+            None
+        );
+        assert_eq!(claude_session_options_for_settings(b"not json"), None);
+    }
 }
 
 #[cfg(all(test, unix))]
