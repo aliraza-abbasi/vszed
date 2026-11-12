@@ -825,17 +825,15 @@ fn restore_zed_placeholder(
 
 /// Claude Code writes prompts and sent messages in the UI font, not the buffer font.
 pub(crate) fn ui_font_text_style(cx: &App) -> TextStyle {
-    // The extension's chat text matches VS Code's workbench labels, which Zed
-    // draws at 14/16 of the UI font size. Scaling the agent font size (rather
-    // than using a fixed label size) keeps the agent zoom actions working.
-    const LABEL_TO_UI_FONT_RATIO: f32 = 14. / 16.;
+    // Scaling the agent font size (rather than using a fixed label size) keeps
+    // the agent zoom actions working.
     let settings = ThemeSettings::get_global(cx);
     TextStyle {
         color: cx.theme().colors().text,
         font_family: settings.ui_font.family.clone(),
         font_fallbacks: settings.ui_font.fallbacks.clone(),
         font_features: settings.ui_font.features.clone(),
-        font_size: (settings.agent_ui_font_size(cx) * LABEL_TO_UI_FONT_RATIO).into(),
+        font_size: (settings.agent_ui_font_size(cx) * TRANSCRIPT_FONT_RATIO).into(),
         font_weight: settings.ui_font.weight,
         line_height: relative(1.5),
         ..Default::default()
@@ -980,8 +978,8 @@ pub(crate) fn sent_message_text(blocks: &[acp_v2::ContentBlock], path_style: Pat
     text.trim().to_string()
 }
 
-/// VS Code draws Claude Code's transcript at its 13px workbench size, which
-/// Zed's labels reach at 14/16 of the UI font size.
+/// VS Code draws Claude Code's transcript and prompt at its 13px workbench
+/// size, which Zed's labels reach at 14/16 of the UI font size.
 const TRANSCRIPT_FONT_RATIO: f32 = 14. / 16.;
 
 /// The agent markdown style, scaled to the size of the transcript's labels.
@@ -2867,7 +2865,7 @@ mod tests {
             name: DEFAULT_PASTED_IMAGE_NAME.to_string(),
         };
         assert_eq!(
-            attachment_name(Some(&pasted.to_uri().to_string()), "image/jpeg", path_style).as_ref(),
+            attachment_name(Some(pasted.to_uri().as_ref()), "image/jpeg", path_style).as_ref(),
             "image.jpg"
         );
         let file = MentionUri::File {
@@ -2878,7 +2876,7 @@ mod tests {
             }),
         };
         assert_eq!(
-            attachment_name(Some(&file.to_uri().to_string()), "image/png", path_style).as_ref(),
+            attachment_name(Some(file.to_uri().as_ref()), "image/png", path_style).as_ref(),
             "screen.png"
         );
     }
