@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 use settings_macros::{MergeFrom, with_fallible_options};
 
 use crate::{
-    DelayMs, DiagnosticSeverityContent, ShowScrollbar, serialize_f32_with_two_decimal_places,
+    BufferLineHeight, DelayMs, DiagnosticSeverityContent, ShowScrollbar,
+    serialize_f32_with_two_decimal_places,
 };
 
 #[with_fallible_options]
@@ -481,6 +482,11 @@ pub struct MinimapContent {
     ///
     /// Default: 80
     pub max_width_columns: Option<num::NonZeroU32>,
+
+    /// The line height of the minimap, relative to its font size.
+    ///
+    /// Default: inherits the `buffer_line_height` setting
+    pub line_height: Option<BufferLineHeight>,
 }
 
 /// Forcefully enable or disable the scrollbar for each axis
