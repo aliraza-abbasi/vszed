@@ -1,10 +1,11 @@
 use super::{
     AcpDebugLog, AcpDebugMessage, AcpSession, ClientContext, ConfigOptions,
     ContextServerConfiguration, ForegroundWork, PendingSessionUpdates, ReadOnlyConfigOptions,
-    UnsupportedVersion, apply_v2_session_notification, close_undelivered_session,
-    drain_foreground_queue, enqueue_notification, first_class_terminal_auth_task,
-    is_disconnect_error, is_resource_not_found, map_acp_error, mcp_configurations_for_project,
-    runtime, transport, with_v2_client_ingress, work_dirs_from_session_info,
+    UnsupportedVersion, apply_v2_session_notification, claude_session_options,
+    close_undelivered_session, drain_foreground_queue, enqueue_notification,
+    first_class_terminal_auth_task, is_disconnect_error, is_resource_not_found, map_acp_error,
+    mcp_configurations_for_project, runtime, transport, with_v2_client_ingress,
+    work_dirs_from_session_info,
 };
 use acp_thread::{
     AcpThread, AgentConnection, AgentSessionConfigOptions, AgentSessionInfo, AgentSessionList,
@@ -190,6 +191,18 @@ fn shared_session_error(error: Arc<anyhow::Error>) -> anyhow::Error {
     } else {
         anyhow!(error)
     }
+}
+
+/// claude-agent-acp's session options (see `claude_session_options`), for Claude sessions.
+fn claude_session_meta(agent_id: &AgentId) -> Option<acp::Meta> {
+    if agent_id.as_ref() != crate::CLAUDE_AGENT_ID {
+        return None;
+    }
+    let options = claude_session_options()?;
+    Some(acp::Meta::from_iter([(
+        "claudeCode".into(),
+        serde_json::json!({ "options": options }),
+    )]))
 }
 
 /// An ACP v2 backend with auth, initial sessions/config and receipt-driven prompts.
@@ -1053,7 +1066,8 @@ impl AcpV2Connection {
         }
         let mut request = acp::ResumeSessionRequest::new(session_id.clone(), context.cwd.clone())
             .additional_directories(context.additional_directories.clone())
-            .mcp_servers(context.mcp_servers.clone());
+            .mcp_servers(context.mcp_servers.clone())
+            .meta(claude_session_meta(&self.id));
         if replay_history {
             request = request.replay_from(acp::ReplayFrom::Start(acp::ReplayFromStart::new()));
         }
@@ -1335,7 +1349,8 @@ impl AgentConnection for AcpV2Connection {
         };
         let mut request = acp::NewSessionRequest::new(context.cwd.clone())
             .additional_directories(context.additional_directories.clone())
-            .mcp_servers(context.mcp_servers.clone());
+            .mcp_servers(context.mcp_servers.clone())
+            .meta(claude_session_meta(&self.id));
         if self.supports_initial_config_options(cx) {
             // `apply_new_session_defaults` still runs after creation, so defaults the agent
             // ignored here (for example, ones that depend on another option) get another chance.

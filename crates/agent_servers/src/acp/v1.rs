@@ -1,11 +1,11 @@
 use super::{
     AcpDebugLog, AcpDebugMessage, AcpSession, AgentExtNotification, AgentExtNotifications,
     ClientContext, ConfigOptions, FlattenAcpResult as _, ForegroundWork, ReadOnlyConfigOptions,
-    UnsupportedVersion, apply_subagent_update, drain_foreground_queue, enqueue_notification,
-    enqueue_request, first_class_terminal_auth_task, handle_v2_complete_elicitation,
-    handle_v2_create_elicitation, map_acp_error, mcp_configurations_for_project, respond_err,
-    respond_result, runtime, session_thread, terminal_auth_task_id, transport,
-    with_v2_client_ingress, work_dirs_from_session_info,
+    UnsupportedVersion, apply_subagent_update, claude_session_options, drain_foreground_queue,
+    enqueue_notification, enqueue_request, first_class_terminal_auth_task,
+    handle_v2_complete_elicitation, handle_v2_create_elicitation, map_acp_error,
+    mcp_configurations_for_project, respond_err, respond_result, runtime, session_thread,
+    terminal_auth_task_id, transport, with_v2_client_ingress, work_dirs_from_session_info,
 };
 use acp_thread::{
     AgentConnection, AgentSessionInfo, AgentSessionList, AgentSessionListRequest,
@@ -549,10 +549,11 @@ fn claude_session_meta(agent_id: &AgentId) -> Option<acp::Meta> {
     .map(|subtype| serde_json::json!({ "type": "system", "subtype": subtype }))
     .chain([serde_json::json!({ "type": "result" })])
     .collect::<Vec<_>>();
-    Some(acp::Meta::from_iter([(
-        "claudeCode".into(),
-        serde_json::json!({ "emitRawSDKMessages": filters }),
-    )]))
+    let mut claude_code = serde_json::json!({ "emitRawSDKMessages": filters });
+    if let Some(options) = claude_session_options() {
+        claude_code["options"] = options;
+    }
+    Some(acp::Meta::from_iter([("claudeCode".into(), claude_code)]))
 }
 
 /// `acp_beta` advertises the unstable subagents and plan operations RFDs, which Zed only
