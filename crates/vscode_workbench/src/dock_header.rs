@@ -5,13 +5,16 @@ use gpui::{
     transparent_black,
 };
 use settings::{Settings, SettingsStore};
-use ui::{ContextMenu, PopoverMenu, Tooltip, prelude::*};
+use ui::{ContextMenu, Icon, PopoverMenu, Tooltip, prelude::*};
 use workspace::{
     ToggleZoom, Workspace,
     dock::{Dock, DockPosition, PanelHandle},
 };
 
-use crate::{PROJECT_PANEL_KEY, WorkbenchSettings, is_active_panel, panel_title, reveal_panel};
+use crate::{
+    Codicon, PROJECT_PANEL_KEY, WorkbenchSettings, action_button, is_active_panel, panel_icon_path,
+    panel_title, reveal_panel,
+};
 
 /// Height of VS Code's side bar and panel titles (`.part > .title` in `part.css`).
 const TITLE_HEIGHT: Pixels = px(35.);
@@ -160,7 +163,7 @@ impl DockHeader {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let icon = panel.icon(window, cx)?;
+        let icon_path = panel_icon_path(panel.as_ref(), window, cx)?;
         let label = panel
             .icon_tooltip(window, cx)
             .unwrap_or_else(|| panel.persistent_name());
@@ -182,18 +185,21 @@ impl DockHeader {
                 .border_b_1()
                 .border_color(border_color)
                 .child(
-                    IconButton::new(("dock-header-icon-tab", panel.panel_id().as_u64()), icon)
-                        .icon_size(IconSize::Medium)
-                        .icon_color(if is_active {
+                    action_button(
+                        ("dock-header-icon-tab", panel.panel_id().as_u64()),
+                        Icon::from_path(icon_path).color(if is_active {
                             Color::Default
                         } else {
                             Color::Muted
-                        })
-                        .aria_label(label)
-                        .tooltip(move |_window, cx| Tooltip::for_action(label, &*toggle_action, cx))
-                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        }),
+                    )
+                    .aria_label(label)
+                    .tooltip(move |_window, cx| Tooltip::for_action(label, &*toggle_action, cx))
+                    .on_click(cx.listener(
+                        move |this, _: &ClickEvent, window, cx| {
                             this.activate_tab(&panel, window, cx);
-                        })),
+                        },
+                    )),
                 )
                 .into_any_element(),
         )
@@ -260,8 +266,7 @@ impl DockHeader {
         PopoverMenu::new("dock-header-more-menu")
             .anchor(Anchor::TopRight)
             .trigger_with_tooltip(
-                IconButton::new("dock-header-more", IconName::Ellipsis)
-                    .icon_size(IconSize::Small)
+                action_button("dock-header-more", Codicon::Ellipsis.icon())
                     .aria_label("Views and More Actions..."),
                 Tooltip::text("Views and More Actions..."),
             )
@@ -305,8 +310,7 @@ impl DockHeader {
     }
 
     fn render_maximize_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        IconButton::new("dock-header-maximize", IconName::Maximize)
-            .icon_size(IconSize::Small)
+        action_button("dock-header-maximize", Codicon::ChevronUp.icon())
             .aria_label("Maximize Panel")
             .tooltip(|_window, cx| Tooltip::for_action("Maximize Panel", &ToggleZoom, cx))
             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
@@ -326,8 +330,7 @@ impl DockHeader {
         };
         let hide_action = self.dock.read(cx).toggle_action();
 
-        IconButton::new("dock-header-close", IconName::Close)
-            .icon_size(IconSize::Small)
+        action_button("dock-header-close", Codicon::Close.icon())
             .aria_label(label)
             .tooltip(move |_window, cx| Tooltip::for_action(label, &*hide_action, cx))
             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {

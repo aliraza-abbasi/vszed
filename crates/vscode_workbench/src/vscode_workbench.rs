@@ -12,7 +12,8 @@ pub use workbench_settings::{ActivityBarSettings, WorkbenchSettings};
 
 use std::sync::Arc;
 
-use gpui::{App, Entity, Focusable as _, SharedString, Window};
+use gpui::{App, Entity, Focusable as _, SharedString, Window, px};
+use ui::{ButtonLike, Icon, IconSize, prelude::*};
 use workspace::dock::{Dock, DockPosition, PanelHandle};
 
 const PROJECT_PANEL_KEY: &str = "ProjectPanel";
@@ -23,10 +24,86 @@ const COLLABORATION_PANEL_KEY: &str = "CollaborationPanel";
 const AGENT_PANEL_KEY: &str = "agent_panel";
 const TERMINAL_PANEL_KEY: &str = "TerminalPanel";
 
+/// VS Code's toolbar action size (`.monaco-action-bar .action-label`), used for
+/// the title bar and part title buttons.
+const ACTION_BUTTON_SIZE: Pixels = px(22.);
+
 pub fn init(cx: &mut App) {
     activity_bar::init(cx);
     dock_header::init(cx);
     preset::init(cx);
+}
+
+/// VS Code's UI icons, embedded from `assets/icons/codicons`.
+#[cfg_attr(test, derive(strum::EnumIter))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Codicon {
+    Account,
+    ChatSparkle,
+    ChevronUp,
+    Close,
+    DebugAlt,
+    Ellipsis,
+    Extensions,
+    Files,
+    LiveShare,
+    Search,
+    SettingsGear,
+    SourceControl,
+    SymbolClass,
+    Terminal,
+}
+
+impl Codicon {
+    fn path(self) -> &'static str {
+        match self {
+            Self::Account => "icons/codicons/account.svg",
+            Self::ChatSparkle => "icons/codicons/chat-sparkle.svg",
+            Self::ChevronUp => "icons/codicons/chevron-up.svg",
+            Self::Close => "icons/codicons/close.svg",
+            Self::DebugAlt => "icons/codicons/debug-alt.svg",
+            Self::Ellipsis => "icons/codicons/ellipsis.svg",
+            Self::Extensions => "icons/codicons/extensions.svg",
+            Self::Files => "icons/codicons/files.svg",
+            Self::LiveShare => "icons/codicons/live-share.svg",
+            Self::Search => "icons/codicons/search.svg",
+            Self::SettingsGear => "icons/codicons/settings-gear.svg",
+            Self::SourceControl => "icons/codicons/source-control.svg",
+            Self::SymbolClass => "icons/codicons/symbol-class.svg",
+            Self::Terminal => "icons/codicons/terminal.svg",
+        }
+    }
+
+    fn icon(self) -> Icon {
+        Icon::from_path(self.path())
+    }
+}
+
+/// The icon of a panel's button: the codicon of the VS Code view the panel
+/// stands for, or else the panel's own icon. `None` when the panel hides its
+/// button.
+fn panel_icon_path(panel: &dyn PanelHandle, window: &Window, cx: &App) -> Option<SharedString> {
+    let icon = panel.icon(window, cx)?;
+    let codicon = match panel.panel_key() {
+        PROJECT_PANEL_KEY => Codicon::Files,
+        GIT_PANEL_KEY => Codicon::SourceControl,
+        DEBUG_PANEL_KEY => Codicon::DebugAlt,
+        OUTLINE_PANEL_KEY => Codicon::SymbolClass,
+        COLLABORATION_PANEL_KEY => Codicon::LiveShare,
+        AGENT_PANEL_KEY => Codicon::ChatSparkle,
+        TERMINAL_PANEL_KEY => Codicon::Terminal,
+        _ => return Some(icon.path().into()),
+    };
+    Some(codicon.path().into())
+}
+
+/// A square toolbar button with a 16px icon, for icons that aren't an
+/// `IconName`.
+fn action_button(id: impl Into<ElementId>, icon: Icon) -> ButtonLike {
+    ButtonLike::new(id)
+        .width(ACTION_BUTTON_SIZE)
+        .height(ACTION_BUTTON_SIZE.into())
+        .child(icon.size(IconSize::Medium))
 }
 
 /// The VS Code name of the view a panel stands for, used for side bar titles and
@@ -110,6 +187,7 @@ mod test_support {
             cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
         let workspace =
             multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        cx.run_until_parked();
         (workspace, cx)
     }
 
@@ -271,4 +349,46 @@ mod test_support {
         "TerminalPanel",
         IconName::Terminal
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use strum::IntoEnumIterator as _;
+
+    use super::Codicon;
+
+    fn assets_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets")
+    }
+
+    #[test]
+    fn test_codicons_exist() {
+        for codicon in Codicon::iter() {
+            let path = assets_dir().join(codicon.path());
+            assert!(path.exists(), "{codicon:?} does not exist at {path:?}");
+        }
+    }
+
+    #[test]
+    fn test_only_used_codicons_are_bundled() {
+        let codicons_dir = assets_dir().join("icons/codicons");
+        let entries = std::fs::read_dir(&codicons_dir).expect("reading the codicons directory");
+        for entry in entries {
+            let path = entry.expect("reading a codicons directory entry").path();
+            if path.extension().is_none_or(|extension| extension != "svg") {
+                continue;
+            }
+            let file_name = path
+                .file_name()
+                .and_then(|file_name| file_name.to_str())
+                .expect("codicon file names are UTF-8");
+            let asset_path = format!("icons/codicons/{file_name}");
+            assert!(
+                Codicon::iter().any(|codicon| codicon.path() == asset_path),
+                "{asset_path} is bundled but not used"
+            );
+        }
+    }
 }

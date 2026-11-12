@@ -1,20 +1,21 @@
 use std::sync::Arc;
 
 use client::{SignIn, SignOut, UserStore};
-use gpui::{Action, Anchor, ClickEvent, Empty, Entity, Subscription, WeakEntity};
+use gpui::{Action, Anchor, ClickEvent, Empty, Entity, Subscription, WeakEntity, svg};
 use settings::{Settings, SettingsStore};
-use ui::{ContextMenu, CountBadge, IconButtonShape, PopoverMenu, Tooltip, prelude::*};
+use ui::{ButtonLike, ContextMenu, CountBadge, PopoverMenu, Tooltip, prelude::*};
 use workspace::{
     DeploySearch, HideStatusItem, ItemHandle, StatusItemView, Workspace,
     dock::{Dock, PanelButtons, PanelHandle},
 };
 
 use crate::{
-    DEBUG_PANEL_KEY, GIT_PANEL_KEY, PROJECT_PANEL_KEY, UseVsCodeLayout, WorkbenchSettings,
-    is_active_panel, reveal_panel,
+    Codicon, DEBUG_PANEL_KEY, GIT_PANEL_KEY, PROJECT_PANEL_KEY, UseVsCodeLayout, WorkbenchSettings,
+    is_active_panel, panel_icon_path, reveal_panel,
 };
 
 const ACTIVITY_BAR_WIDTH: Pixels = px(48.);
+const ACTIVITY_BAR_ICON_SIZE: Pixels = px(24.);
 const ACTIVE_INDICATOR_WIDTH: Pixels = px(2.);
 
 pub(crate) fn init(cx: &mut App) {
@@ -225,7 +226,7 @@ impl ActivityBar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let icon = panel.icon(window, cx)?;
+        let icon_path = panel_icon_path(panel.as_ref(), window, cx)?;
         let label = panel
             .icon_tooltip(window, cx)
             .unwrap_or_else(|| panel.persistent_name());
@@ -238,12 +239,17 @@ impl ActivityBar {
 
         // The active state is part of the id so the cached tooltip is rebuilt when the
         // panel is toggled from elsewhere, for example with a keybinding.
-        let button = activity_bar_button((panel.panel_key(), is_active as u64), icon, is_active)
-            .aria_label(label)
-            .tooltip(move |_window, cx| Tooltip::for_action(label, &*toggle_action, cx))
-            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                this.toggle_panel(&panel, window, cx);
-            }));
+        let button = activity_bar_button(
+            (panel.panel_key(), is_active as u64),
+            icon_path,
+            is_active,
+            cx,
+        )
+        .aria_label(label)
+        .tooltip(move |_window, cx| Tooltip::for_action(label, &*toggle_action, cx))
+        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+            this.toggle_panel(&panel, window, cx);
+        }));
 
         Some(render_entry_cell(is_active, button, badge, cx))
     }
@@ -259,7 +265,7 @@ impl ActivityBar {
             .anchor(Anchor::BottomLeft)
             .attach(Anchor::BottomRight)
             .trigger_with_tooltip(
-                activity_bar_button("activity-bar-accounts", IconName::Person, false)
+                activity_bar_button("activity-bar-accounts", Codicon::Account.path(), false, cx)
                     .aria_label("Accounts"),
                 Tooltip::text("Accounts"),
             )
@@ -288,14 +294,14 @@ impl Render for ActivityBar {
                 ActivityBarEntry::Panel(panel) => self.render_panel_entry(panel, window, cx),
                 ActivityBarEntry::Search => Some(render_action_entry(
                     "activity-bar-search",
-                    IconName::MagnifyingGlass,
+                    Codicon::Search,
                     "Search",
                     DeploySearch::default().boxed_clone(),
                     cx,
                 )),
                 ActivityBarEntry::Extensions => Some(render_action_entry(
                     "activity-bar-extensions",
-                    IconName::Blocks,
+                    Codicon::Extensions,
                     "Extensions",
                     zed_actions::Extensions::default().boxed_clone(),
                     cx,
@@ -329,22 +335,37 @@ impl Render for ActivityBar {
                         None,
                         cx,
                     ))
-                    .child(render_entry_cell(false, render_manage_menu(), None, cx)),
+                    .child(render_entry_cell(false, render_manage_menu(cx), None, cx)),
             )
     }
 }
 
-fn activity_bar_button(id: impl Into<ElementId>, icon: IconName, is_active: bool) -> IconButton {
-    IconButton::new(id, icon)
-        .shape(IconButtonShape::Square)
+fn activity_bar_button(
+    id: impl Into<ElementId>,
+    icon_path: impl Into<SharedString>,
+    is_active: bool,
+    cx: &App,
+) -> ButtonLike {
+    let icon_color = if is_active {
+        Color::Default
+    } else {
+        Color::Muted
+    };
+    let hover_color = Color::Default.color(cx);
+    ButtonLike::new(id)
         .style(ButtonStyle::Transparent)
-        .icon_size(IconSize::Custom(rems_from_px(24_f32)))
-        .icon_color(if is_active {
-            Color::Default
-        } else {
-            Color::Muted
-        })
-        .hover_color(Color::Default)
+        .width(ACTIVITY_BAR_WIDTH)
+        .height(ACTIVITY_BAR_WIDTH.into())
+        .child(
+            // `Icon` only exposes a hover color inside the `ui` crate, so the icon
+            // is drawn directly to brighten it on hover like VS Code does.
+            svg()
+                .path(icon_path.into())
+                .size(ACTIVITY_BAR_ICON_SIZE)
+                .flex_none()
+                .text_color(icon_color.color(cx))
+                .group_hover("", move |style| style.text_color(hover_color)),
+        )
 }
 
 fn render_entry_cell(
@@ -383,26 +404,31 @@ fn render_entry_cell(
 
 fn render_action_entry(
     id: &'static str,
-    icon: IconName,
+    codicon: Codicon,
     label: &'static str,
     action: Box<dyn Action>,
     cx: &App,
 ) -> AnyElement {
     let tooltip_action = action.boxed_clone();
-    let button = activity_bar_button(id, icon, false)
+    let button = activity_bar_button(id, codicon.path(), false, cx)
         .aria_label(label)
         .tooltip(move |_window, cx| Tooltip::for_action(label, &*tooltip_action, cx))
         .on_click(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx));
     render_entry_cell(false, button, None, cx)
 }
 
-fn render_manage_menu() -> impl IntoElement {
+fn render_manage_menu(cx: &App) -> impl IntoElement {
     PopoverMenu::new("activity-bar-manage-menu")
         .anchor(Anchor::BottomLeft)
         .attach(Anchor::BottomRight)
         .trigger_with_tooltip(
-            activity_bar_button("activity-bar-manage", IconName::Settings, false)
-                .aria_label("Manage"),
+            activity_bar_button(
+                "activity-bar-manage",
+                Codicon::SettingsGear.path(),
+                false,
+                cx,
+            )
+            .aria_label("Manage"),
             Tooltip::text("Manage"),
         )
         .menu(|window, cx| {
