@@ -433,6 +433,24 @@ impl StatusBar {
         cx.notify();
     }
 
+    /// Adds an item that is drawn at the far right of the status bar, right of
+    /// every existing item. [`Self::add_right_item`] draws new items left of the
+    /// existing right side items instead.
+    pub fn add_rightmost_item<T>(
+        &mut self,
+        item: Entity<T>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) where
+        T: 'static + StatusItemView,
+    {
+        let active_pane_item = self.active_pane.read(cx).active_item();
+        item.set_active_pane_item(active_pane_item.as_deref(), window, cx);
+
+        self.right_items.insert(0, Box::new(item));
+        cx.notify();
+    }
+
     pub fn set_active_pane(
         &mut self,
         active_pane: &Entity<Pane>,
