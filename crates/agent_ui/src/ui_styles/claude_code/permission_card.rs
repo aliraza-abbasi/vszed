@@ -229,7 +229,7 @@ impl ThreadView {
                     .font_weight(FontWeight::SEMIBOLD)
                     .child(prompt.title.clone()),
             )
-            .children(prompt.description.clone().map(|description| {
+            .children(prompt.description.map(|description| {
                 Label::new(description)
                     .size(LabelSize::Small)
                     .color(Color::Muted)
