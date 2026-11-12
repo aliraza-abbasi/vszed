@@ -670,9 +670,9 @@ impl ThreadView {
                                     .color(Color::Muted),
                             )
                         })
-                })),
+                }))
+                .into_any_element(),
         )
-        .map(IntoElement::into_any_element)
     }
 
     /// The hover button on a sent message's corner that opens Claude Code's
