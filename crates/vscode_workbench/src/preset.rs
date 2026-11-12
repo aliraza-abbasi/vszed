@@ -8,7 +8,7 @@ use futures::channel::oneshot;
 use gpui::{App, AsyncApp, Context, Entity, Task, WeakEntity, Window, actions};
 use serde::{Deserialize, Serialize};
 use settings::{
-    BaseKeymapContent, BottomDockLayout, BufferLineHeight, DockPosition, DockSide,
+    BaseKeymapContent, BottomDockLayout, BufferLineHeight, DisplayIn, DockPosition, DockSide,
     EncodingDisplayOptions, FontFamilyName, FontSize, IconThemeName, IconThemeSelection,
     MinimapThumb, SettingsContent, SettingsStore, ShowDiagnostics, ShowMinimap,
     TerminalDockPosition, ThemeAppearanceMode, ThemeName, ThemeSelection,
@@ -300,6 +300,7 @@ struct LayoutSnapshot {
     tab_git_status: Option<bool>,
     tab_diagnostics: Option<ShowDiagnostics>,
     minimap: Option<ShowMinimap>,
+    minimap_display_in: Option<DisplayIn>,
     minimap_thumb: Option<MinimapThumb>,
     minimap_max_width_columns: Option<NonZeroU32>,
     minimap_line_height: Option<BufferLineHeight>,
@@ -308,6 +309,7 @@ struct LayoutSnapshot {
     breadcrumbs: Option<bool>,
     buffer_font_family: Option<FontFamilyName>,
     buffer_font_size: Option<FontSize>,
+    buffer_line_height: Option<BufferLineHeight>,
     ui_font_size: Option<FontSize>,
     theme: Option<ThemeSelection>,
     icon_theme: Option<IconThemeSelection>,
@@ -356,6 +358,7 @@ impl LayoutSnapshot {
             tab_git_status: tabs.and_then(|tabs| tabs.git_status),
             tab_diagnostics: tabs.and_then(|tabs| tabs.show_diagnostics),
             minimap: minimap.and_then(|minimap| minimap.show),
+            minimap_display_in: minimap.and_then(|minimap| minimap.display_in),
             minimap_thumb: minimap.and_then(|minimap| minimap.thumb),
             minimap_max_width_columns: minimap.and_then(|minimap| minimap.max_width_columns),
             minimap_line_height: minimap.and_then(|minimap| minimap.line_height),
@@ -370,6 +373,7 @@ impl LayoutSnapshot {
                 .and_then(|toolbar| toolbar.breadcrumbs),
             buffer_font_family: content.theme.buffer_font_family.clone(),
             buffer_font_size: content.theme.buffer_font_size,
+            buffer_line_height: content.theme.buffer_line_height,
             ui_font_size: content.theme.ui_font_size,
             theme: content.theme.theme.clone(),
             icon_theme: content.theme.icon_theme.clone(),
@@ -426,6 +430,7 @@ impl LayoutSnapshot {
         });
         update_nested(&mut content.editor.minimap, |minimap| {
             minimap.show = self.minimap;
+            minimap.display_in = self.minimap_display_in;
             minimap.thumb = self.minimap_thumb;
             minimap.max_width_columns = self.minimap_max_width_columns;
             minimap.line_height = self.minimap_line_height;
@@ -439,6 +444,7 @@ impl LayoutSnapshot {
         });
         content.theme.buffer_font_family = self.buffer_font_family.clone();
         content.theme.buffer_font_size = self.buffer_font_size;
+        content.theme.buffer_line_height = self.buffer_line_height;
         content.theme.ui_font_size = self.ui_font_size;
         content.theme.theme = self.theme.clone();
         content.theme.icon_theme = self.icon_theme.clone();
@@ -475,6 +481,8 @@ impl LayoutSnapshot {
         self.tab_git_status = Some(true);
         self.tab_diagnostics = Some(ShowDiagnostics::Errors);
         self.minimap = Some(ShowMinimap::Always);
+        // VS Code draws a minimap in every editor group, not only the focused one.
+        self.minimap_display_in = Some(DisplayIn::AllEditors);
         // VS Code's `editor.minimap.showSlider` default.
         self.minimap_thumb = Some(MinimapThumb::Hover);
         // Zed's minimap is 15% of the text width, capped at this many columns.
@@ -499,6 +507,12 @@ impl LayoutSnapshot {
         };
         self.buffer_font_family = Some(FontFamilyName(buffer_font_family.into()));
         self.buffer_font_size = Some(FontSize(buffer_font_size));
+        // VS Code's `editor.lineHeight` defaults to 0 (`EDITOR_FONT_DEFAULTS`),
+        // which computes the line height as the font size times
+        // `GOLDEN_LINE_HEIGHT_RATIO` from `src/vs/editor/common/config/fontInfo.ts`:
+        // 1.5 on macOS and 1.35 elsewhere.
+        let buffer_line_height = if cfg!(target_os = "macos") { 1.5 } else { 1.35 };
+        self.buffer_line_height = Some(BufferLineHeight::Custom(buffer_line_height));
         // Zed renders most UI labels at 0.875 of `ui_font_size`, so 15 gives
         // VS Code's 13px workbench text.
         self.ui_font_size = Some(FontSize(15.));
@@ -529,6 +543,7 @@ mod tests {
     const ORIGINAL_SETTINGS: &str = r#"{
         "base_keymap": "JetBrains",
         "buffer_font_size": 15,
+        "buffer_line_height": "standard",
         "theme": "One Dark",
         "vim_mode": true,
         "project_panel": { "dock": "right", "default_width": 300 },
@@ -623,6 +638,7 @@ mod tests {
         assert_eq!(applied["tabs"]["git_status"], json!(true));
         assert_eq!(applied["tabs"]["show_diagnostics"], json!("errors"));
         assert_eq!(applied["minimap"]["show"], json!("always"));
+        assert_eq!(applied["minimap"]["display_in"], json!("all_editors"));
         assert_eq!(applied["minimap"]["thumb"], json!("hover"));
         assert_eq!(applied["minimap"]["max_width_columns"], json!(120));
         assert_eq!(applied["minimap"]["line_height"], json!({ "custom": 1.0 }));
@@ -642,6 +658,11 @@ mod tests {
         };
         assert_eq!(applied["buffer_font_family"], json!(expected_font_family));
         assert_eq!(applied["buffer_font_size"], json!(expected_font_size));
+        let expected_line_height: f32 = if cfg!(target_os = "macos") { 1.5 } else { 1.35 };
+        assert_eq!(
+            applied["buffer_line_height"],
+            json!({ "custom": expected_line_height })
+        );
         assert_eq!(applied["ui_font_size"], json!(15.0));
         assert_eq!(
             applied["theme"],
@@ -661,6 +682,7 @@ mod tests {
         assert_eq!(restored["search"]["button"], json!(true));
         assert_eq!(restored["tab_bar"]["show_nav_history_buttons"], json!(true));
         assert_eq!(restored["status_bar"]["line_endings_button"], json!(false));
+        assert_eq!(restored["buffer_line_height"], json!("standard"));
         assert!(
             restored["status_bar"]
                 .get("active_encoding_button")
