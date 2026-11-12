@@ -19460,6 +19460,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
+name = "upstream_release_notifier"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "db",
+ "futures 0.3.34",
+ "gpui",
+ "http_client",
+ "log",
+ "project",
+ "release_channel",
+ "semver",
+ "serde",
+ "serde_json",
+ "settings",
+ "ui",
+ "util",
+ "workspace",
+]
+
+[[package]]
 name = "url"
 version = "2.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"

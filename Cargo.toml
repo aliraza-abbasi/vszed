@@ -231,6 +231,7 @@ members = [
     "crates/ui_input",
     "crates/ui_macros",
     "crates/ui_prompt",
+    "crates/upstream_release_notifier",
     "crates/util",
     "crates/util_macros",
     "crates/vim",
@@ -505,6 +506,7 @@ ui = { path = "crates/ui" }
 ui_input = { path = "crates/ui_input" }
 ui_macros = { path = "crates/ui_macros" }
 ui_prompt = { path = "crates/ui_prompt" }
+upstream_release_notifier = { path = "crates/upstream_release_notifier" }
 util = { path = "crates/util" }
 util_macros = { path = "crates/util_macros" }
 vim = { path = "crates/vim" }
