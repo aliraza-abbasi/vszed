@@ -12,6 +12,8 @@ upstream files. Use this list when resolving rebase conflicts and when folding i
 | `crates/agent_ui/src/conversation_view/thread_view.rs` (~64) | `#[path = "../ui_styles/claude_code/thread.rs"] mod claude_code_thread;` so the renderer can use `ThreadView` internals | +3 |
 | `crates/agent_ui/src/conversation_view/thread_view.rs` (`render_entries`, ~7411) | early return to `render_claude_code_entries` when `agent.ui_style` is `claude_code` | +3 |
 | `crates/agent_ui/src/conversation_view/thread_view.rs` (`render_message_editor`, ~5570) | early return to `render_claude_code_message_editor` (after the subagent case) | +3 |
+| `crates/agent_ui/src/conversation_view/thread_view.rs` (`activity_bar_bg` ~3997, `render_activity_bar` ~4009) | `activity_bar_bg` returns the editor background in the Claude Code style, and `render_activity_bar` returns early to `render_claude_code_activity_bar` (same rows, drawn like the prompt box) | +6 |
+| `crates/agent_ui/src/message_editor.rs` (`MessageEditor::render`, ~2094) | `let text_style = crate::ui_styles::message_editor_text_style(text_style, cx);`, which swaps in the UI font family and size in the Claude Code style (prompt box and editable sent messages) | +1 |
 | `crates/agent_ui/src/config_options.rs` (~33, ~1016) | `pub(crate)` on `ConfigOptionsView::{config_options, agent_server, fs}` and `set_config_option_and_default`, so the model and mode chips can read and set the adapter's options | 4 changed |
 | `crates/agent_ui/src/agent_panel.rs` (imports, `NewThread` handler ~366, `open_thread` ~1680, `new_thread` ~1770, `load_agent_thread` ~4530) | route thread opens to editor tabs when `agent.thread_location` is `editor` (`ui_styles::thread_item::route_to_thread_tab`); `load_agent_thread` only routes user-initiated opens (`focus`), so the panel's startup restore stays in the panel | +20 |
 | `assets/keymaps/default-{macos,linux,windows}.json` (end) | `Workspace` block: `cmd-escape` / `ctrl-escape` → `agent::ToggleThreadTabFocus`, `cmd-shift-escape` / `ctrl-shift-escape` → `agent::NewThreadTab`. Both actions call `cx.propagate()` unless thread tabs or the Claude Code style are on, so the stock `menu::Cancel` binding still gets the keystroke | +10 each |
@@ -22,10 +24,26 @@ Notes:
   not fields on `AgentSettings`, so no exhaustive `AgentSettings { .. }` literal needs to change
   and `assets/settings/default.json` is untouched. On fold-in, move them into `AgentSettings`
   and add `default.json` and Settings UI entries.
-- The style is swapped at the conversation list and the message editor area. The `ThreadView`
-  root (action handlers, callouts, queue, activity bar) is shared by both styles.
-- `ui_styles/claude_code/prompt_box.rs` is declared from `thread.rs` with a nested `#[path]`,
-  so it is also a descendant of `thread_view` without another hook line.
+- The style is swapped at the conversation list, the activity bar and the message editor
+  area. The `ThreadView` root (action handlers, callouts) is shared by both styles.
+- `ui_styles/claude_code/prompt_box.rs` and `ui_styles/claude_code/permission_card.rs` are
+  declared from `thread.rs` with a nested `#[path]`, so they are also descendants of
+  `thread_view` without another hook line.
+- `render_claude_code_activity_bar` (in `prompt_box.rs`) repeats the composition of upstream
+  `render_activity_bar` (permission rows, plan, edited files, queue) with the prompt box's
+  container. When upstream changes `render_activity_bar`, port the change. It leaves out the
+  permission rows while the permission card is up.
+- Permission card (B4): a pending request whose options are a flat list (every ACP v2 request,
+  and ACP v1 `PermissionOptions::Flat`, which is what claude-agent-acp sends) replaces the prompt
+  box with the card, and the tool row drops Zed's inline buttons for it. Zed's own agent
+  (dropdown choices with patterns) keeps Zed's buttons. Answers go through the same paths as
+  Zed's buttons: `ThreadView::authorize_permission_request` (v1) and
+  `ConversationView::select_permission_option` / `cancel_permission_request` (v2). The card's
+  focus handle and highlighted option live in `ThreadActivity`.
+- Preset: `ui_styles/preset.rs` registers `agent::UseClaudeCodeStyle` and
+  `agent::RestorePreviousUiStyle` on every workspace. The user's previous `agent.ui_style` and
+  `agent.thread_location` are kept in the KV store under `agent_ui_style_previous_settings`
+  until restored.
 - Per-thread timeline state (user message send times, thought durations) is kept in a
   `ClaudeCodeActivity` global keyed by `ThreadView` entity id, populated through
   `cx.observe_new::<ThreadView>` in `ui_styles::claude_code::init`. On fold-in this becomes a
