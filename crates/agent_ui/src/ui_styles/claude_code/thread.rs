@@ -11,24 +11,73 @@ mod claude_code_prompt_box;
 use super::*;
 use crate::ui_styles::claude_code::{
     ClaudeCodeSpinnerElement, StepStatus, TIMELINE_GUTTER, TimelineDot, ToolOutputTab, ToolRow,
-    edit_line_stats, format_timestamp, is_long_tool_text, remove_output_tab, set_output_tab,
+    attachment_name, edit_line_stats, format_day, format_timestamp, is_long_tool_text,
+    remove_output_tab, sent_message_text, set_output_tab, set_user_message_overflows,
     summarize_tool_call, thought_has_summary, thought_label, thread_activity, timeline_row,
-    toggle_thoughts_expanded, tool_output_text, tool_output_title, ui_font_text_style,
+    toggle_thoughts_expanded, toggle_user_message_expanded, tool_output_text, tool_output_title,
+    transcript_markdown_style, ui_font_text_style,
 };
+use chrono::Local;
 use claude_code_permission_card::claude_code_card_handles;
-use editor::{EditorElement, EditorStyle};
+use gpui::{StyledText, canvas, point};
+use ui::{ContextMenuEntry, DocumentationSide};
+use util::paths::PathStyle;
 use workspace::SplitDirection;
+
+/// Claude Code clamps a sent message to 60px of text, fading the last 50px.
+const USER_MESSAGE_COLLAPSED_HEIGHT: Pixels = px(60.);
+const USER_MESSAGE_FADE_HEIGHT: Pixels = px(50.);
+const WAVE_LENGTH: f32 = 8.;
+const WAVE_AMPLITUDE: f32 = 2.;
+const MAX_WAVE_WIDTH: f32 = 8192.;
+
+/// One side of Claude Code's date line: a thin wave filling the space.
+fn wavy_line(cx: &App) -> AnyElement {
+    let color = cx.theme().colors().border;
+    canvas(
+        |_, _, _| {},
+        move |bounds, _, window, _| {
+            let width = f32::from(bounds.size.width);
+            // Layout can hand an unconstrained canvas an infinite width.
+            if !width.is_finite() || width <= 0. {
+                return;
+            }
+            let half_wave = WAVE_LENGTH / 2.;
+            let half_wave_count = (width.min(MAX_WAVE_WIDTH) / half_wave).ceil() as usize;
+            let middle = bounds.center().y;
+            let mut builder = gpui::PathBuilder::stroke(px(1.));
+            builder.move_to(point(bounds.left(), middle));
+            for index in 0..half_wave_count {
+                let start = index as f32 * half_wave;
+                let direction = if index % 2 == 0 { -1. } else { 1. };
+                builder.curve_to(
+                    point(bounds.left() + px(start + half_wave), middle),
+                    point(
+                        bounds.left() + px(start + half_wave / 2.),
+                        middle + px(direction * WAVE_AMPLITUDE * 2.),
+                    ),
+                );
+            }
+            match builder.build() {
+                Ok(path) => window.paint_path(path, color),
+                Err(error) => log::debug!("failed to build the date line: {error}"),
+            }
+        },
+    )
+    .flex_1()
+    .h(px(WAVE_AMPLITUDE * 4.))
+    .into_any_element()
+}
 
 impl ThreadView {
     pub(super) fn render_claude_code_entries(&mut self, cx: &mut Context<Self>) -> List {
-        let max_content_width = AgentSettings::get_global(cx).max_content_width;
+        // Claude Code's transcript spans the whole editor width, so Zed's
+        // `max_content_width` doesn't apply.
         let centered_container = move |content: AnyElement| {
-            h_flex().w_full().justify_center().child(
-                div()
-                    .when_some(max_content_width, |this, max_width| this.max_w(max_width))
-                    .w_full()
-                    .child(content),
-            )
+            h_flex()
+                .w_full()
+                .justify_center()
+                .child(div().w_full().child(content))
         };
 
         list(
@@ -178,9 +227,11 @@ impl ThreadView {
         }
     }
 
-    /// Claude Code's only control under a response is **Copy response**, shown
-    /// while the response is hovered. Zed's other turn controls (feedback,
-    /// scroll to the prompt or to the top, turn stats) have no counterpart there.
+    /// Claude Code shows **Copy response** under a response while it is
+    /// hovered, lined up with the response text. Its other icon, **Bookmark
+    /// response**, is the extension's own feature with nothing behind it in
+    /// ACP. Zed's other turn controls (feedback, scroll to the prompt or to the
+    /// top, turn stats) have no counterpart there.
     fn render_claude_code_turn_controls(
         &self,
         entry_ix: usize,
@@ -200,9 +251,9 @@ impl ThreadView {
         Some(
             h_flex()
                 .w_full()
-                .px_5()
+                .pl(px(20.) + TIMELINE_GUTTER)
+                .pr_5()
                 .pb_1()
-                .justify_end()
                 .debug_selector(move || format!("claude-code-turn-controls-{entry_ix}"))
                 .child(
                     CopyButton::new(("claude-code-copy-response", entry_ix), "")
@@ -270,8 +321,6 @@ impl ThreadView {
             .iter()
             .all(acp_thread::content::can_convert_to_v1);
         let is_editable = can_rewind && source_is_representable;
-        let sent_at = thread_activity(cx.entity_id(), cx)
-            .and_then(|activity| activity.user_message_sent_at(entry_ix));
 
         let colors = cx.theme().colors();
         let focus_border = colors.border_focused;
@@ -317,6 +366,13 @@ impl ThreadView {
                 )
         });
 
+        let hover_group = SharedString::from(format!("claude-code-user-message-{entry_ix}"));
+        let body = if editing {
+            editor.clone().into_any_element()
+        } else {
+            self.render_claude_code_sent_message(entry_ix, message, hover_group.clone(), cx)
+        };
+
         Some(
             v_flex()
                 .id(("claude-code-user-message", entry_ix))
@@ -326,21 +382,15 @@ impl ThreadView {
                 .pt_4()
                 .pb_2()
                 .gap_1()
-                .when_some(sent_at, |this, sent_at| {
-                    this.child(
-                        h_flex().w_full().justify_end().child(
-                            Label::new(format_timestamp(sent_at))
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
-                        ),
-                    )
-                })
+                .children(self.render_claude_code_message_stamp((entry_ix, 0), cx))
                 .child(
                     div()
                         .relative()
                         .w_full()
+                        .group(hover_group.clone())
                         .child(
                             div()
+                                .id(("claude-code-user-message-box", entry_ix))
                                 .w_full()
                                 .p(px(10.))
                                 .rounded(px(6.))
@@ -349,46 +399,303 @@ impl ThreadView {
                                 .when(editing && !editor_focused, |this| this.border_dashed())
                                 .bg(colors.elevated_surface_background)
                                 .when(is_editable && !editing, |this| {
+                                    // Clicking focuses the message's editor, which
+                                    // starts editing it.
                                     this.hover(|style| {
                                         style.border_color(focus_border.opacity(0.8))
                                     })
+                                    .on_click(
+                                        move |_event, window, cx| {
+                                            let editor_focus = editor.focus_handle(cx);
+                                            window.focus(&editor_focus, cx);
+                                        },
+                                    )
                                 })
-                                .child(if editing {
-                                    editor.into_any_element()
-                                } else {
-                                    Self::render_claude_code_sent_message(&editor, cx)
-                                }),
+                                .child(body),
                         )
-                        .children(edit_controls),
+                        .children(edit_controls)
+                        .when(!editing, |this| {
+                            this.child(self.render_claude_code_rewind_button(entry_ix, hover_group))
+                        }),
                 )
                 .into_any_element(),
         )
     }
 
-    /// A sent message reads as plain UI text directly inside its box, like
-    /// Claude Code. The message's own editor still renders it, so mention
-    /// creases stay, and clicking it focuses the editor to start editing,
-    /// which switches to the full `MessageEditor`.
+    /// A sent message like Claude Code draws it: attachments as a row of
+    /// chips, then the text in the UI font, clamped to a few lines with
+    /// "Show more" on hover. Mentions read as "@name", as typed.
     fn render_claude_code_sent_message(
-        message_editor: &Entity<MessageEditor>,
+        &self,
+        entry_ix: usize,
+        message: &acp_thread::UserMessage,
+        hover_group: SharedString,
         cx: &Context<Self>,
     ) -> AnyElement {
-        let editor = message_editor.read(cx).editor().clone();
+        let thread_view_id = cx.entity_id();
+        let activity = thread_activity(thread_view_id, cx);
+        let is_expanded =
+            activity.is_some_and(|activity| activity.is_user_message_expanded(entry_ix));
+        let overflows = activity.is_some_and(|activity| activity.user_message_overflows(entry_ix));
+        let path_style = self.claude_code_path_style(cx);
+        let text = sent_message_text(message.content.source_blocks(), path_style);
         let text_style = ui_font_text_style(cx);
-        div()
+        let colors = cx.theme().colors();
+        let background = colors.elevated_surface_background;
+
+        let toggle_expanded = |label: &'static str, id: &'static str| {
+            div()
+                .id((id, entry_ix))
+                .debug_selector(move || format!("{id}-{entry_ix}"))
+                .px_2()
+                .py_1()
+                .rounded(px(4.))
+                .bg(colors.text)
+                .text_color(colors.elevated_surface_background)
+                .text_ui_sm(cx)
+                .cursor_pointer()
+                .child(label)
+                .on_click(cx.listener(move |_this, _event: &ClickEvent, _window, cx| {
+                    // The click must not also start editing the message.
+                    cx.stop_propagation();
+                    toggle_user_message_expanded(cx.entity_id(), entry_ix, cx);
+                    cx.notify();
+                }))
+        };
+
+        let text_block = (!text.is_empty()).then(|| {
+            div()
+                .relative()
+                .w_full()
+                .when(!is_expanded, |this| {
+                    this.max_h(USER_MESSAGE_COLLAPSED_HEIGHT).overflow_hidden()
+                })
+                .child(
+                    div()
+                        .w_full()
+                        .on_children_prepainted(move |bounds, _window, cx| {
+                            let height = bounds
+                                .first()
+                                .map(|bounds| bounds.size.height)
+                                .unwrap_or_default();
+                            set_user_message_overflows(
+                                thread_view_id,
+                                entry_ix,
+                                height > USER_MESSAGE_COLLAPSED_HEIGHT + px(1.),
+                                cx,
+                            );
+                        })
+                        .child(StyledText::new(text).with_default_highlights(&text_style, [])),
+                )
+                .when(overflows && !is_expanded, |this| {
+                    this.child(
+                        div()
+                            .absolute()
+                            .left_0()
+                            .right_0()
+                            .bottom_0()
+                            .h(USER_MESSAGE_FADE_HEIGHT)
+                            .bg(linear_gradient(
+                                180.,
+                                linear_color_stop(background.opacity(0.), 0.),
+                                linear_color_stop(background, 1.),
+                            )),
+                    )
+                    .child(
+                        div().absolute().right_0().bottom_0().child(
+                            toggle_expanded("Show more", "claude-code-show-more")
+                                .invisible()
+                                .group_hover(hover_group.clone(), |style| style.visible()),
+                        ),
+                    )
+                })
+        });
+
+        v_flex()
             .w_full()
-            .child(EditorElement::new(
-                &editor,
-                EditorStyle {
-                    background: gpui::transparent_black(),
-                    local_player: cx.theme().players().local(),
-                    text: text_style,
-                    syntax: cx.theme().syntax().clone(),
-                    inlay_hints_style: editor::make_inlay_hints_style(cx),
-                    ..Default::default()
-                },
-            ))
+            .gap_1p5()
+            .children(self.render_claude_code_attachment_chips(entry_ix, message, path_style, cx))
+            .children(text_block)
+            .when(overflows && is_expanded, |this| {
+                this.child(
+                    h_flex()
+                        .w_full()
+                        .justify_end()
+                        .child(toggle_expanded("Show less", "claude-code-show-less")),
+                )
+            })
             .into_any_element()
+    }
+
+    fn claude_code_path_style(&self, cx: &App) -> PathStyle {
+        self.project
+            .upgrade()
+            .map(|project| project.read(cx).path_style(cx))
+            .unwrap_or_else(PathStyle::local)
+    }
+
+    /// Images sent with a message, as Claude Code's attachment chips: a
+    /// thumbnail, the file name and the pixel size.
+    fn render_claude_code_attachment_chips(
+        &self,
+        entry_ix: usize,
+        message: &acp_thread::UserMessage,
+        path_style: PathStyle,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        let names = message
+            .content
+            .source_blocks()
+            .iter()
+            .filter_map(|block| match block {
+                acp_v2::ContentBlock::Image(image) => Some(attachment_name(
+                    image.uri.as_deref(),
+                    &image.mime_type.0,
+                    path_style,
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if names.is_empty() {
+            return None;
+        }
+        let images = message
+            .content
+            .blocks()
+            .filter_map(|block| block.image().map(|(image, size)| (image.clone(), size)))
+            .collect::<Vec<_>>();
+        let colors = cx.theme().colors();
+        Some(
+            h_flex()
+                .debug_selector(move || format!("claude-code-attachments-{entry_ix}"))
+                .w_full()
+                .flex_wrap()
+                .gap_1()
+                .children(names.into_iter().enumerate().map(|(index, name)| {
+                    let image = images.get(index).cloned();
+                    h_flex()
+                        .id(("claude-code-attachment", index))
+                        .gap_1()
+                        .px_1()
+                        .py_0p5()
+                        .rounded_sm()
+                        .bg(colors.element_background)
+                        .when_some(image.as_ref(), |this, (image, _)| {
+                            this.child(
+                                img(image.clone())
+                                    .flex_none()
+                                    .size(px(14.))
+                                    .rounded_xs()
+                                    .object_fit(ObjectFit::Cover),
+                            )
+                        })
+                        .child(Label::new(name).size(LabelSize::Small))
+                        .when_some(image.and_then(|(_, size)| size), |this, size| {
+                            this.child(
+                                Label::new(format!("{}×{}", size.width, size.height))
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            )
+                        })
+                })),
+        )
+        .map(IntoElement::into_any_element)
+    }
+
+    /// The hover button on a sent message's corner that opens Claude Code's
+    /// rewind menu. Its actions need ACP plumbing vszed doesn't have yet:
+    /// forking needs Zed's agent client to send `session/fork` with a fork
+    /// point, and claude-agent-acp doesn't expose Claude's file checkpoints.
+    fn render_claude_code_rewind_button(
+        &self,
+        entry_ix: usize,
+        hover_group: SharedString,
+    ) -> AnyElement {
+        const FORK_UNAVAILABLE: &str =
+            "Not available yet: Zed's agent client doesn't send ACP session/fork.";
+        const REWIND_UNAVAILABLE: &str =
+            "Not available: the Claude adapter doesn't expose Claude's file checkpoints.";
+        let unavailable_entry = |label: &'static str, reason: &'static str| {
+            ContextMenuEntry::new(label)
+                .disabled(true)
+                .documentation_aside(DocumentationSide::Left, move |_| {
+                    Label::new(reason).into_any_element()
+                })
+        };
+        div()
+            .absolute()
+            .top(px(-10.))
+            .right(px(-10.))
+            .child(
+                PopoverMenu::new(("claude-code-rewind-menu", entry_ix))
+                    .trigger_with_tooltip(
+                        IconButton::new(("claude-code-rewind", entry_ix), IconName::Undo)
+                            .style(ButtonStyle::Filled)
+                            .icon_size(IconSize::XSmall)
+                            .icon_color(Color::Muted)
+                            .visible_on_hover(hover_group),
+                        Tooltip::text("Rewind"),
+                    )
+                    .anchor(gpui::Anchor::TopRight)
+                    .menu(move |window, cx| {
+                        Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                            menu.item(unavailable_entry(
+                                "Fork conversation from here",
+                                FORK_UNAVAILABLE,
+                            ))
+                            .item(unavailable_entry("Rewind code to here", REWIND_UNAVAILABLE))
+                            .item(unavailable_entry(
+                                "Fork conversation and rewind code",
+                                REWIND_UNAVAILABLE,
+                            ))
+                        }))
+                    }),
+            )
+            .into_any_element()
+    }
+
+    /// Claude Code's muted time above a message, preceded by a date line
+    /// where the day changes.
+    fn render_claude_code_message_stamp(
+        &self,
+        key: (usize, usize),
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        let activity = thread_activity(cx.entity_id(), cx)?;
+        let time = activity.message_time(key)?;
+        let starts_new_day = activity.starts_new_day(key);
+        let (entry_ix, chunk_ix) = key;
+        Some(
+            v_flex()
+                .w_full()
+                .gap_2()
+                .when(starts_new_day, |this| {
+                    this.child(
+                        h_flex()
+                            .debug_selector(move || {
+                                format!("claude-code-day-line-{entry_ix}-{chunk_ix}")
+                            })
+                            .w_full()
+                            .py_2()
+                            .gap_2()
+                            .child(wavy_line(cx))
+                            .child(
+                                Label::new(format_day(time, Local::now()))
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            )
+                            .child(wavy_line(cx)),
+                    )
+                })
+                .child(
+                    h_flex().w_full().justify_end().child(
+                        Label::new(format_timestamp(time))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+                )
+                .into_any_element(),
+        )
     }
 
     fn render_claude_code_assistant_message(
@@ -403,6 +710,7 @@ impl ThreadView {
             && entry_ix + 1 == thread.entries().len();
         let last_chunk_ix = message.chunks.len().checked_sub(1);
         let activity = thread_activity(cx.entity_id(), cx);
+        let markdown_style = transcript_markdown_style(window, cx);
 
         let rows = message
             .chunks
@@ -411,15 +719,28 @@ impl ThreadView {
             .filter_map(|(chunk_ix, chunk)| match chunk {
                 AssistantMessageChunk::Message { block, .. } => {
                     block.visible_content(cx).then(|| {
-                        timeline_row(
-                            TimelineDot::new(
-                                ("claude-code-message-dot", chunk_ix),
-                                StepStatus::Neutral,
-                            ),
-                            self.render_message_content(entry_ix, chunk_ix, block, window, cx),
-                            window,
-                        )
-                        .into_any_element()
+                        v_flex()
+                            .w_full()
+                            .gap_1()
+                            .children(
+                                self.render_claude_code_message_stamp((entry_ix, chunk_ix), cx),
+                            )
+                            .child(timeline_row(
+                                TimelineDot::new(
+                                    ("claude-code-message-dot", chunk_ix),
+                                    StepStatus::Neutral,
+                                ),
+                                self.render_claude_code_message_content(
+                                    entry_ix,
+                                    chunk_ix,
+                                    block,
+                                    &markdown_style,
+                                    window,
+                                    cx,
+                                ),
+                                window,
+                            ))
+                            .into_any_element()
                     })
                 }
                 // A thought without text still shows its label, as Claude Code
@@ -451,6 +772,46 @@ impl ThreadView {
                 .gap_2()
                 .text_ui(cx)
                 .children(rows),
+        )
+    }
+
+    /// Assistant text in the transcript's smaller size. Images and resources
+    /// render as in Zed's own style.
+    fn render_claude_code_message_content(
+        &self,
+        entry_ix: usize,
+        chunk_ix: usize,
+        content: &acp_thread::MessageContent,
+        markdown_style: &MarkdownStyle,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> Div {
+        v_flex().w_full().gap_3().children(
+            content
+                .blocks()
+                .enumerate()
+                .filter(|(_, block)| block.visible_content(cx))
+                .map(|(block_ix, block)| {
+                    let rendered = match block.markdown() {
+                        Some(markdown) => self
+                            .render_markdown(markdown.clone(), markdown_style.clone(), cx)
+                            .into_any_element(),
+                        None => self.render_output_content_block(
+                            entry_ix, block_ix, block, None, false, window, cx,
+                        ),
+                    };
+                    div()
+                        .id(("message-content-block", block_ix))
+                        .debug_selector(move || {
+                            format!("message-content-{entry_ix}-{chunk_ix}-{block_ix}")
+                        })
+                        .child(self.render_message_context_menu(
+                            entry_ix,
+                            block.markdown().cloned(),
+                            rendered,
+                            cx,
+                        ))
+                }),
         )
     }
 
@@ -510,7 +871,7 @@ impl ThreadView {
                     }),
             )
             .when(is_open, |this| {
-                let mut style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
+                let mut style = transcript_markdown_style(window, cx);
                 style.base_text_style.color = Color::Muted.color(cx);
                 let guide_offset = (TIMELINE_GUTTER - px(1.)) / 2.;
                 this.child(
@@ -1006,12 +1367,21 @@ impl ThreadView {
                         .pl(TIMELINE_GUTTER)
                         .gap_2()
                         .children(summary.blocks().enumerate().map(|(content_ix, content)| {
-                            self.render_output_content_block(
-                                entry_ix, content_ix, content, None, true, window, cx,
-                            )
+                            match content.markdown() {
+                                Some(markdown) => self
+                                    .render_markdown(
+                                        markdown.clone(),
+                                        transcript_markdown_style(window, cx),
+                                        cx,
+                                    )
+                                    .into_any_element(),
+                                None => self.render_output_content_block(
+                                    entry_ix, content_ix, content, None, true, window, cx,
+                                ),
+                            }
                         }))
                         .when_some(error, |this, error| {
-                            let mut style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
+                            let mut style = transcript_markdown_style(window, cx);
                             style.base_text_style.color = Color::Error.color(cx);
                             this.child(self.render_markdown(error, style, cx))
                         }),
@@ -1228,7 +1598,7 @@ mod tests {
         thread_view.read_with(cx, |_, cx| {
             let activity =
                 thread_activity(thread_view.entity_id(), cx).expect("thread activity is tracked");
-            assert!(activity.user_message_sent_at(0).is_some());
+            assert!(activity.message_time((0, 0)).is_some());
             assert!(activity.thought_duration(1, 0).is_some());
         });
     }
@@ -1373,6 +1743,76 @@ mod tests {
             workspace.active_item(cx).map(|item| item.item_id())
         });
         assert_eq!(active_item_id, Some(editor.entity_id()));
+    }
+
+    /// A 1×1 PNG.
+    const TINY_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+
+    #[gpui::test]
+    async fn test_claude_code_sent_message(cx: &mut TestAppContext) {
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![acp_v1::SessionUpdate::AgentMessageChunk(
+            acp_v1::ContentChunk::new("Got it.".into()),
+        )]);
+        let (thread_view, cx) = setup_thread_view(connection, cx).await;
+        cx.simulate_resize(gpui::size(px(1600.), px(1000.)));
+        set_ui_style("claude_code", cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let long_text = (1..=12)
+            .map(|line| format!("Line {line} of a long prompt"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let image = acp_v2::ContentBlock::Image(acp_v2::ImageContent::new(TINY_PNG, "image/png"));
+        thread
+            .update(cx, |thread, cx| {
+                thread.send(vec![image.clone(), image, long_text.as_str().into()], cx)
+            })
+            .await
+            .expect("prompt should succeed");
+        cx.run_until_parked();
+
+        assert!(cx.debug_bounds("claude-code-attachments-0").is_some());
+        assert!(
+            cx.debug_bounds("claude-code-day-line-0-0").is_some(),
+            "the first message with a time gets a date line"
+        );
+        let collapsed = cx
+            .debug_bounds("claude-code-user-message-0")
+            .expect("user message");
+        let max_content_width = cx.update(|_window, cx| {
+            AgentSettings::get_global(cx)
+                .max_content_width
+                .unwrap_or(px(0.))
+        });
+        assert!(
+            collapsed.size.width > max_content_width,
+            "the transcript is not capped at Zed's max content width"
+        );
+        let thread_view_id = thread_view.entity_id();
+        let overflows = cx.update(|_window, cx| {
+            thread_activity(thread_view_id, cx)
+                .is_some_and(|activity| activity.user_message_overflows(0))
+        });
+        assert!(overflows, "the long message is clamped");
+        assert!(cx.debug_bounds("claude-code-show-less-0").is_none());
+
+        cx.simulate_mouse_move(collapsed.center(), None, gpui::Modifiers::default());
+        cx.run_until_parked();
+        let show_more = cx
+            .debug_bounds("claude-code-show-more-0")
+            .expect("Show more while hovered");
+        cx.simulate_click(show_more.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        let expanded = cx
+            .debug_bounds("claude-code-user-message-0")
+            .expect("user message");
+        assert!(expanded.size.height > collapsed.size.height);
+        assert!(cx.debug_bounds("claude-code-show-less-0").is_some());
+        assert_eq!(
+            thread_view.read_with(cx, |view, _| view.editing_message),
+            None,
+            "Show more doesn't start editing"
+        );
     }
 
     #[gpui::test]
