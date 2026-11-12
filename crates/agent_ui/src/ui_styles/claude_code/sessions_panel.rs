@@ -162,6 +162,7 @@ pub(crate) struct ClaudeCodeSessionsPanel {
     /// window that has reset stops showing its old reading.
     scheduled_usage_reset: Option<i64>,
     _usage_reset_timer: Task<()>,
+    _account_watch: usage::AccountFileWatch,
     _refresh_task: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
@@ -193,6 +194,7 @@ impl ClaudeCodeSessionsPanel {
         if let Some(store) = ThreadMetadataStore::try_global(cx) {
             subscriptions.push(cx.observe(&store, |_, _, cx| cx.notify()));
         }
+        let account_watch = usage::watch_account_file(project.read(cx).fs().clone(), cx);
         Self {
             workspace: workspace.weak_handle(),
             project,
@@ -208,13 +210,14 @@ impl ClaudeCodeSessionsPanel {
             session_manager_expanded: true,
             scheduled_usage_reset: None,
             _usage_reset_timer: Task::ready(()),
+            _account_watch: account_watch,
             _refresh_task: Task::ready(()),
             _subscriptions: subscriptions,
         }
     }
 
-    /// The usage limits from the most recent rate limit reports of the
-    /// project's open Claude threads.
+    /// The usage limits from Claude Code's account cache and the most recent
+    /// rate limit reports of the project's Claude threads.
     pub(crate) fn usage_windows(&self, cx: &App) -> Vec<UsageWindow> {
         usage::project_usage_windows(self.project.entity_id(), Utc::now().timestamp(), cx)
     }
@@ -826,7 +829,11 @@ impl Render for ClaudeCodeSessionsPanel {
             // No title row of its own: a dock header, when there is one, already names the panel.
             .child(self.render_section_header(Section::AccountAndUsage, cx))
             .when(self.account_and_usage_expanded, |this| {
-                this.child(usage::render_account_and_usage(&usage_windows, cx))
+                this.child(usage::render_account_and_usage(
+                    usage::account_email(cx),
+                    &usage_windows,
+                    cx,
+                ))
             })
             .child(
                 self.render_section_header(Section::SessionManager, cx)
