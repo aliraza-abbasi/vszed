@@ -306,6 +306,7 @@ struct LayoutSnapshot {
     minimap_line_height: Option<BufferLineHeight>,
     status_bar_encoding_button: Option<EncodingDisplayOptions>,
     status_bar_line_endings_button: Option<bool>,
+    lsp_button: Option<bool>,
     breadcrumbs: Option<bool>,
     buffer_font_family: Option<FontFamilyName>,
     buffer_font_size: Option<FontSize>,
@@ -366,6 +367,10 @@ impl LayoutSnapshot {
                 .and_then(|status_bar| status_bar.active_encoding_button),
             status_bar_line_endings_button: status_bar
                 .and_then(|status_bar| status_bar.line_endings_button),
+            lsp_button: content
+                .global_lsp_settings
+                .as_ref()
+                .and_then(|lsp_settings| lsp_settings.button),
             breadcrumbs: content
                 .editor
                 .toolbar
@@ -439,6 +444,9 @@ impl LayoutSnapshot {
             status_bar.active_encoding_button = self.status_bar_encoding_button;
             status_bar.line_endings_button = self.status_bar_line_endings_button;
         });
+        update_nested(&mut content.global_lsp_settings, |lsp_settings| {
+            lsp_settings.button = self.lsp_button;
+        });
         update_nested(&mut content.editor.toolbar, |toolbar| {
             toolbar.breadcrumbs = self.breadcrumbs;
         });
@@ -496,6 +504,9 @@ impl LayoutSnapshot {
         // VS Code always shows the encoding and line ending of the active file.
         self.status_bar_encoding_button = Some(EncodingDisplayOptions::Enabled);
         self.status_bar_line_endings_button = Some(true);
+        // The workbench status bar's language status item (`{ }`) stands in for
+        // it, and VS Code has no other language server item.
+        self.lsp_button = Some(false);
         self.breadcrumbs = Some(true);
         // VS Code's per-platform editor defaults, from its `fontInfo.ts`.
         let (buffer_font_family, buffer_font_size) = if cfg!(target_os = "macos") {
@@ -550,6 +561,7 @@ mod tests {
         "tabs": { "close_position": "left", "file_icons": false },
         "tab_bar": { "show": true, "show_nav_history_buttons": true },
         "search": { "button": true, "regex": true },
+        "global_lsp_settings": { "request_timeout": 60 },
         "status_bar": { "line_endings_button": false, "cursor_position_button": true },
         "title_bar": { "show_branch_name": true, "show_user_picture": false }
     }"#;
@@ -648,6 +660,8 @@ mod tests {
         );
         assert_eq!(applied["status_bar"]["line_endings_button"], json!(true));
         assert_eq!(applied["status_bar"]["cursor_position_button"], json!(true));
+        assert_eq!(applied["global_lsp_settings"]["button"], json!(false));
+        assert_eq!(applied["global_lsp_settings"]["request_timeout"], json!(60));
         assert_eq!(applied["toolbar"]["breadcrumbs"], json!(true));
         let (expected_font_family, expected_font_size) = if cfg!(target_os = "macos") {
             ("Menlo", 12.0)
@@ -683,6 +697,11 @@ mod tests {
         assert_eq!(restored["tab_bar"]["show_nav_history_buttons"], json!(true));
         assert_eq!(restored["status_bar"]["line_endings_button"], json!(false));
         assert_eq!(restored["buffer_line_height"], json!("standard"));
+        assert_eq!(
+            restored["global_lsp_settings"],
+            json!({ "request_timeout": 60 }),
+            "global_lsp_settings.button was not set before the layout was applied"
+        );
         assert!(
             restored["status_bar"]
                 .get("active_encoding_button")
