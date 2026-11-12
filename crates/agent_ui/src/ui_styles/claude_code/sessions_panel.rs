@@ -673,7 +673,10 @@ impl Panel for ClaudeCodeSessionsPanel {
 
     fn set_active(&mut self, active: bool, window: &mut Window, cx: &mut Context<Self>) {
         if active {
-            self.refresh(window, cx);
+            // Docks activate panels while the workspace is being updated, and
+            // `refresh` reads the workspace.
+            self.has_requested_sessions = true;
+            cx.defer_in(window, |this, window, cx| this.refresh(window, cx));
         }
     }
 }
@@ -986,6 +989,41 @@ mod tests {
                 .collect::<Vec<_>>()
         });
         assert_eq!(tabs, vec![Some(listed.session_id.clone())]);
+    }
+
+    #[gpui::test]
+    async fn test_toggling_the_panel_focuses_it(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            crate::ui_styles::init(cx);
+            gpui::UpdateGlobal::update_global(cx, |store: &mut settings::SettingsStore, cx| {
+                store
+                    .set_user_settings(r#"{ "agent": { "ui_style": "claude_code" } }"#, cx)
+                    .expect("valid settings");
+            });
+        });
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+
+        // The activity bar and the keybinding toggle the panel from inside a
+        // workspace update, which activates the panel.
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.toggle_panel_focus::<ClaudeCodeSessionsPanel>(window, cx);
+        });
+        cx.run_until_parked();
+
+        let panel_is_active = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .left_dock()
+                .read(cx)
+                .visible_panel()
+                .is_some_and(|panel| panel.panel_key() == ClaudeCodeSessionsPanel::panel_key())
+        });
+        assert!(panel_is_active);
     }
 
     #[test]
