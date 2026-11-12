@@ -825,13 +825,17 @@ fn restore_zed_placeholder(
 
 /// Claude Code writes prompts and sent messages in the UI font, not the buffer font.
 pub(crate) fn ui_font_text_style(cx: &App) -> TextStyle {
+    // The extension's chat text matches VS Code's workbench labels, which Zed
+    // draws at 14/16 of the UI font size. Scaling the agent font size (rather
+    // than using a fixed label size) keeps the agent zoom actions working.
+    const LABEL_TO_UI_FONT_RATIO: f32 = 14. / 16.;
     let settings = ThemeSettings::get_global(cx);
     TextStyle {
         color: cx.theme().colors().text,
         font_family: settings.ui_font.family.clone(),
         font_fallbacks: settings.ui_font.fallbacks.clone(),
         font_features: settings.ui_font.features.clone(),
-        font_size: settings.agent_ui_font_size(cx).into(),
+        font_size: (settings.agent_ui_font_size(cx) * LABEL_TO_UI_FONT_RATIO).into(),
         font_weight: settings.ui_font.weight,
         line_height: relative(1.5),
         ..Default::default()
