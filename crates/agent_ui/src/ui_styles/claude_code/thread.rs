@@ -10,11 +10,9 @@ use super::*;
 use crate::ui_styles::claude_code::{
     ClaudeCodeSpinnerElement, StepStatus, TIMELINE_GUTTER, TimelineDot, ToolRow, edit_line_stats,
     format_timestamp, summarize_tool_call, thought_label, thread_activity, timeline_row,
-    tool_output_text,
+    tool_output_text, ui_font_text_style,
 };
 use editor::{EditorElement, EditorStyle};
-use gpui::TextStyle;
-use theme_settings::ThemeSettings;
 
 impl ThreadView {
     pub(super) fn render_claude_code_entries(&mut self, cx: &mut Context<Self>) -> List {
@@ -345,17 +343,7 @@ impl ThreadView {
         cx: &Context<Self>,
     ) -> AnyElement {
         let editor = message_editor.read(cx).editor().clone();
-        let settings = ThemeSettings::get_global(cx);
-        let text_style = TextStyle {
-            color: cx.theme().colors().text,
-            font_family: settings.ui_font.family.clone(),
-            font_fallbacks: settings.ui_font.fallbacks.clone(),
-            font_features: settings.ui_font.features.clone(),
-            font_size: settings.agent_ui_font_size(cx).into(),
-            font_weight: settings.ui_font.weight,
-            line_height: relative(1.5),
-            ..Default::default()
-        };
+        let text_style = ui_font_text_style(cx);
         div()
             .w_full()
             .child(EditorElement::new(
@@ -824,9 +812,10 @@ mod tests {
     use acp_thread::StubAgentConnection;
     use agent_client_protocol::v1::schema as acp_v1;
     use fs::FakeFs;
-    use gpui::{TestAppContext, UpdateGlobal as _, VisualTestContext};
+    use gpui::{TestAppContext, TextStyle, UpdateGlobal as _, VisualTestContext};
     use serde_json::json;
     use settings::SettingsStore;
+    use theme_settings::ThemeSettings;
     use workspace::{Item, MultiWorkspace};
 
     struct TestThreadItem {
@@ -1071,6 +1060,53 @@ mod tests {
         set_ui_style("zed", cx);
         assert!(cx.debug_bounds("claude-code-prompt-box").is_none());
         assert_eq!(placeholder(&message_editor, cx), zed_placeholder);
+    }
+
+    #[gpui::test]
+    async fn test_claude_code_prompt_uses_ui_font(cx: &mut TestAppContext) {
+        let (_thread_view, cx) = setup_thread_view(StubAgentConnection::new(), cx).await;
+        let set_settings = |ui_style: &str, cx: &mut VisualTestContext| {
+            cx.update(|_window, cx| {
+                SettingsStore::update_global(cx, |store, cx| {
+                    store
+                        .set_user_settings(
+                            &format!(
+                                r#"{{
+                                    "ui_font_family": "Helvetica",
+                                    "buffer_font_family": "Menlo",
+                                    "agent": {{ "ui_style": "{ui_style}" }}
+                                }}"#
+                            ),
+                            cx,
+                        )
+                        .expect("valid settings");
+                });
+            });
+            cx.run_until_parked();
+        };
+        let zed_style = TextStyle {
+            font_family: "Menlo".into(),
+            ..TextStyle::default()
+        };
+        let prompt_font = |cx: &mut VisualTestContext| {
+            cx.update(|_window, cx| {
+                crate::ui_styles::message_editor_text_style(zed_style.clone(), cx).font_family
+            })
+        };
+
+        set_settings("zed", cx);
+        assert_eq!(prompt_font(cx).as_ref(), "Menlo");
+
+        set_settings("claude_code", cx);
+        assert_eq!(prompt_font(cx).as_ref(), "Helvetica");
+        assert_eq!(
+            cx.update(|_window, cx| ThemeSettings::get_global(cx).ui_font.family.clone())
+                .as_ref(),
+            "Helvetica"
+        );
+
+        set_settings("zed", cx);
+        assert_eq!(prompt_font(cx).as_ref(), "Menlo");
     }
 
     #[gpui::test]
