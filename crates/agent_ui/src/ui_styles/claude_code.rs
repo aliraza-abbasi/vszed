@@ -15,9 +15,10 @@ use chrono::{DateTime, Local};
 use collections::HashMap;
 use gpui::{
     Animation, AnimationExt as _, App, Context, ElementId, EntityId, Global, Hsla, Pixels,
-    pulsating_between, px,
+    TextStyle, pulsating_between, px,
 };
 use settings::{AgentUiStyle, Settings as _, SettingsStore};
+use theme_settings::ThemeSettings;
 use ui::prelude::*;
 
 use super::AgentUiStyleSettings;
@@ -400,6 +401,21 @@ fn restore_zed_placeholder(
     thread_view.message_editor.update(cx, |message_editor, cx| {
         message_editor.set_placeholder_text(&placeholder, window, cx);
     });
+}
+
+/// Claude Code writes prompts and sent messages in the UI font, not the buffer font.
+pub(crate) fn ui_font_text_style(cx: &App) -> TextStyle {
+    let settings = ThemeSettings::get_global(cx);
+    TextStyle {
+        color: cx.theme().colors().text,
+        font_family: settings.ui_font.family.clone(),
+        font_fallbacks: settings.ui_font.fallbacks.clone(),
+        font_features: settings.ui_font.features.clone(),
+        font_size: settings.agent_ui_font_size(cx).into(),
+        font_weight: settings.ui_font.weight,
+        line_height: relative(1.5),
+        ..Default::default()
+    }
 }
 
 pub(crate) fn thought_label(duration: Option<Duration>, is_streaming: bool) -> SharedString {

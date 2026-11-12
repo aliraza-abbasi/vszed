@@ -2091,6 +2091,7 @@ impl Render for MessageEditor {
                     line_height: relative(settings.buffer_line_height.value()),
                     ..Default::default()
                 };
+                let text_style = crate::ui_styles::message_editor_text_style(text_style, cx);
 
                 EditorElement::new(
                     &self.editor,

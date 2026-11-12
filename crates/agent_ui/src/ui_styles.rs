@@ -1,7 +1,7 @@
 pub(crate) mod claude_code;
 pub(crate) mod thread_item;
 
-use gpui::App;
+use gpui::{App, TextStyle};
 use settings::{AgentThreadLocation, AgentUiStyle, RegisterSetting, Settings, SettingsContent};
 
 /// Resolved `agent.ui_style` and `agent.thread_location` settings.
@@ -30,6 +30,16 @@ impl Settings for AgentUiStyleSettings {
 
 pub(crate) fn claude_code_style_enabled(cx: &App) -> bool {
     AgentUiStyleSettings::get_global(cx).ui_style == AgentUiStyle::ClaudeCode
+}
+
+/// The text style of agent message editors (the prompt and editable sent
+/// messages): Zed's own style unless the active ui style draws them differently.
+pub(crate) fn message_editor_text_style(zed_style: TextStyle, cx: &App) -> TextStyle {
+    if claude_code_style_enabled(cx) {
+        claude_code::ui_font_text_style(cx)
+    } else {
+        zed_style
+    }
 }
 
 pub(crate) fn init(cx: &mut App) {
