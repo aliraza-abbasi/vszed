@@ -22,6 +22,28 @@ const MAX_PREVIEW_CHARS: usize = 400;
 
 type ClickHandler = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
 
+/// A file name after the tool name that opens the file, as Claude Code shows the
+/// target of Read, Edit and Write, with an optional plain suffix such as a line range.
+pub(crate) struct FileLink {
+    pub name: SharedString,
+    pub suffix: Option<SharedString>,
+    pub on_click: ClickHandler,
+}
+
+impl FileLink {
+    pub(crate) fn new(
+        name: impl Into<SharedString>,
+        suffix: Option<SharedString>,
+        on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            suffix,
+            on_click: Rc::new(on_click),
+        }
+    }
+}
+
 /// A compact tool call step: a status dot, the tool name in bold followed by
 /// a muted description, and an optional bordered IN/OUT block. Like Claude
 /// Code, OUT shows the first lines unwrapped and clipped; clicking it can open
@@ -33,12 +55,15 @@ pub(crate) struct ToolRow {
     id: ElementId,
     name: SharedString,
     description: Option<SharedString>,
+    file_links: Vec<FileLink>,
+    secondary_line: Option<SharedString>,
     status: StepStatus,
     header_suffix: Option<AnyElement>,
     on_header_click: Option<ClickHandler>,
     input: Option<SharedString>,
     copy_input: bool,
     output: Option<SharedString>,
+    output_label: Option<&'static str>,
     on_open_output: Option<ClickHandler>,
     body: Option<AnyElement>,
     footer: Vec<AnyElement>,
@@ -54,12 +79,15 @@ impl ToolRow {
             id: id.into(),
             name: name.into(),
             description: None,
+            file_links: Vec::new(),
+            secondary_line: None,
             status,
             header_suffix: None,
             on_header_click: None,
             input: None,
             copy_input: false,
             output: None,
+            output_label: Some("OUT"),
             on_open_output: None,
             body: None,
             footer: Vec::new(),
@@ -68,6 +96,18 @@ impl ToolRow {
 
     pub(crate) fn description(mut self, description: Option<SharedString>) -> Self {
         self.description = description;
+        self
+    }
+
+    /// Shows file links in place of the description, separated by commas.
+    pub(crate) fn file_links(mut self, file_links: Vec<FileLink>) -> Self {
+        self.file_links = file_links;
+        self
+    }
+
+    /// A short muted line under the header, such as Claude Code's "Added 1 line".
+    pub(crate) fn secondary_line(mut self, secondary_line: Option<SharedString>) -> Self {
+        self.secondary_line = secondary_line;
         self
     }
 
@@ -98,6 +138,13 @@ impl ToolRow {
 
     pub(crate) fn output(mut self, output: Option<SharedString>) -> Self {
         self.output = output;
+        self
+    }
+
+    /// Claude Code labels a tool's output "OUT", except where the output is the
+    /// tool's own content, such as the file a Write creates.
+    pub(crate) fn unlabeled_output(mut self) -> Self {
+        self.output_label = None;
         self
     }
 
@@ -173,6 +220,48 @@ pub(crate) fn output_preview_lines(output: &str) -> Vec<SharedString> {
         .collect()
 }
 
+/// Claude Code draws file names in the monospace font at 85% of the text size, in the
+/// link color, underlined while hovered.
+fn render_file_links(id: &ElementId, file_links: Vec<FileLink>, cx: &App) -> impl IntoElement {
+    let link_color = cx.theme().colors().text_accent;
+    let link_count = file_links.len();
+    h_flex()
+        .min_w_0()
+        .flex_wrap()
+        .font_buffer(cx)
+        .text_xs()
+        .children(
+            file_links
+                .into_iter()
+                .enumerate()
+                .map(move |(index, file_link)| {
+                    let on_click = file_link.on_click;
+                    h_flex()
+                        .min_w_0()
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("{id}-file-link-{index}")))
+                                .text_color(link_color)
+                                .cursor_pointer()
+                                .hover(|style| style.underline())
+                                .child(file_link.name)
+                                .on_click(move |event, window, cx| on_click(event, window, cx)),
+                        )
+                        .when_some(file_link.suffix, |this, suffix| {
+                            this.child(
+                                div()
+                                    .pl_1()
+                                    .text_color(cx.theme().colors().text)
+                                    .child(suffix),
+                            )
+                        })
+                        .when(index + 1 < link_count, |this| {
+                            this.child(div().pr_1().text_color(cx.theme().colors().text).child(","))
+                        })
+                }),
+        )
+}
+
 fn output_background(cx: &App) -> Hsla {
     cx.theme()
         .colors()
@@ -189,6 +278,9 @@ impl RenderOnce for ToolRow {
             .min_w_0()
             .gap_1p5()
             .child(Label::new(self.name).weight(FontWeight::BOLD).single_line())
+            .when(!self.file_links.is_empty(), |this| {
+                this.child(render_file_links(&self.id, self.file_links, cx))
+            })
             .when_some(self.description, |this, description| {
                 this.child(
                     div().min_w_0().overflow_hidden().child(
@@ -221,7 +313,7 @@ impl RenderOnce for ToolRow {
                 .px_2p5()
                 .py_1p5()
                 .bg(output_background)
-                .child(io_label("OUT"))
+                .children(self.output_label.map(io_label))
                 .child(
                     v_flex()
                         .flex_1()
@@ -272,6 +364,15 @@ impl RenderOnce for ToolRow {
                 header,
                 window,
             ))
+            .when_some(self.secondary_line, |this, secondary_line| {
+                this.child(
+                    div().pl(TIMELINE_GUTTER).child(
+                        Label::new(secondary_line)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
+                )
+            })
             .when(has_io_block, |this| {
                 this.child(
                     div().pl(TIMELINE_GUTTER).child(
