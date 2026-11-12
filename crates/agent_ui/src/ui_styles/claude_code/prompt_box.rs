@@ -493,7 +493,7 @@ impl ThreadView {
                 let thread_view = thread_view.clone();
                 Some(ContextMenu::build(window, cx, move |menu, _, _| {
                     let upload_target = thread_view.clone();
-                    let context_target = thread_view.clone();
+                    let context_target = thread_view;
                     menu.item(
                         ContextMenuEntry::new("Upload from computer")
                             .icon(IconName::Share)
