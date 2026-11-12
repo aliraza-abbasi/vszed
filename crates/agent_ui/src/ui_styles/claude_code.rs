@@ -1762,6 +1762,156 @@ pub(crate) fn prompt_accent(mode_id: Option<&str>, cx: &App) -> PromptAccent {
     }
 }
 
+// --- Prompt footer ----------------------------------------------------------------------
+
+/// claude-agent-acp's command that compacts the conversation.
+pub(crate) const COMPACT_COMMAND: &str = "compact";
+
+/// What "Add context" types after the text before the cursor: an `@`, after a space
+/// when the text doesn't end in whitespace, because Zed's mention menu (like the
+/// extension's) only opens for an `@` that starts a word.
+pub(crate) fn mention_trigger_text(previous_character: Option<char>) -> &'static str {
+    match previous_character {
+        Some(character) if !character.is_whitespace() => " @",
+        _ => "@",
+    }
+}
+
+// --- Context ring -----------------------------------------------------------------------
+
+/// Claude Code counts the context as full this many tokens before the model's window
+/// ends: the auto-compact buffer, plus the output reserve below.
+const AUTO_COMPACT_BUFFER_TOKENS: u64 = 13_000;
+/// The output reserve is the model's output limit, capped at this. ACP doesn't send the
+/// limit, and every current Claude model's is above the cap.
+const MAX_OUTPUT_RESERVE_TOKENS: u64 = 20_000;
+
+/// How much of the context Claude Code's footer ring shows as used: the share of the
+/// window left after the output reserve and the auto-compact buffer, in percent and at
+/// most 100. The ring only appears once less than half of it remains.
+pub(crate) fn context_ring_percentage(
+    used_tokens: u64,
+    context_window: u64,
+    max_output_tokens: Option<u64>,
+) -> Option<f32> {
+    let reserve = max_output_tokens
+        .unwrap_or(MAX_OUTPUT_RESERVE_TOKENS)
+        .min(MAX_OUTPUT_RESERVE_TOKENS)
+        + AUTO_COMPACT_BUFFER_TOKENS;
+    let usable = context_window
+        .checked_sub(reserve)
+        .filter(|usable| *usable > 0)?;
+    let percentage = (used_tokens as f32 / usable as f32 * 100.).min(100.);
+    (100. - percentage < 50.).then_some(percentage)
+}
+
+/// The ring's tooltip, as the extension words it.
+pub(crate) fn context_ring_tooltip(percentage_used: f32) -> String {
+    format!(
+        "{}% of context remaining until auto-compact.",
+        (100. - percentage_used).round()
+    )
+}
+
+/// The extension draws the ring in three steps rather than continuously: an orange arc
+/// from the top, clockwise, and a faint track over most of the rest. Angles are in
+/// degrees clockwise from the top, read off the extension's arcs.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ContextRingArcs {
+    pub used_end: f32,
+    pub track: Option<(f32, f32)>,
+}
+
+pub(crate) fn context_ring_arcs(percentage_used: f32) -> ContextRingArcs {
+    if percentage_used < 62.5 {
+        ContextRingArcs {
+            used_end: 180.,
+            track: Some((210.7, 326.8)),
+        }
+    } else if percentage_used < 87. {
+        ContextRingArcs {
+            used_end: 252.5,
+            track: Some((284.8, 326.8)),
+        }
+    } else {
+        ContextRingArcs {
+            used_end: 315.,
+            track: None,
+        }
+    }
+}
+
+/// The extension's 20px ring icon, drawn at its 26px button size.
+pub(crate) const CONTEXT_RING_BOX: Pixels = px(26.);
+const CONTEXT_RING_RADIUS: f32 = 5. * 26. / 20.;
+const CONTEXT_RING_STROKE: f32 = 1.5 * 26. / 20.;
+
+#[derive(IntoElement)]
+pub(crate) struct ContextRing {
+    percentage_used: f32,
+}
+
+impl ContextRing {
+    pub(crate) fn new(percentage_used: f32) -> Self {
+        Self { percentage_used }
+    }
+}
+
+fn paint_ring_arc(
+    center: gpui::Point<Pixels>,
+    start_degrees: f32,
+    end_degrees: f32,
+    color: Hsla,
+    window: &mut Window,
+) {
+    let point_at = |degrees: f32| {
+        let radians = degrees.to_radians();
+        gpui::point(
+            center.x + px(CONTEXT_RING_RADIUS * radians.sin()),
+            center.y - px(CONTEXT_RING_RADIUS * radians.cos()),
+        )
+    };
+    let mut builder = gpui::PathBuilder::stroke(px(CONTEXT_RING_STROKE)).with_style(
+        gpui::PathStyle::Stroke(gpui::StrokeOptions {
+            line_width: CONTEXT_RING_STROKE,
+            line_cap: gpui::LineCap::Round,
+            ..Default::default()
+        }),
+    );
+    builder.move_to(point_at(start_degrees));
+    builder.arc_to(
+        gpui::point(px(CONTEXT_RING_RADIUS), px(CONTEXT_RING_RADIUS)),
+        px(0.),
+        end_degrees - start_degrees > 180.,
+        true,
+        point_at(end_degrees),
+    );
+    match builder.build() {
+        Ok(path) => window.paint_path(path, color),
+        Err(error) => log::debug!("failed to build the context ring: {error}"),
+    }
+}
+
+impl RenderOnce for ContextRing {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let arcs = context_ring_arcs(self.percentage_used);
+        let used_color: Hsla = rgba(CLAUDE_CLAY_BUTTON_ORANGE).into();
+        let track_color = cx.theme().colors().text.opacity(0.15);
+        gpui::canvas(
+            |_, _, _| {},
+            move |bounds, _, window, _| {
+                let center = bounds.center();
+                if let Some((start, end)) = arcs.track {
+                    paint_ring_arc(center, start, end, track_color, window);
+                }
+                paint_ring_arc(center, 0., arcs.used_end, used_color, window);
+            },
+        )
+        .size(CONTEXT_RING_BOX)
+        .flex_none()
+    }
+}
+
 // --- Background tasks (raw SDK messages) ------------------------------------------
 
 /// claude-agent-acp's extension notification that carries a raw SDK message.
@@ -3602,6 +3752,37 @@ mod tests {
         assert_eq!(agent_count_label(13), "13 agents");
         assert_eq!(format_idle_time(Duration::from_secs(18 * 60)), "18m");
         assert_eq!(format_idle_time(Duration::from_secs(26 * 3600)), "1d 2h");
+    }
+
+    #[test]
+    fn test_context_ring() {
+        // 200k tokens, less the 20k output reserve and the 13k auto-compact buffer.
+        assert_eq!(context_ring_percentage(80_000, 200_000, None), None);
+        let percentage = context_ring_percentage(100_200, 200_000, None).expect("over half used");
+        assert!((percentage - 60.).abs() < 0.01);
+        assert_eq!(
+            context_ring_tooltip(percentage),
+            "40% of context remaining until auto-compact."
+        );
+        assert_eq!(context_ring_percentage(500_000, 200_000, None), Some(100.));
+        assert_eq!(context_ring_percentage(10_000, 0, None), None);
+        assert_eq!(context_ring_percentage(10_000, 30_000, None), None);
+        // A smaller output limit leaves more of the window.
+        let percentage =
+            context_ring_percentage(107_400, 200_000, Some(8_000)).expect("over half used");
+        assert!((percentage - 60.).abs() < 0.01);
+
+        assert_eq!(context_ring_arcs(60.).used_end, 180.);
+        assert_eq!(context_ring_arcs(70.).used_end, 252.5);
+        assert_eq!(context_ring_arcs(90.).track, None);
+    }
+
+    #[test]
+    fn test_mention_trigger_text() {
+        assert_eq!(mention_trigger_text(None), "@");
+        assert_eq!(mention_trigger_text(Some(' ')), "@");
+        assert_eq!(mention_trigger_text(Some('\n')), "@");
+        assert_eq!(mention_trigger_text(Some('e')), " @");
     }
 
     #[test]
