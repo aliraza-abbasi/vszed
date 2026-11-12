@@ -123,24 +123,15 @@ impl ThreadView {
             .unwrap_or(!is_generating);
 
         let primary = if is_turn_end && !assistant_message_is_blank {
-            let user_message_index = {
-                let thread = thread.read(cx);
-                thread
-                    .entries()
-                    .iter()
-                    .take(entry_ix)
-                    .rposition(|entry| thread.is_user_authored_scroll_target(entry))
-            };
+            let hover_group = SharedString::from(format!("claude-code-turn-{entry_ix}"));
             v_flex()
                 .w_full()
+                .group(hover_group.clone())
                 .child(primary)
-                .child(self.render_thread_controls(
-                    &thread,
+                .children(self.render_claude_code_turn_controls(
                     entry_ix,
-                    ThreadControlsPosition::TurnEnd {
-                        user_message_index,
-                        is_thread_bottom,
-                    },
+                    is_thread_bottom,
+                    hover_group,
                     cx,
                 ))
                 .into_any_element()
@@ -149,18 +140,9 @@ impl ThreadView {
         };
 
         let primary = if is_thread_bottom {
-            let is_assistant = matches!(entry, AgentThreadEntry::AssistantMessage(_));
             v_flex()
                 .w_full()
                 .child(primary)
-                .when(!is_assistant, |this| {
-                    this.child(self.render_thread_controls(
-                        &thread,
-                        entry_ix,
-                        ThreadControlsPosition::ThreadBottom,
-                        cx,
-                    ))
-                })
                 .when_some(
                     self.thread_feedback.comments_editor.clone(),
                     |this, editor| this.child(Self::render_feedback_feedback_editor(editor, cx)),
@@ -189,6 +171,50 @@ impl ThreadView {
             }
             _ => primary,
         }
+    }
+
+    /// Claude Code's only control under a response is **Copy response**, shown
+    /// while the response is hovered. Zed's other turn controls (feedback,
+    /// scroll to the prompt or to the top, turn stats) have no counterpart there.
+    fn render_claude_code_turn_controls(
+        &self,
+        entry_ix: usize,
+        is_thread_bottom: bool,
+        hover_group: SharedString,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        let thread = self.thread.read(cx);
+        let is_generating = matches!(thread.status(), ThreadStatus::Generating);
+        let needs_confirmation =
+            thread.is_waiting_for_confirmation() || self.has_pending_request_elicitation(cx);
+        if is_thread_bottom && (is_generating || needs_confirmation) {
+            return None;
+        }
+        let response_index = Self::agent_message_copy_index(thread.entries(), entry_ix, cx)?;
+        let thread = self.thread.clone();
+        Some(
+            h_flex()
+                .w_full()
+                .px_5()
+                .pb_1()
+                .justify_end()
+                .debug_selector(move || format!("claude-code-turn-controls-{entry_ix}"))
+                .child(
+                    CopyButton::new(("claude-code-copy-response", entry_ix), "")
+                        .icon_size(IconSize::Small)
+                        .tooltip_label("Copy response")
+                        .visible_on_hover(hover_group)
+                        .custom_on_click(move |_, cx| {
+                            let entries = thread.read(cx).entries();
+                            if let Some(text) =
+                                Self::get_agent_message_content(entries, response_index, cx)
+                            {
+                                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                            }
+                        }),
+                )
+                .into_any_element(),
+        )
     }
 
     /// A canceled tool call that never produced output only adds noise.
@@ -997,6 +1023,40 @@ mod tests {
             assert!(activity.user_message_sent_at(0).is_some());
             assert!(activity.thought_duration(1, 0).is_some());
         });
+    }
+
+    #[gpui::test]
+    async fn test_claude_code_turn_controls(cx: &mut TestAppContext) {
+        let connection = StubAgentConnection::new();
+        let (thread_view, cx) = setup_thread_view(connection.clone(), cx).await;
+        set_ui_style("claude_code", cx);
+
+        let message_editor = thread_view.read_with(cx, |view, _| view.message_editor.clone());
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("Hello", window, cx);
+        });
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+        let session_id =
+            thread_view.read_with(cx, |view, cx| view.thread.read(cx).session_id().clone());
+        cx.update(|_window, cx| {
+            connection.send_update(
+                session_id.clone(),
+                acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(
+                    "Here is what I found.".into(),
+                )),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("claude-code-turn-controls-1").is_none(),
+            "no controls while the turn runs"
+        );
+
+        connection.end_turn(session_id, acp_v1::StopReason::EndTurn);
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("claude-code-turn-controls-1").is_some());
     }
 
     #[gpui::test]
