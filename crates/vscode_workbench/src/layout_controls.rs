@@ -5,7 +5,10 @@ use gpui::{Action, Anchor, AnyView, ClickEvent, Empty, WeakEntity, actions};
 use settings::{BottomDockLayout, Settings, SettingsStore, update_settings_file};
 use title_bar::TitleBar;
 use ui::{ButtonLike, ContextMenu, IconPosition, PopoverMenu, Tooltip, prelude::*};
-use workspace::{Workspace, WorkspaceSettings, dock::DockPosition};
+use util::ResultExt as _;
+use workspace::{
+    MultiWorkspace, ToggleWorkspaceSidebar, Workspace, WorkspaceSettings, dock::DockPosition,
+};
 
 use crate::{
     Codicon, RestorePreviousLayout, UseVsCodeLayout, WorkbenchSettings, action_button,
@@ -87,6 +90,22 @@ fn set_activity_bar_visible(fs: Arc<dyn Fs>, cx: &App) {
     });
 }
 
+/// The window's threads sidebar and whether it is open, or `None` while AI is
+/// disabled, which also disables the sidebar.
+fn threads_sidebar_state(
+    workspace: &Workspace,
+    cx: &App,
+) -> Option<(WeakEntity<MultiWorkspace>, bool)> {
+    let multi_workspace = workspace.multi_workspace()?.upgrade()?;
+    let multi_workspace_state = multi_workspace.read(cx);
+    multi_workspace_state.multi_workspace_enabled(cx).then(|| {
+        (
+            multi_workspace.downgrade(),
+            multi_workspace_state.sidebar_open(),
+        )
+    })
+}
+
 fn apply_layout_controls(
     title_bar: &mut TitleBar,
     _window: &mut Window,
@@ -162,6 +181,7 @@ impl LayoutControls {
                     (position, name, dock.is_open(), dock.toggle_action())
                 });
                 let activity_bar_visible = WorkbenchSettings::get_global(cx).activity_bar.visible;
+                let threads_sidebar = threads_sidebar_state(workspace.read(cx), cx);
                 let bottom_dock_layout = WorkspaceSettings::get_global(cx).bottom_dock_layout;
                 let can_restore = has_previous_layout(cx);
                 let fs = workspace.read(cx).app_state().fs.clone();
@@ -197,6 +217,24 @@ impl LayoutControls {
                             )
                         },
                     );
+                    // Zed's threads sidebar has no VS Code counterpart. The VS Code
+                    // status bar hides its toggle, so it is listed with the parts.
+                    let menu =
+                        menu.when_some(threads_sidebar, |menu, (multi_workspace, is_open)| {
+                            menu.toggleable_entry(
+                                "Threads Sidebar",
+                                is_open,
+                                IconPosition::Start,
+                                Some(ToggleWorkspaceSidebar.boxed_clone()),
+                                move |window, cx| {
+                                    multi_workspace
+                                        .update(cx, |multi_workspace, cx| {
+                                            multi_workspace.toggle_sidebar(window, cx);
+                                        })
+                                        .log_err();
+                                },
+                            )
+                        });
                     let menu = BOTTOM_DOCK_LAYOUTS.into_iter().fold(
                         menu.separator().header("Bottom Panel Alignment"),
                         |menu, (layout, label)| {
@@ -358,6 +396,45 @@ mod tests {
             cx.run_until_parked();
             assert_eq!(active_panel_id(&dock, cx), None);
         }
+    }
+
+    #[gpui::test]
+    async fn test_threads_sidebar_state(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (workspace, cx) = open_workspace(cx).await;
+        let sidebar_is_open = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, cx| {
+                threads_sidebar_state(workspace, cx).map(|(_, is_open)| is_open)
+            })
+        };
+        assert_eq!(sidebar_is_open(cx), Some(false));
+
+        let multi_workspace = workspace
+            .read_with(cx, |workspace, cx| {
+                threads_sidebar_state(workspace, cx).map(|(multi_workspace, _)| multi_workspace)
+            })
+            .expect("the threads sidebar is available while AI is enabled");
+        multi_workspace
+            .update_in(cx, |multi_workspace, window, cx| {
+                multi_workspace.toggle_sidebar(window, cx);
+            })
+            .expect("the window should still be open");
+        cx.run_until_parked();
+        assert_eq!(sidebar_is_open(cx), Some(true));
+
+        cx.update(|_window, cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.project.disable_ai = Some(true.into())
+                });
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            sidebar_is_open(cx),
+            None,
+            "the sidebar isn't offered while AI is disabled"
+        );
     }
 
     #[gpui::test]

@@ -103,8 +103,14 @@ fn apply_status_bar_items(
         move_status_item_after::<ActiveBufferLanguage, ActiveToolchain>(workspace, window, cx);
         workspace.status_bar().update(cx, |status_bar, cx| {
             status_bar.add_rightmost_item(notification_bell, window, cx);
+            // VS Code starts the status bar with the remote indicator. The threads
+            // sidebar stays reachable from the layout controls and its keybinding.
+            status_bar.set_show_sidebar_toggle(false, cx);
         });
     } else {
+        workspace.status_bar().update(cx, |status_bar, cx| {
+            status_bar.set_show_sidebar_toggle(true, cx);
+        });
         remove_status_items::<NotificationBell>(workspace, cx);
         remove_status_items::<ProblemsItem>(workspace, cx);
         remove_status_items::<GitBranchItem>(workspace, cx);
@@ -721,6 +727,24 @@ mod tests {
 
         set_status_bar(false, cx);
         assert_eq!(item_positions(&workspace, cx), original_positions);
+    }
+
+    #[gpui::test]
+    async fn test_status_bar_hides_sidebar_toggle(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (workspace, cx) = open_workspace(cx).await;
+        let shows_sidebar_toggle = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, cx| {
+                workspace.status_bar().read(cx).show_sidebar_toggle()
+            })
+        };
+        assert!(shows_sidebar_toggle(cx));
+
+        set_status_bar(true, cx);
+        assert!(!shows_sidebar_toggle(cx));
+
+        set_status_bar(false, cx);
+        assert!(shows_sidebar_toggle(cx));
     }
 
     #[gpui::test]
