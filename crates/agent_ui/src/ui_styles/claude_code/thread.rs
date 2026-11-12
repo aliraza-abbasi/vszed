@@ -3,6 +3,8 @@
 // `ThreadView`'s private state and render helpers without widening their
 // visibility upstream.
 
+#[path = "permission_card.rs"]
+mod claude_code_permission_card;
 #[path = "prompt_box.rs"]
 mod claude_code_prompt_box;
 
@@ -12,6 +14,7 @@ use crate::ui_styles::claude_code::{
     format_timestamp, summarize_tool_call, thought_label, thread_activity, timeline_row,
     tool_output_text, ui_font_text_style,
 };
+use claude_code_permission_card::claude_code_card_handles;
 use editor::{EditorElement, EditorStyle};
 
 impl ThreadView {
@@ -682,9 +685,12 @@ impl ThreadView {
                 row = row.footer(self.render_sandbox_fallback_authorization_details(details, cx));
             }
         }
+        // ACP v2 requests and flat ACP v1 options are answered in the
+        // permission card that replaces the prompt box, as in Claude Code.
         if let Some(request) = tool_call
             .authorization_id()
             .and_then(|id| self.thread.read(cx).permission_request(id))
+            .filter(|request| !claude_code_card_handles(request))
         {
             row = row.footer(self.render_permission_buttons(
                 session_id.clone(),
@@ -695,10 +701,6 @@ impl ThreadView {
                 self.sandbox_confusables_block_allow(tool_call, cx),
                 cx,
             ));
-        }
-        if let Some(permissions) = self.render_generic_tool_permissions(&session_id, tool_call, cx)
-        {
-            row = row.footer(permissions);
         }
 
         div()
@@ -838,7 +840,7 @@ mod tests {
     use acp_thread::StubAgentConnection;
     use agent_client_protocol::v1::schema as acp_v1;
     use fs::FakeFs;
-    use gpui::{TestAppContext, TextStyle, UpdateGlobal as _, VisualTestContext};
+    use gpui::{KeyBinding, TestAppContext, TextStyle, UpdateGlobal as _, VisualTestContext};
     use serde_json::json;
     use settings::SettingsStore;
     use theme_settings::ThemeSettings;
@@ -1095,6 +1097,200 @@ mod tests {
         assert_eq!(activity_bar.left(), prompt_box.left());
         assert_eq!(activity_bar.right(), prompt_box.right());
         assert!(activity_bar.bottom() <= prompt_box.top());
+    }
+
+    /// The default keymap's global menu bindings, plus the `Workspace` escape
+    /// binding they have to win over.
+    fn bind_permission_keys(cx: &mut VisualTestContext) {
+        cx.update(|_window, cx| {
+            cx.bind_keys([
+                KeyBinding::new("escape", menu::Cancel, None),
+                KeyBinding::new("escape", workspace::Unfollow, Some("Workspace")),
+                KeyBinding::new("down", menu::SelectNext, None),
+                KeyBinding::new("up", menu::SelectPrevious, None),
+                KeyBinding::new("enter", menu::Confirm, None),
+            ]);
+        });
+    }
+
+    fn focus_message_editor(thread_view: &Entity<ThreadView>, cx: &mut VisualTestContext) {
+        thread_view.update_in(cx, |view, window, cx| {
+            let editor_focus = view.message_editor.focus_handle(cx);
+            window.focus(&editor_focus, cx);
+        });
+        cx.run_until_parked();
+    }
+
+    fn permission_card_is_focused(
+        thread_view: &Entity<ThreadView>,
+        cx: &mut VisualTestContext,
+    ) -> bool {
+        let thread_view_id = thread_view.entity_id();
+        cx.update(|window, cx| {
+            thread_activity(thread_view_id, cx)
+                .and_then(|activity| activity.permission_focus())
+                .is_some_and(|focus| focus.is_focused(window))
+        })
+    }
+
+    fn selected_legacy_option(outcome: acp_thread::RequestPermissionOutcome) -> String {
+        match outcome {
+            acp_thread::RequestPermissionOutcome::Selected(selected) => {
+                selected.option_id.0.to_string()
+            }
+            other => panic!("expected a selected option, got {other:?}"),
+        }
+    }
+
+    fn selected_option(outcome: acp_v2::RequestPermissionOutcome) -> String {
+        match outcome {
+            acp_v2::RequestPermissionOutcome::Selected(selected) => {
+                selected.option_id.0.to_string()
+            }
+            other => panic!("expected a selected option, got {other:?}"),
+        }
+    }
+
+    #[gpui::test]
+    async fn test_claude_code_permission_card_keys(cx: &mut TestAppContext) {
+        let (thread_view, cx) = setup_thread_view(StubAgentConnection::new(), cx).await;
+        set_ui_style("claude_code", cx);
+        bind_permission_keys(cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+
+        // claude-agent-acp v0.106.0 Bash options, sent as an ACP v1 request.
+        let request_authorization = |tool_call_id: &str, cx: &mut VisualTestContext| {
+            let task = thread.update(cx, |thread, cx| {
+                thread
+                    .request_tool_call_authorization(
+                        acp_v1::ToolCall::new(tool_call_id.to_string(), "git status")
+                            .kind(acp_v1::ToolKind::Execute)
+                            .into(),
+                        acp_thread::PermissionOptions::Flat(vec![
+                            acp_v2::PermissionOption::new(
+                                "allow-once",
+                                "Yes",
+                                acp_v2::PermissionOptionKind::AllowOnce,
+                            ),
+                            acp_v2::PermissionOption::new(
+                                "allow-with-updates",
+                                "Yes, and don't ask again for `git status` commands",
+                                acp_v2::PermissionOptionKind::AllowAlways,
+                            ),
+                            acp_v2::PermissionOption::new(
+                                "reject",
+                                "No",
+                                acp_v2::PermissionOptionKind::RejectOnce,
+                            ),
+                        ]),
+                        acp_thread::AuthorizationKind::PermissionGrant,
+                        cx,
+                    )
+                    .expect("authorization request")
+            });
+            cx.run_until_parked();
+            task
+        };
+
+        focus_message_editor(&thread_view, cx);
+        let first = request_authorization("bash-1", cx);
+        assert!(cx.debug_bounds("claude-code-permission-card").is_some());
+        assert!(cx.debug_bounds("claude-code-permission-option-2").is_some());
+        assert!(cx.debug_bounds("claude-code-permission-option-3").is_none());
+        assert!(
+            cx.debug_bounds("claude-code-prompt-box").is_none(),
+            "the card takes the prompt box's place"
+        );
+        assert!(
+            permission_card_is_focused(&thread_view, cx),
+            "focus moves from the prompt to the card"
+        );
+        cx.simulate_keystrokes("2");
+        assert_eq!(selected_legacy_option(first.await), "allow-with-updates");
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("claude-code-permission-card").is_none());
+        assert!(cx.debug_bounds("claude-code-prompt-box").is_some());
+        let editor_focused = thread_view.update_in(cx, |view, window, cx| {
+            view.message_editor.focus_handle(cx).is_focused(window)
+        });
+        assert!(editor_focused, "focus returns to the prompt once answered");
+
+        let second = request_authorization("bash-2", cx);
+        assert!(permission_card_is_focused(&thread_view, cx));
+        cx.simulate_keystrokes("escape");
+        assert_eq!(selected_legacy_option(second.await), "reject");
+        cx.run_until_parked();
+
+        let third = request_authorization("bash-3", cx);
+        cx.simulate_keystrokes("down enter");
+        assert_eq!(selected_legacy_option(third.await), "allow-with-updates");
+    }
+
+    #[gpui::test]
+    async fn test_claude_code_plan_approval_card(cx: &mut TestAppContext) {
+        let (thread_view, cx) = setup_thread_view(StubAgentConnection::new(), cx).await;
+        set_ui_style("claude_code", cx);
+        bind_permission_keys(cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().0.to_string());
+
+        // claude-agent-acp v0.106.0 ExitPlanMode request over ACP v2, with auto mode available.
+        let request_plan_approval = |tool_call_id: &str, cx: &mut VisualTestContext| {
+            let request: acp_v2::RequestPermissionRequest = serde_json::from_value(json!({
+                "sessionId": session_id,
+                "title": "Ready to code?",
+                "subject": {
+                    "type": "tool_call",
+                    "toolCall": {
+                        "toolCallId": tool_call_id,
+                        "title": "Approve Plan",
+                        "kind": "switch_mode",
+                        "status": "pending",
+                        "content": [{
+                            "type": "content",
+                            "content": { "type": "text", "text": "# Plan\n\n1. Add the card" }
+                        }]
+                    }
+                },
+                "options": [
+                    { "optionId": "exit-plan-auto", "name": "Yes, and use auto mode", "kind": "allow_always" },
+                    { "optionId": "exit-plan-default", "name": "Yes, manually approve edits", "kind": "allow_once" },
+                    { "optionId": "reject", "name": "No, keep planning", "kind": "reject_once" }
+                ]
+            }))
+            .expect("plan approval request");
+            let (_, task) = thread.update(cx, |thread, cx| {
+                thread
+                    .request_permission(request, cx)
+                    .expect("permission request")
+            });
+            cx.run_until_parked();
+            task
+        };
+
+        focus_message_editor(&thread_view, cx);
+        let first = request_plan_approval("plan-1", cx);
+        assert!(cx.debug_bounds("claude-code-permission-card").is_some());
+        assert!(cx.debug_bounds("claude-code-permission-plan").is_some());
+        assert!(cx.debug_bounds("claude-code-prompt-box").is_none());
+        assert!(
+            cx.debug_bounds("standalone-generic-permissions").is_none()
+                && cx.debug_bounds("claude-code-activity-bar").is_none(),
+            "only the card asks"
+        );
+        assert!(permission_card_is_focused(&thread_view, cx));
+        cx.simulate_keystrokes("1");
+        assert_eq!(selected_option(first.await), "exit-plan-auto");
+        cx.run_until_parked();
+
+        let second = request_plan_approval("plan-2", cx);
+        cx.simulate_keystrokes("escape");
+        assert_eq!(selected_option(second.await), "reject");
+        cx.run_until_parked();
+
+        let third = request_plan_approval("plan-3", cx);
+        cx.simulate_keystrokes("down enter");
+        assert_eq!(selected_option(third.await), "exit-plan-default");
     }
 
     #[gpui::test]
