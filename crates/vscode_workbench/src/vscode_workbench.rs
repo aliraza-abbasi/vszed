@@ -1,12 +1,16 @@
 //! An optional VS Code style workbench layered on top of the Zed workspace.
 
 mod activity_bar;
+mod command_center;
 mod dock_header;
+mod layout_controls;
 mod preset;
 mod workbench_settings;
 
 pub use activity_bar::ActivityBar;
+pub use command_center::CommandCenter;
 pub use dock_header::DockHeader;
+pub use layout_controls::{LayoutControls, ToggleActivityBar};
 pub use preset::{RestorePreviousLayout, UseVsCodeLayout};
 pub use workbench_settings::{ActivityBarSettings, WorkbenchSettings};
 
@@ -32,6 +36,8 @@ pub fn init(cx: &mut App) {
     activity_bar::init(cx);
     dock_header::init(cx);
     preset::init(cx);
+    command_center::init(cx);
+    layout_controls::init(cx);
 }
 
 /// VS Code's UI icons, embedded from `assets/icons/codicons`.
@@ -39,13 +45,23 @@ pub fn init(cx: &mut App) {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Codicon {
     Account,
+    ArrowLeft,
+    ArrowRight,
     ChatSparkle,
+    ChevronDown,
     ChevronUp,
     Close,
     DebugAlt,
     Ellipsis,
     Extensions,
     Files,
+    Layout,
+    LayoutPanel,
+    LayoutPanelOff,
+    LayoutSidebarLeft,
+    LayoutSidebarLeftOff,
+    LayoutSidebarRight,
+    LayoutSidebarRightOff,
     LiveShare,
     Search,
     SettingsGear,
@@ -58,13 +74,23 @@ impl Codicon {
     fn path(self) -> &'static str {
         match self {
             Self::Account => "icons/codicons/account.svg",
+            Self::ArrowLeft => "icons/codicons/arrow-left.svg",
+            Self::ArrowRight => "icons/codicons/arrow-right.svg",
             Self::ChatSparkle => "icons/codicons/chat-sparkle.svg",
+            Self::ChevronDown => "icons/codicons/chevron-down.svg",
             Self::ChevronUp => "icons/codicons/chevron-up.svg",
             Self::Close => "icons/codicons/close.svg",
             Self::DebugAlt => "icons/codicons/debug-alt.svg",
             Self::Ellipsis => "icons/codicons/ellipsis.svg",
             Self::Extensions => "icons/codicons/extensions.svg",
             Self::Files => "icons/codicons/files.svg",
+            Self::Layout => "icons/codicons/layout.svg",
+            Self::LayoutPanel => "icons/codicons/layout-panel.svg",
+            Self::LayoutPanelOff => "icons/codicons/layout-panel-off.svg",
+            Self::LayoutSidebarLeft => "icons/codicons/layout-sidebar-left.svg",
+            Self::LayoutSidebarLeftOff => "icons/codicons/layout-sidebar-left-off.svg",
+            Self::LayoutSidebarRight => "icons/codicons/layout-sidebar-right.svg",
+            Self::LayoutSidebarRightOff => "icons/codicons/layout-sidebar-right-off.svg",
             Self::LiveShare => "icons/codicons/live-share.svg",
             Self::Search => "icons/codicons/search.svg",
             Self::SettingsGear => "icons/codicons/settings-gear.svg",
@@ -162,6 +188,7 @@ mod test_support {
     };
     use project::Project;
     use settings::{SettingsStore, WorkbenchSettingsContent};
+    use title_bar::TitleBar;
     use ui::IconName;
     use workspace::{
         MultiWorkspace, Workspace,
@@ -189,6 +216,39 @@ mod test_support {
             multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
         cx.run_until_parked();
         (workspace, cx)
+    }
+
+    /// Opens a workspace with Zed's title bar, which needs calls to be set up.
+    pub(crate) async fn open_workspace_with_title_bar(
+        cx: &mut TestAppContext,
+    ) -> (Entity<Workspace>, &mut VisualTestContext) {
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        cx.update(|cx| {
+            command_palette_hooks::init(cx);
+            let project = project.read(cx);
+            call::init(project.client(), project.user_store(), cx);
+            title_bar::init(cx);
+        });
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        cx.run_until_parked();
+        (workspace, cx)
+    }
+
+    pub(crate) fn title_bar(
+        workspace: &Entity<Workspace>,
+        cx: &mut VisualTestContext,
+    ) -> Entity<TitleBar> {
+        workspace
+            .read_with(cx, |workspace, _| {
+                workspace
+                    .titlebar_item()
+                    .and_then(|item| item.downcast::<TitleBar>().ok())
+            })
+            .expect("the title bar should be shown")
     }
 
     pub(crate) fn update_workbench_settings(
