@@ -16,6 +16,9 @@ use workspace::{OpenOptions, Workspace};
 
 use crate::open_abs_path_at_point;
 
+#[path = "../ui_styles/claude_code/mention_chip.rs"]
+mod claude_code_mention_chip;
+
 #[derive(IntoElement)]
 pub struct MentionCrease {
     id: ElementId,
@@ -88,6 +91,9 @@ impl MentionCrease {
 
 impl RenderOnce for MentionCrease {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        if crate::ui_styles::claude_code_style_enabled(cx) {
+            return self.render_claude_code_chip(window, cx);
+        }
         let settings = ThemeSettings::get_global(cx);
         let font_size = settings.agent_buffer_font_size(cx);
         let buffer_font = settings.buffer_font.clone();
@@ -149,6 +155,7 @@ impl RenderOnce for MentionCrease {
                     })
                 }
             })
+            .into_any_element()
     }
 }
 
