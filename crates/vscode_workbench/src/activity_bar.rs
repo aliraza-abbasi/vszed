@@ -1,12 +1,20 @@
 use std::sync::Arc;
 
-use client::{SignIn, SignOut, UserStore};
-use gpui::{Action, Anchor, ClickEvent, Entity, Subscription, WeakEntity, svg};
+use agent_settings::{AgentSettings, WindowLayout};
+use auto_update::AutoUpdater;
+use client::{Client, SignOut, UserStore, zed_urls};
+use gpui::{Action, Anchor, App, ClickEvent, Entity, Subscription, WeakEntity, svg};
+use project::DisableAiSettings;
 use settings::{Settings, SettingsStore};
-use ui::{ButtonLike, ContextMenu, CountBadge, PopoverMenu, Tooltip, prelude::*};
+use title_bar::{UseAgenticLayout, UseClassicLayout};
+use ui::{
+    ButtonLike, ContextMenu, ContextMenuEntry, CountBadge, IconPosition, PopoverMenu, Tooltip,
+    prelude::*,
+};
 use workspace::{
     DeploySearch, Workspace,
     dock::{Dock, PanelButtons, PanelHandle},
+    notifications::{NotifyResultExt as _, NotifyTaskExt as _},
 };
 
 use crate::{
@@ -89,6 +97,7 @@ pub struct ActivityBar {
     workspace: WeakEntity<Workspace>,
     left_dock: Entity<Dock>,
     user_store: Entity<UserStore>,
+    client: Arc<Client>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -107,6 +116,7 @@ impl ActivityBar {
             workspace: workspace.weak_handle(),
             left_dock,
             user_store,
+            client: workspace.client().clone(),
             _subscriptions: subscriptions,
         }
     }
@@ -182,30 +192,26 @@ impl ActivityBar {
             .filter(|_| !is_active)
             .and_then(|icon_label| icon_label.parse::<usize>().ok());
         let toggle_action = panel.toggle_action(window, cx);
+        let panel_key = panel.panel_key();
 
         // The active state is part of the id so the cached tooltip is rebuilt when the
         // panel is toggled from elsewhere, for example with a keybinding.
-        let button = activity_bar_button(
-            (panel.panel_key(), is_active as u64),
-            icon_path,
-            is_active,
-            cx,
-        )
-        .aria_label(label)
-        .tooltip(move |_window, cx| Tooltip::for_action(label, &*toggle_action, cx))
-        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-            this.toggle_panel(&panel, window, cx);
-        }));
+        let button = activity_bar_button((panel_key, is_active as u64), icon_path, is_active, cx)
+            .aria_label(label)
+            .tooltip(move |_window, cx| Tooltip::for_action(label, &*toggle_action, cx))
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                this.toggle_panel(&panel, window, cx);
+            }));
 
-        Some(render_entry_cell(is_active, button, badge, cx))
+        Some(render_entry_cell(panel_key, is_active, button, badge, cx))
     }
 
+    /// The account entries of Zed's title bar user menu, which the VS Code layout
+    /// hides. The rest of that menu is in the Manage menu.
     fn render_accounts_menu(&self, cx: &App) -> impl IntoElement {
-        let username = self
-            .user_store
-            .read(cx)
-            .current_user()
-            .map(|user| user.username.clone());
+        let client = self.client.clone();
+        let user_store = self.user_store.clone();
+        let workspace = self.workspace.clone();
 
         PopoverMenu::new("activity-bar-accounts-menu")
             .anchor(Anchor::BottomLeft)
@@ -216,19 +222,85 @@ impl ActivityBar {
                 Tooltip::text("Accounts"),
             )
             .menu(move |window, cx| {
-                let username = username.clone();
-                Some(ContextMenu::build(
-                    window,
-                    cx,
-                    move |menu, _window, _cx| match username {
-                        Some(username) => menu
-                            .header(username)
-                            .action("Sign Out", SignOut.boxed_clone()),
-                        None => menu.action("Sign In", SignIn.boxed_clone()),
-                    },
-                ))
+                let user_store_state = user_store.read(cx);
+                let username = user_store_state
+                    .current_user()
+                    .map(|user| user.username.clone());
+                let current_organization_id = user_store_state
+                    .current_organization()
+                    .map(|organization| organization.id.clone());
+                let organizations = user_store_state.organizations().clone();
+                let is_signing_in = username.is_none()
+                    && matches!(
+                        *client.status().borrow(),
+                        client::Status::Authenticating
+                            | client::Status::Authenticated
+                            | client::Status::Connecting
+                    );
+                let client = client.clone();
+                let user_store = user_store.clone();
+                let workspace = workspace.clone();
+
+                Some(ContextMenu::build(window, cx, move |menu, _window, _cx| {
+                    let Some(username) = username else {
+                        if is_signing_in {
+                            return menu.item(ContextMenuEntry::new("Signing In…").disabled(true));
+                        }
+                        let client = client.clone();
+                        let workspace = workspace.clone();
+                        return menu.entry("Sign In", None, move |_window, cx| {
+                            sign_in(client.clone(), workspace.clone(), cx);
+                        });
+                    };
+
+                    let menu =
+                        menu.header(username)
+                            .entry("Manage Account", None, |_window, cx| {
+                                cx.open_url(&zed_urls::account_url(cx))
+                            });
+                    let menu = if organizations.is_empty() {
+                        menu
+                    } else {
+                        organizations.iter().fold(
+                            menu.separator().header("Organization"),
+                            |menu, organization| {
+                                let is_current =
+                                    current_organization_id.as_ref() == Some(&organization.id);
+                                let organization = organization.clone();
+                                let user_store = user_store.clone();
+                                let workspace = workspace.clone();
+                                menu.toggleable_entry(
+                                    organization.name.clone(),
+                                    is_current,
+                                    IconPosition::Start,
+                                    None,
+                                    move |window, cx| {
+                                        let task = user_store.update(cx, |user_store, cx| {
+                                            user_store
+                                                .set_current_organization(organization.clone(), cx)
+                                        });
+                                        task.detach_and_notify_err(workspace.clone(), window, cx);
+                                    },
+                                )
+                            },
+                        )
+                    };
+                    menu.separator().action("Sign Out", SignOut.boxed_clone())
+                }))
             })
     }
+}
+
+/// Signs in like the title bar's Sign In button does, which reports failures
+/// in the workspace instead of only in the log.
+fn sign_in(client: Arc<Client>, workspace: WeakEntity<Workspace>, cx: &mut App) {
+    cx.spawn(async move |cx| {
+        client
+            .sign_in_with_optional_connect(true, cx)
+            .await
+            .notify_workspace_async_err(workspace, cx);
+    })
+    .detach();
 }
 
 impl Render for ActivityBar {
@@ -239,14 +311,14 @@ impl Render for ActivityBar {
             .filter_map(|entry| match entry {
                 ActivityBarEntry::Panel(panel) => self.render_panel_entry(panel, window, cx),
                 ActivityBarEntry::Search => Some(render_action_entry(
-                    "activity-bar-search",
+                    "search",
                     Codicon::Search,
                     "Search",
                     DeploySearch::default().boxed_clone(),
                     cx,
                 )),
                 ActivityBarEntry::Extensions => Some(render_action_entry(
-                    "activity-bar-extensions",
+                    "extensions",
                     Codicon::Extensions,
                     "Extensions",
                     zed_actions::Extensions::default().boxed_clone(),
@@ -276,12 +348,19 @@ impl Render for ActivityBar {
                 v_flex()
                     .flex_none()
                     .child(render_entry_cell(
+                        "accounts",
                         false,
                         self.render_accounts_menu(cx),
                         None,
                         cx,
                     ))
-                    .child(render_entry_cell(false, render_manage_menu(cx), None, cx)),
+                    .child(render_entry_cell(
+                        "manage",
+                        false,
+                        render_manage_menu(cx),
+                        None,
+                        cx,
+                    )),
             )
     }
 }
@@ -315,12 +394,14 @@ fn activity_bar_button(
 }
 
 fn render_entry_cell(
+    name: &'static str,
     is_active: bool,
     button: impl IntoElement,
     badge: Option<usize>,
     cx: &App,
 ) -> AnyElement {
     div()
+        .debug_selector(|| format!("activity-bar-cell-{name}"))
         .relative()
         .flex()
         .flex_none()
@@ -349,18 +430,23 @@ fn render_entry_cell(
 }
 
 fn render_action_entry(
-    id: &'static str,
+    name: &'static str,
     codicon: Codicon,
     label: &'static str,
     action: Box<dyn Action>,
     cx: &App,
 ) -> AnyElement {
     let tooltip_action = action.boxed_clone();
-    let button = activity_bar_button(id, codicon.path(), false, cx)
-        .aria_label(label)
-        .tooltip(move |_window, cx| Tooltip::for_action(label, &*tooltip_action, cx))
-        .on_click(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx));
-    render_entry_cell(false, button, None, cx)
+    let button = activity_bar_button(
+        SharedString::from(format!("activity-bar-{name}")),
+        codicon.path(),
+        false,
+        cx,
+    )
+    .aria_label(label)
+    .tooltip(move |_window, cx| Tooltip::for_action(label, &*tooltip_action, cx))
+    .on_click(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx));
+    render_entry_cell(name, false, button, None, cx)
 }
 
 fn render_manage_menu(cx: &App) -> impl IntoElement {
@@ -378,7 +464,15 @@ fn render_manage_menu(cx: &App) -> impl IntoElement {
             Tooltip::text("Manage"),
         )
         .menu(|window, cx| {
-            Some(ContextMenu::build(window, cx, |menu, _window, _cx| {
+            let is_update_downloaded = AutoUpdater::get(cx)
+                .is_some_and(|auto_updater| auto_updater.read(cx).status().is_updated());
+            let ai_enabled = !DisableAiSettings::get_global(cx).disable_ai;
+            let window_layout = AgentSettings::get_layout(cx);
+            let is_classic_layout = matches!(window_layout, WindowLayout::Editor(_));
+            let is_agentic_layout = matches!(window_layout, WindowLayout::Agent(_));
+            let is_custom_layout = matches!(window_layout, WindowLayout::Custom(_));
+
+            Some(ContextMenu::build(window, cx, move |menu, _window, _cx| {
                 menu.action(
                     "Command Palette",
                     zed_actions::command_palette::Toggle.boxed_clone(),
@@ -391,13 +485,50 @@ fn render_manage_menu(cx: &App) -> impl IntoElement {
                     zed_actions::theme_selector::Toggle::default().boxed_clone(),
                 )
                 .action(
+                    "Icon Themes…",
+                    zed_actions::icon_theme_selector::Toggle::default().boxed_clone(),
+                )
+                .action(
                     "Extensions",
                     zed_actions::Extensions::default().boxed_clone(),
                 )
                 .separator()
                 .action("Use VS Code Layout", UseVsCodeLayout.boxed_clone())
+                .when(ai_enabled, |menu| {
+                    menu.submenu("Panel Layout", move |menu, _window, _cx| {
+                        menu.toggleable_entry(
+                            "Classic",
+                            is_classic_layout,
+                            IconPosition::Start,
+                            Some(UseClassicLayout.boxed_clone()),
+                            |window, cx| window.dispatch_action(UseClassicLayout.boxed_clone(), cx),
+                        )
+                        .toggleable_entry(
+                            "Agentic",
+                            is_agentic_layout,
+                            IconPosition::Start,
+                            Some(UseAgenticLayout.boxed_clone()),
+                            |window, cx| window.dispatch_action(UseAgenticLayout.boxed_clone(), cx),
+                        )
+                        .when(is_custom_layout, |menu| {
+                            menu.item(
+                                ContextMenuEntry::new("Custom")
+                                    .toggleable(IconPosition::Start, true)
+                                    .disabled(true),
+                            )
+                        })
+                    })
+                })
                 .separator()
-                .action("Check for Updates", auto_update::Check.boxed_clone())
+                .map(|menu| {
+                    if is_update_downloaded {
+                        menu.entry("Restart to Update", None, |_window, cx| {
+                            workspace::reload(cx)
+                        })
+                    } else {
+                        menu.action("Check for Updates", auto_update::Check.boxed_clone())
+                    }
+                })
             }))
         })
 }
@@ -405,7 +536,7 @@ fn render_manage_menu(cx: &App) -> impl IntoElement {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{Empty, EntityId, TestAppContext, VisualTestContext};
+    use gpui::{Empty, EntityId, Modifiers, TestAppContext, VisualTestContext};
     use workspace::{
         HideStatusItem, ItemHandle, StatusItemView,
         dock::{DockPosition, Panel as _},
@@ -611,6 +742,49 @@ mod tests {
             !left_dock.read_with(cx, |dock, _| dock.is_open()),
             "clicking the visible panel closes its dock"
         );
+    }
+
+    fn click_cell(cell: &'static str, cx: &mut VisualTestContext) {
+        let bounds = cx
+            .debug_bounds(cell)
+            .unwrap_or_else(|| panic!("{cell} should be rendered"));
+        cx.simulate_click(bounds.center(), Modifiers::none());
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_activity_bar_menus_cover_user_menu(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (_workspace, cx) = open_workspace(cx).await;
+        set_activity_bar_visible(true, cx);
+
+        click_cell("activity-bar-cell-accounts", cx);
+        assert!(
+            cx.debug_bounds("MENU_ITEM-Sign In").is_some(),
+            "signed out, the accounts menu offers to sign in"
+        );
+        click_cell("activity-bar-cell-accounts", cx);
+        assert!(
+            cx.debug_bounds("MENU_ITEM-Sign In").is_none(),
+            "clicking the button again closes the menu"
+        );
+
+        click_cell("activity-bar-cell-manage", cx);
+        for entry in [
+            "MENU_ITEM-Command Palette",
+            "MENU_ITEM-Settings",
+            "MENU_ITEM-Keymap",
+            "MENU_ITEM-Themes…",
+            "MENU_ITEM-Icon Themes…",
+            "MENU_ITEM-Extensions",
+            "MENU_ITEM-Use VS Code Layout",
+            "MENU_ITEM-Check for Updates",
+        ] {
+            assert!(
+                cx.debug_bounds(entry).is_some(),
+                "the manage menu should have {entry}"
+            );
+        }
     }
 
     #[gpui::test]
