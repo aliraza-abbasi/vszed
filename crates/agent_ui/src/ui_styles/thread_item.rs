@@ -395,10 +395,14 @@ impl Item for AgentThreadItem {
         } else {
             None
         };
-        let icon = self
-            .agent_icon(cx)
-            .size(IconSize::Small)
-            .color(params.text_color());
+        // Claude Code tabs carry the orange spark.
+        let is_claude = self.request.agent.id().as_ref() == agent_servers::CLAUDE_AGENT_ID;
+        let icon_color = if is_claude && super::claude_code_style_enabled(cx) {
+            Color::Custom(super::claude_code::claude_orange())
+        } else {
+            params.text_color()
+        };
+        let icon = self.agent_icon(cx).size(IconSize::Small).color(icon_color);
         h_flex()
             .gap_1p5()
             .child(
@@ -689,6 +693,32 @@ pub(crate) fn route_to_thread_tab(
 /// keystroke falls through to its stock binding (`cmd-escape` cancels menus).
 fn thread_tab_shortcuts_enabled(cx: &App) -> bool {
     threads_open_in_editor(cx) || super::claude_code_style_enabled(cx)
+}
+
+/// Brings up the visible thread tab, or any open one, or a new one: the Claude Code
+/// status bar item. With threads in the agent panel, it focuses the panel.
+pub(crate) fn focus_or_open_thread_tab(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    if !threads_open_in_editor(cx) {
+        workspace.focus_panel::<AgentPanel>(window, cx);
+        return;
+    }
+    let visible_tab = workspace.panes().iter().find_map(|pane| {
+        pane.read(cx)
+            .active_item()
+            .and_then(|item| item.downcast::<AgentThreadItem>())
+    });
+    match visible_tab.or_else(|| workspace.items_of_type::<AgentThreadItem>(cx).next()) {
+        Some(tab) => {
+            workspace.activate_item(&tab, true, true, window, cx);
+        }
+        None => {
+            new_thread_tab(workspace, None, window, cx);
+        }
+    }
 }
 
 fn toggle_thread_tab_focus(

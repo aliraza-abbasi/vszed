@@ -10,12 +10,12 @@ mod claude_code_prompt_box;
 
 use super::*;
 use crate::ui_styles::claude_code::{
-    ClaudeCodeSpinnerElement, StepStatus, TIMELINE_GUTTER, TimelineDot, ToolOutputTab, ToolRow,
-    attachment_name, edit_line_stats, format_day, format_timestamp, is_long_tool_text,
-    remove_output_tab, sent_message_text, set_output_tab, set_user_message_overflows,
-    summarize_tool_call, thought_has_summary, thought_label, thread_activity, timeline_row,
-    toggle_thoughts_expanded, toggle_user_message_expanded, tool_output_text, tool_output_title,
-    transcript_markdown_style, ui_font_text_style,
+    AgentSummary, ClaudeCodeSpinnerElement, StatusDot, StepStatus, TIMELINE_GUTTER, TimelineDot,
+    ToolOutputTab, ToolRow, agent_summaries, attachment_name, edit_line_stats, format_day,
+    format_timestamp, is_long_tool_text, remove_output_tab, sent_message_text, set_output_tab,
+    set_user_message_overflows, summarize_tool_call, thought_has_summary, thought_label,
+    thread_activity, timeline_row, toggle_thoughts_expanded, toggle_user_message_expanded,
+    tool_output_text, tool_output_title, transcript_markdown_style, ui_font_text_style,
 };
 use chrono::Local;
 use claude_code_permission_card::claude_code_card_handles;
@@ -80,6 +80,12 @@ impl ThreadView {
                 .child(div().w_full().child(content))
         };
 
+        // The prompt box floats over the bottom of the transcript, so the last entry
+        // scrolls up clear of it.
+        let floating_prompt_height = thread_activity(cx.entity_id(), cx)
+            .map(|activity| activity.floating_prompt_height().get())
+            .unwrap_or_default();
+
         list(
             self.list_state.clone(),
             cx.processor(move |this, index: usize, window, cx| {
@@ -97,6 +103,7 @@ impl ThreadView {
         )
         .with_sizing_behavior(gpui::ListSizingBehavior::Auto)
         .flex_grow_1()
+        .pb(floating_prompt_height)
     }
 
     fn render_claude_code_entry(
@@ -142,8 +149,25 @@ impl ThreadView {
                 if Self::claude_code_tool_call_is_hidden(tool_call, cx) {
                     return Empty.into_any_element();
                 }
-                self.render_claude_code_tool_call(entry_ix, tool_call, window, cx)
-                    .when_some(entry_focus_handle, |this, handle| this.track_focus(&handle))
+                // Claude Code's Agent and Task calls report the `think` kind.
+                let background_line = matches!(tool_call.kind(), acp_v2::ToolKind::Think)
+                    .then(|| {
+                        self.render_claude_code_background_agent_line(
+                            |agent| agent.tool_call_id.as_ref() == Some(&tool_call.id),
+                            window,
+                            cx,
+                        )
+                    })
+                    .flatten();
+                v_flex()
+                    .w_full()
+                    .child(
+                        self.render_claude_code_tool_call(entry_ix, tool_call, window, cx)
+                            .when_some(entry_focus_handle, |this, handle| {
+                                this.track_focus(&handle)
+                            }),
+                    )
+                    .children(background_line)
                     .into_any_element()
             }
             AgentThreadEntry::Elicitation(elicitation_id) => {
@@ -160,13 +184,27 @@ impl ThreadView {
                 self.render_claude_code_compaction(entry_ix, compaction, window, cx)
             }
             AgentThreadEntry::SessionMessage(message) => {
-                let session_message =
-                    match acp_subagent_card(self.thread.read(cx), entry_ix, message, cx) {
-                        Some(card) => self.render_acp_subagent_card(entry_ix, &card, window, cx),
-                        None => self.render_session_message(entry_ix, message, window, cx),
-                    };
-                session_message
-                    .when_some(entry_focus_handle, |this, handle| this.track_focus(&handle))
+                let card = acp_subagent_card(self.thread.read(cx), entry_ix, message, cx);
+                let background_line = card.as_ref().and_then(|card| {
+                    let session_id = card.subagent.read(cx).session_id().clone();
+                    self.render_claude_code_background_agent_line(
+                        |agent| agent.session_id.as_ref() == Some(&session_id),
+                        window,
+                        cx,
+                    )
+                });
+                let session_message = match card {
+                    Some(card) => self.render_acp_subagent_card(entry_ix, &card, window, cx),
+                    None => self.render_session_message(entry_ix, message, window, cx),
+                };
+                v_flex()
+                    .w_full()
+                    .child(
+                        session_message.when_some(entry_focus_handle, |this, handle| {
+                            this.track_focus(&handle)
+                        }),
+                    )
+                    .children(background_line)
                     .into_any_element()
             }
         };
@@ -269,6 +307,41 @@ impl ThreadView {
                             }
                         }),
                 )
+                .into_any_element(),
+        )
+    }
+
+    /// Claude Code shows a subagent that runs in the background as one status line under
+    /// the call that started it: "Working in the background: … · type /tasks to see its
+    /// transcript".
+    fn render_claude_code_background_agent_line(
+        &self,
+        is_agent: impl Fn(&AgentSummary) -> bool,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        let agent = agent_summaries(
+            self.thread.read(cx),
+            thread_activity(cx.entity_id(), cx),
+            Instant::now(),
+            cx,
+        )
+        .into_iter()
+        .find(|agent| agent.backgrounded && is_agent(agent))?;
+        Some(
+            div()
+                .w_full()
+                .px_5()
+                .pb_1()
+                .text_ui(cx)
+                .debug_selector(|| "claude-code-background-agent".to_string())
+                .child(timeline_row(
+                    StatusDot::new(agent.dot_state()).size(px(7.)),
+                    Label::new(agent.background_line())
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                    window,
+                ))
                 .into_any_element(),
         )
     }
@@ -2115,6 +2188,153 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_claude_code_prompt_box_floats_over_the_transcript(cx: &mut TestAppContext) {
+        let connection = StubAgentConnection::new();
+        let (thread_view, cx) = setup_thread_view(connection, cx).await;
+        let message_editor = thread_view.read_with(cx, |view, _| view.message_editor.clone());
+        let editor_mode = |cx: &mut VisualTestContext| {
+            message_editor.read_with(cx, |message_editor, cx| {
+                message_editor.editor().read(cx).mode().clone()
+            })
+        };
+        let zed_mode = editor_mode(cx);
+
+        set_ui_style("claude_code", cx);
+        cx.run_until_parked();
+        assert_eq!(
+            editor_mode(cx),
+            editor::EditorMode::AutoHeight {
+                min_lines: 1,
+                max_lines: Some(9),
+            },
+            "the prompt starts at one line"
+        );
+        let prompt_box = cx
+            .debug_bounds("claude-code-prompt-box")
+            .expect("prompt box is drawn");
+        assert!(
+            prompt_box.size.width <= px(680.),
+            "the prompt box is at most 680px wide, got {:?}",
+            prompt_box.size.width
+        );
+        let floating_height = thread_view.read_with(cx, |_, cx| {
+            thread_activity(thread_view.entity_id(), cx)
+                .map(|activity| activity.floating_prompt_height().get())
+        });
+        assert!(
+            floating_height.is_some_and(|height| height >= prompt_box.size.height),
+            "the transcript keeps the floating box's height clear"
+        );
+
+        set_ui_style("zed", cx);
+        cx.run_until_parked();
+        assert_eq!(editor_mode(cx), zed_mode);
+    }
+
+    #[gpui::test]
+    async fn test_claude_code_agents_chip_from_sdk_messages(cx: &mut TestAppContext) {
+        let connection = StubAgentConnection::new();
+        let (thread_view, cx) = setup_thread_view(connection, cx).await;
+        set_ui_style("claude_code", cx);
+        assert!(cx.debug_bounds("claude-code-agents-chip").is_none());
+
+        let session_id =
+            thread_view.read_with(cx, |view, cx| view.thread.read(cx).session_id().clone());
+        let send = |message: serde_json::Value, cx: &mut VisualTestContext| {
+            let session_id = session_id.clone();
+            cx.update(|_, cx| {
+                let notifications = agent_servers::AgentExtNotifications::global(cx);
+                notifications.update(cx, |_, cx| {
+                    cx.emit(agent_servers::AgentExtNotification {
+                        session_id: Some(session_id.clone()),
+                        method: "_claude/sdkMessage".into(),
+                        params: std::sync::Arc::new(json!({
+                            "sessionId": session_id.0.to_string(),
+                            "message": message,
+                        })),
+                    })
+                });
+            });
+            cx.run_until_parked();
+        };
+        send(
+            json!({
+                "type": "system",
+                "subtype": "task_started",
+                "task_id": "agent-1",
+                "tool_use_id": "toolu_1",
+                "description": "Explore agent UI architecture",
+                "subagent_type": "Explore",
+                "task_type": "local_agent",
+                "is_backgrounded": true,
+            }),
+            cx,
+        );
+        assert!(cx.debug_bounds("claude-code-agents-chip").is_some());
+        let live = thread_view.read_with(cx, |view, cx| {
+            let agents = agent_summaries(
+                view.thread.read(cx),
+                thread_activity(thread_view.entity_id(), cx),
+                Instant::now(),
+                cx,
+            );
+            crate::ui_styles::claude_code::live_agent_count(&agents)
+        });
+        assert_eq!(live, 1);
+
+        send(
+            json!({
+                "type": "system",
+                "subtype": "task_notification",
+                "task_id": "agent-1",
+                "status": "completed",
+                "output_file": "",
+                "summary": "",
+            }),
+            cx,
+        );
+        let live = thread_view.read_with(cx, |view, cx| {
+            let agents = agent_summaries(
+                view.thread.read(cx),
+                thread_activity(thread_view.entity_id(), cx),
+                Instant::now(),
+                cx,
+            );
+            crate::ui_styles::claude_code::live_agent_count(&agents)
+        });
+        assert_eq!(
+            live, 0,
+            "finished agents stay in the map but not in the count"
+        );
+        assert!(cx.debug_bounds("claude-code-agents-chip").is_some());
+    }
+
+    #[gpui::test]
+    async fn test_claude_code_status_item_follows_the_style(cx: &mut TestAppContext) {
+        let connection = StubAgentConnection::new();
+        let (thread_view, cx) = setup_thread_view(connection, cx).await;
+        let workspace = thread_view.read_with(cx, |view, _| view.workspace.clone());
+        let has_status_item = |cx: &mut VisualTestContext| {
+            workspace
+                .read_with(cx, |workspace, cx| {
+                    workspace
+                        .status_bar()
+                        .read(cx)
+                        .item_of_type::<crate::ui_styles::claude_code::ClaudeCodeStatusItem>()
+                        .is_some()
+                })
+                .expect("workspace")
+        };
+        assert!(!has_status_item(cx));
+        set_ui_style("claude_code", cx);
+        cx.run_until_parked();
+        assert!(has_status_item(cx));
+        set_ui_style("zed", cx);
+        cx.run_until_parked();
+        assert!(!has_status_item(cx));
+    }
+
+    #[gpui::test]
     async fn test_claude_code_prompt_box(cx: &mut TestAppContext) {
         let connection = StubAgentConnection::new();
         let (thread_view, cx) = setup_thread_view(connection.clone(), cx).await;
@@ -2124,7 +2344,10 @@ mod tests {
 
         set_ui_style("claude_code", cx);
         assert!(cx.debug_bounds("claude-code-prompt-box").is_some());
-        assert_eq!(placeholder(&message_editor, cx), "Message Test…");
+        assert_eq!(
+            placeholder(&message_editor, cx),
+            crate::ui_styles::claude_code::idle_placeholder()
+        );
 
         message_editor.update_in(cx, |editor, window, cx| {
             editor.set_text("Hello", window, cx);
@@ -2137,7 +2360,10 @@ mod tests {
             thread_view.read_with(cx, |view, cx| view.thread.read(cx).session_id().clone());
         connection.end_turn(session_id, acp_v1::StopReason::EndTurn);
         cx.run_until_parked();
-        assert_eq!(placeholder(&message_editor, cx), "Message Test…");
+        assert_eq!(
+            placeholder(&message_editor, cx),
+            crate::ui_styles::claude_code::idle_placeholder()
+        );
 
         set_ui_style("zed", cx);
         assert!(cx.debug_bounds("claude-code-prompt-box").is_none());
