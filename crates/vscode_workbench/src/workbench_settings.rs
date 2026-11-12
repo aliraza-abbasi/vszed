@@ -6,6 +6,7 @@ pub struct WorkbenchSettings {
     pub dock_headers: bool,
     pub command_center: bool,
     pub layout_controls: bool,
+    pub status_bar: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -34,6 +35,9 @@ impl Settings for WorkbenchSettings {
                 .unwrap_or_default(),
             layout_controls: workbench
                 .and_then(|workbench| workbench.layout_controls)
+                .unwrap_or_default(),
+            status_bar: workbench
+                .and_then(|workbench| workbench.status_bar)
                 .unwrap_or_default(),
         }
     }

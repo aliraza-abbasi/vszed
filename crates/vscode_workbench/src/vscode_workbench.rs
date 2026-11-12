@@ -5,6 +5,7 @@ mod command_center;
 mod dock_header;
 mod layout_controls;
 mod preset;
+mod status_items;
 mod workbench_settings;
 
 pub use activity_bar::ActivityBar;
@@ -12,6 +13,7 @@ pub use command_center::CommandCenter;
 pub use dock_header::DockHeader;
 pub use layout_controls::{LayoutControls, ToggleActivityBar};
 pub use preset::{RestorePreviousLayout, UseVsCodeLayout};
+pub use status_items::{GitBranchItem, NotificationBell, ProblemsItem, RemoteIndicator};
 pub use workbench_settings::{ActivityBarSettings, WorkbenchSettings};
 
 use std::sync::Arc;
@@ -38,6 +40,7 @@ pub fn init(cx: &mut App) {
     preset::init(cx);
     command_center::init(cx);
     layout_controls::init(cx);
+    status_items::init(cx);
 }
 
 /// VS Code's UI icons, embedded from `assets/icons/codicons`.
@@ -47,14 +50,19 @@ enum Codicon {
     Account,
     ArrowLeft,
     ArrowRight,
+    Bell,
+    BellDot,
     ChatSparkle,
     ChevronDown,
     ChevronUp,
     Close,
+    CloudUpload,
     DebugAlt,
     Ellipsis,
+    Error,
     Extensions,
     Files,
+    GitBranch,
     Layout,
     LayoutPanel,
     LayoutPanelOff,
@@ -63,11 +71,14 @@ enum Codicon {
     LayoutSidebarRight,
     LayoutSidebarRightOff,
     LiveShare,
+    Remote,
     Search,
     SettingsGear,
     SourceControl,
     SymbolClass,
+    Sync,
     Terminal,
+    Warning,
 }
 
 impl Codicon {
@@ -76,14 +87,19 @@ impl Codicon {
             Self::Account => "icons/codicons/account.svg",
             Self::ArrowLeft => "icons/codicons/arrow-left.svg",
             Self::ArrowRight => "icons/codicons/arrow-right.svg",
+            Self::Bell => "icons/codicons/bell.svg",
+            Self::BellDot => "icons/codicons/bell-dot.svg",
             Self::ChatSparkle => "icons/codicons/chat-sparkle.svg",
             Self::ChevronDown => "icons/codicons/chevron-down.svg",
             Self::ChevronUp => "icons/codicons/chevron-up.svg",
             Self::Close => "icons/codicons/close.svg",
+            Self::CloudUpload => "icons/codicons/cloud-upload.svg",
             Self::DebugAlt => "icons/codicons/debug-alt.svg",
             Self::Ellipsis => "icons/codicons/ellipsis.svg",
+            Self::Error => "icons/codicons/error.svg",
             Self::Extensions => "icons/codicons/extensions.svg",
             Self::Files => "icons/codicons/files.svg",
+            Self::GitBranch => "icons/codicons/git-branch.svg",
             Self::Layout => "icons/codicons/layout.svg",
             Self::LayoutPanel => "icons/codicons/layout-panel.svg",
             Self::LayoutPanelOff => "icons/codicons/layout-panel-off.svg",
@@ -92,11 +108,14 @@ impl Codicon {
             Self::LayoutSidebarRight => "icons/codicons/layout-sidebar-right.svg",
             Self::LayoutSidebarRightOff => "icons/codicons/layout-sidebar-right-off.svg",
             Self::LiveShare => "icons/codicons/live-share.svg",
+            Self::Remote => "icons/codicons/remote.svg",
             Self::Search => "icons/codicons/search.svg",
             Self::SettingsGear => "icons/codicons/settings-gear.svg",
             Self::SourceControl => "icons/codicons/source-control.svg",
             Self::SymbolClass => "icons/codicons/symbol-class.svg",
+            Self::Sync => "icons/codicons/sync.svg",
             Self::Terminal => "icons/codicons/terminal.svg",
+            Self::Warning => "icons/codicons/warning.svg",
         }
     }
 
