@@ -1580,10 +1580,9 @@ mod tests {
 
         cx.update(|cx| retain_thread_readings(thread_view.entity_id(), cx));
         assert!(cx.read(|cx| {
-            cx.global::<ClaudeUsageStore>()
+            !cx.global::<ClaudeUsageStore>()
                 .threads
-                .get(&thread_view.entity_id())
-                .is_none()
+                .contains_key(&thread_view.entity_id())
         }));
         assert_eq!(rows(cx, project_id), expected, "kept after the view closed");
         assert!(rows(cx, other_project.entity_id()).is_empty());
