@@ -9060,6 +9060,11 @@ impl Editor {
             .current_line_highlight
             .unwrap_or_else(|| EditorSettings::get_global(cx).current_line_highlight);
         self.set_current_line_highlight(Some(current_line_highlight));
+        if let Some(text_style_refinement) = self.text_style_refinement.as_mut() {
+            text_style_refinement.line_height = minimap_settings
+                .line_height
+                .map(|line_height| relative(line_height.value()));
+        }
     }
 
     pub fn minimap(&self) -> Option<&Entity<Self>> {
