@@ -201,6 +201,124 @@ impl ThreadView {
             .into_any_element()
     }
 
+    /// Zed's activity bar (pending permissions, the plan, edited files and the
+    /// message queue) with the same rows and behavior, drawn as a box with the
+    /// prompt box's width, radius and colors so the two read as one column.
+    pub(in crate::conversation_view::thread_view) fn render_claude_code_activity_bar(
+        &self,
+        window: &mut Window,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        let thread = self.thread.read(cx);
+        let action_log = thread.action_log();
+        let telemetry = ActionLogTelemetry::from(thread);
+        let changed_buffers = action_log.read(cx).changed_buffers(cx).collect::<Vec<_>>();
+        let plan = thread.plan().filter(|plan| !plan.is_empty(cx));
+        let has_plan = plan.is_some();
+        let has_changed_buffers = !changed_buffers.is_empty();
+        let has_queue = self.has_queued_messages();
+
+        let awaiting_permission = self
+            .render_main_agent_awaiting_permission(window, cx)
+            .or_else(|| self.render_subagents_awaiting_permission(cx));
+        let awaiting_permission = match (self.render_generic_permissions(cx), awaiting_permission) {
+            (Some(generic), Some(legacy)) => Some(
+                v_flex()
+                    .child(generic)
+                    .child(Divider::horizontal().color(DividerColor::Border))
+                    .child(legacy)
+                    .into_any(),
+            ),
+            (generic, legacy) => generic.or(legacy),
+        };
+        let has_awaiting_permission = awaiting_permission.is_some();
+
+        if !has_changed_buffers && !has_plan && !has_queue && !has_awaiting_permission {
+            return None;
+        }
+
+        // Mirrors `render_activity_bar`, which keeps ACP edit controls enabled.
+        let pending_edits = false;
+        let max_content_width = AgentSettings::get_global(cx).max_content_width;
+        let colors = cx.theme().colors();
+
+        let activity_box = v_flex()
+            .id("claude-code-activity-bar")
+            .debug_selector(|| "claude-code-activity-bar".into())
+            .w_full()
+            .min_w_0()
+            .overflow_hidden()
+            .rounded(PROMPT_BOX_RADIUS)
+            .border_1()
+            .border_color(colors.border)
+            .bg(self.activity_bar_bg(cx))
+            .when_some(awaiting_permission, |this, element| this.child(element))
+            .when(
+                has_awaiting_permission && (has_plan || has_changed_buffers || has_queue),
+                |this| this.child(Divider::horizontal().color(DividerColor::Border)),
+            )
+            .when_some(plan, |this, plan| {
+                this.child(self.render_plan_summary(plan, window, cx))
+                    .when(self.plan_expanded, |this| {
+                        this.children(self.render_plan_body(plan, window, cx))
+                    })
+            })
+            .when(has_plan && has_changed_buffers, |this| {
+                this.child(Divider::horizontal().color(DividerColor::Border))
+            })
+            .when(
+                has_changed_buffers && thread.parent_session_id().is_none(),
+                |this| {
+                    this.child(self.render_edits_summary(
+                        &changed_buffers,
+                        self.edits_expanded,
+                        pending_edits,
+                        cx,
+                    ))
+                    .when(self.edits_expanded, |this| {
+                        this.child(self.render_edited_files(
+                            action_log,
+                            telemetry.clone(),
+                            &changed_buffers,
+                            pending_edits,
+                            cx,
+                        ))
+                    })
+                },
+            )
+            .when(has_queue, |this| {
+                this.when(has_plan || has_changed_buffers, |this| {
+                    this.child(Divider::horizontal().color(DividerColor::Border))
+                })
+                .child(self.render_message_queue_summary(window, cx))
+                .when(self.queue_expanded, |this| {
+                    this.child(self.render_message_queue_entries(window, cx))
+                })
+            });
+
+        Some(
+            h_flex()
+                .w_full()
+                .flex_none()
+                .justify_center()
+                .px_3()
+                .pt_1()
+                .bg(colors.editor_background)
+                .child(
+                    div()
+                        .when_some(max_content_width, |this, max_width| {
+                            this.flex_basis(max_width)
+                        })
+                        .when(max_content_width.is_none(), |this| this.w_full())
+                        .min_w_0()
+                        .flex_shrink_1()
+                        .flex_grow_0()
+                        .child(activity_box),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn claude_code_config_options(&self, cx: &App) -> Option<ConfigOptionsHandle> {
         let view = self.config_options_view.as_ref()?.read(cx);
         Some(ConfigOptionsHandle {

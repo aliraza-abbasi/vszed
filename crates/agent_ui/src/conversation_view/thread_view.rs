@@ -3996,6 +3996,9 @@ impl ThreadView {
 
     fn activity_bar_bg(&self, cx: &Context<Self>) -> Hsla {
         let editor_bg_color = cx.theme().colors().editor_background;
+        if crate::ui_styles::claude_code_style_enabled(cx) {
+            return editor_bg_color;
+        }
         let active_color = cx.theme().colors().element_selected;
         editor_bg_color.blend(active_color.opacity(0.3))
     }
@@ -4005,6 +4008,9 @@ impl ThreadView {
         window: &mut Window,
         cx: &Context<Self>,
     ) -> Option<AnyElement> {
+        if crate::ui_styles::claude_code_style_enabled(cx) {
+            return self.render_claude_code_activity_bar(window, cx);
+        }
         let thread = self.thread.read(cx);
         let action_log = thread.action_log();
         let telemetry = ActionLogTelemetry::from(thread);
