@@ -297,7 +297,7 @@ impl RenderOnce for ToolRow {
                                 });
                                 this.child(
                                     h_flex()
-                                        .group(hover_group.clone())
+                                        .group(hover_group)
                                         .relative()
                                         .items_start()
                                         .px_2p5()
