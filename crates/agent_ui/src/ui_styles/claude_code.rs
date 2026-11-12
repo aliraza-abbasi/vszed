@@ -1,5 +1,6 @@
 pub(crate) mod sessions_panel;
 mod tool_row;
+pub(crate) mod usage;
 
 pub(crate) use tool_row::ToolRow;
 
@@ -349,6 +350,7 @@ pub(crate) fn init(cx: &mut App) {
     })
     .detach();
     sessions_panel::init(cx);
+    usage::init(cx);
 }
 
 /// Records timeline activity for every thread view, whichever style is active,

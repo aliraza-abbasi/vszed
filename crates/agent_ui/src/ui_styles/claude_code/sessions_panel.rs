@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use acp_thread::{AgentSessionInfo, AgentSessionList, AgentSessionListRequest};
 use agent_client_protocol::v2::schema as acp_v2;
@@ -8,7 +9,7 @@ use collections::HashSet;
 use editor::{Editor, EditorEvent};
 use gpui::{
     Action, App, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    Subscription, Task, WeakEntity, Window, actions, px,
+    FontWeight, Stateful, Subscription, Task, WeakEntity, Window, actions, px,
 };
 use project::{AgentId, Project};
 use std::rc::Rc;
@@ -21,6 +22,7 @@ use workspace::{
 
 use crate::agent_panel::AgentPanel;
 use crate::thread_metadata_store::{ThreadId, ThreadMetadata, ThreadMetadataStore};
+use crate::ui_styles::claude_code::usage::{self, UsageWindow};
 use crate::ui_styles::claude_code_style_enabled;
 use crate::ui_styles::thread_item::{
     AgentThreadItem, ThreadTabRequest, connection_store, global_thread_store, new_thread_tab,
@@ -128,6 +130,21 @@ struct SessionRow {
     status: SessionStatus,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Section {
+    AccountAndUsage,
+    SessionManager,
+}
+
+impl Section {
+    fn title(self) -> &'static str {
+        match self {
+            Self::AccountAndUsage => "ACCOUNT & USAGE",
+            Self::SessionManager => "SESSION MANAGER",
+        }
+    }
+}
+
 pub(crate) struct ClaudeCodeSessionsPanel {
     workspace: WeakEntity<Workspace>,
     project: Entity<Project>,
@@ -139,6 +156,12 @@ pub(crate) struct ClaudeCodeSessionsPanel {
     renaming: Option<(acp_v2::SessionId, Entity<Editor>)>,
     position: DockPosition,
     has_requested_sessions: bool,
+    account_and_usage_expanded: bool,
+    session_manager_expanded: bool,
+    /// The reset time `_usage_reset_timer` re-renders the panel at, so a
+    /// window that has reset stops showing its old reading.
+    scheduled_usage_reset: Option<i64>,
+    _usage_reset_timer: Task<()>,
     _refresh_task: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
@@ -165,6 +188,7 @@ impl ClaudeCodeSessionsPanel {
                     this.refresh(window, cx);
                 }
             }),
+            usage::observe_usage(cx),
         ];
         if let Some(store) = ThreadMetadataStore::try_global(cx) {
             subscriptions.push(cx.observe(&store, |_, _, cx| cx.notify()));
@@ -180,9 +204,92 @@ impl ClaudeCodeSessionsPanel {
             renaming: None,
             position: DockPosition::Left,
             has_requested_sessions: false,
+            account_and_usage_expanded: true,
+            session_manager_expanded: true,
+            scheduled_usage_reset: None,
+            _usage_reset_timer: Task::ready(()),
             _refresh_task: Task::ready(()),
             _subscriptions: subscriptions,
         }
+    }
+
+    /// The usage limits from the most recent rate limit reports of the
+    /// project's open Claude threads.
+    pub(crate) fn usage_windows(&self, cx: &App) -> Vec<UsageWindow> {
+        usage::project_usage_windows(self.project.entity_id(), Utc::now().timestamp(), cx)
+    }
+
+    fn schedule_usage_refresh(&mut self, windows: &[UsageWindow], cx: &mut Context<Self>) {
+        let next_reset = windows.iter().filter_map(|window| window.resets_at).min();
+        if next_reset == self.scheduled_usage_reset {
+            return;
+        }
+        self.scheduled_usage_reset = next_reset;
+        self._usage_reset_timer = match next_reset {
+            Some(resets_at) => {
+                let seconds_left = resets_at.saturating_sub(Utc::now().timestamp());
+                let delay =
+                    Duration::from_secs(u64::try_from(seconds_left).unwrap_or(0).saturating_add(1));
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(delay).await;
+                    this.update(cx, |this, cx| {
+                        this.scheduled_usage_reset = None;
+                        cx.notify();
+                    })
+                    .log_err();
+                })
+            }
+            None => Task::ready(()),
+        };
+    }
+
+    fn is_expanded(&self, section: Section) -> bool {
+        match section {
+            Section::AccountAndUsage => self.account_and_usage_expanded,
+            Section::SessionManager => self.session_manager_expanded,
+        }
+    }
+
+    fn toggle_section(&mut self, section: Section, cx: &mut Context<Self>) {
+        match section {
+            Section::AccountAndUsage => {
+                self.account_and_usage_expanded = !self.account_and_usage_expanded
+            }
+            Section::SessionManager => {
+                self.session_manager_expanded = !self.session_manager_expanded
+            }
+        }
+        cx.notify();
+    }
+
+    fn render_section_header(&self, section: Section, cx: &mut Context<Self>) -> Stateful<Div> {
+        let expanded = self.is_expanded(section);
+        h_flex()
+            .id(match section {
+                Section::AccountAndUsage => "claude-code-account-and-usage-header",
+                Section::SessionManager => "claude-code-session-manager-header",
+            })
+            .w_full()
+            .px_2()
+            .py_1()
+            .gap_1()
+            .cursor_pointer()
+            .child(
+                Icon::new(if expanded {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                })
+                .size(IconSize::XSmall)
+                .color(Color::Muted),
+            )
+            .child(
+                Label::new(section.title())
+                    .size(LabelSize::Small)
+                    .weight(FontWeight::SEMIBOLD)
+                    .color(Color::Muted),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| this.toggle_section(section, cx)))
     }
 
     fn project_roots(&self, cx: &App) -> Vec<PathBuf> {
@@ -707,6 +814,9 @@ impl Render for ClaudeCodeSessionsPanel {
             _ => None,
         };
 
+        let usage_windows = self.usage_windows(cx);
+        self.schedule_usage_refresh(&usage_windows, cx);
+
         v_flex()
             .id("claude-code-sessions-panel")
             .key_context("ClaudeCodeSessionsPanel")
@@ -714,101 +824,127 @@ impl Render for ClaudeCodeSessionsPanel {
             .size_full()
             .bg(cx.theme().colors().panel_background)
             // No title row of its own: a dock header, when there is one, already names the panel.
+            .child(self.render_section_header(Section::AccountAndUsage, cx))
+            .when(self.account_and_usage_expanded, |this| {
+                this.child(usage::render_account_and_usage(&usage_windows, cx))
+            })
             .child(
-                div().px_2().pt_2().pb_1().child(
-                    Button::new("new-claude-session", "New session")
-                        .start_icon(Icon::new(IconName::Plus).size(IconSize::Small))
-                        .full_width()
-                        .style(ButtonStyle::Outlined)
-                        .on_click(cx.listener(|this, _, window, cx| this.new_session(window, cx))),
-                ),
+                self.render_section_header(Section::SessionManager, cx)
+                    .border_t_1()
+                    .border_color(cx.theme().colors().border_variant),
             )
-            .child(
-                h_flex()
-                    .mx_2()
-                    .mb_1()
-                    .gap_1()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .px_2()
-                            .py_1()
-                            .rounded_sm()
-                            .border_1()
-                            .border_color(cx.theme().colors().border)
-                            .child(self.search_editor.clone()),
-                    )
-                    .child(
-                        IconButton::new("refresh-claude-sessions", IconName::RotateCw)
-                            .icon_size(IconSize::Small)
-                            .icon_color(Color::Muted)
-                            .tooltip(Tooltip::text("Refresh"))
-                            .on_click(cx.listener(|this, _, window, cx| this.refresh(window, cx))),
-                    ),
-            )
-            .child(
-                v_flex()
-                    .id("claude-code-session-list")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .px_1()
-                    .when_some(empty_text, |this, text| {
-                        this.child(
-                            div()
-                                .px_3()
-                                .py_2()
-                                .child(Label::new(text).size(LabelSize::Small).color(Color::Muted)),
+            .when(self.session_manager_expanded, |this| {
+                this.child(
+                    v_flex()
+                        .flex_1()
+                        .min_h_0()
+                        .child(
+                            div().px_2().pt_2().pb_1().child(
+                                Button::new("new-claude-session", "New session")
+                                    .start_icon(Icon::new(IconName::Plus).size(IconSize::Small))
+                                    .full_width()
+                                    .style(ButtonStyle::Outlined)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.new_session(window, cx)
+                                    })),
+                            ),
                         )
-                    })
-                    .children(
-                        active
-                            .into_iter()
-                            .map(|row| self.render_row(row, next_index(), cx).into_any_element())
-                            .collect::<Vec<_>>(),
-                    )
-                    .when(archived_count > 0, |this| {
-                        let show_archived = self.show_archived;
-                        this.child(
+                        .child(
                             h_flex()
-                                .id("claude-code-archived-sessions")
-                                .px_3()
-                                .pt_3()
-                                .pb_1()
+                                .mx_2()
+                                .mb_1()
                                 .gap_1()
-                                .cursor_pointer()
                                 .child(
-                                    Icon::new(if show_archived {
-                                        IconName::ChevronDown
-                                    } else {
-                                        IconName::ChevronRight
-                                    })
-                                    .size(IconSize::XSmall)
-                                    .color(Color::Muted),
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .px_2()
+                                        .py_1()
+                                        .rounded_sm()
+                                        .border_1()
+                                        .border_color(cx.theme().colors().border)
+                                        .child(self.search_editor.clone()),
                                 )
                                 .child(
-                                    Label::new(format!("Archived sessions ({archived_count})"))
-                                        .size(LabelSize::Small)
-                                        .color(Color::Muted),
-                                )
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.show_archived = !this.show_archived;
-                                    cx.notify();
-                                })),
+                                    IconButton::new("refresh-claude-sessions", IconName::RotateCw)
+                                        .icon_size(IconSize::Small)
+                                        .icon_color(Color::Muted)
+                                        .tooltip(Tooltip::text("Refresh"))
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.refresh(window, cx)
+                                        })),
+                                ),
                         )
-                        .when(show_archived, |this| {
-                            this.children(
-                                archived
-                                    .into_iter()
-                                    .map(|row| {
-                                        self.render_row(row, next_index(), cx).into_any_element()
-                                    })
-                                    .collect::<Vec<_>>(),
-                            )
-                        })
-                    }),
-            )
+                        .child(
+                            v_flex()
+                                .id("claude-code-session-list")
+                                .flex_1()
+                                .min_h_0()
+                                .overflow_y_scroll()
+                                .px_1()
+                                .when_some(empty_text, |this, text| {
+                                    this.child(div().px_3().py_2().child(
+                                        Label::new(text).size(LabelSize::Small).color(Color::Muted),
+                                    ))
+                                })
+                                .children(
+                                    active
+                                        .into_iter()
+                                        .map(|row| {
+                                            self.render_row(row, next_index(), cx)
+                                                .into_any_element()
+                                        })
+                                        .collect::<Vec<_>>(),
+                                )
+                                .when(archived_count > 0, |this| {
+                                    let show_archived = self.show_archived;
+                                    this.child(
+                                        h_flex()
+                                            .id("claude-code-archived-sessions")
+                                            .px_3()
+                                            .pt_3()
+                                            .pb_1()
+                                            .gap_1()
+                                            .cursor_pointer()
+                                            .child(
+                                                Icon::new(if show_archived {
+                                                    IconName::ChevronDown
+                                                } else {
+                                                    IconName::ChevronRight
+                                                })
+                                                .size(IconSize::XSmall)
+                                                .color(Color::Muted),
+                                            )
+                                            .child(
+                                                Label::new(format!(
+                                                    "Archived sessions ({archived_count})"
+                                                ))
+                                                .size(LabelSize::Small)
+                                                .color(Color::Muted),
+                                            )
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.show_archived = !this.show_archived;
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .when(
+                                        show_archived,
+                                        |this| {
+                                            this.children(
+                                                archived
+                                                    .into_iter()
+                                                    .map(|row| {
+                                                        self.render_row(row, next_index(), cx)
+                                                            .into_any_element()
+                                                    })
+                                                    .collect::<Vec<_>>(),
+                                            )
+                                        },
+                                    )
+                                }),
+                        ),
+                )
+            })
     }
 }
 
@@ -849,10 +985,13 @@ fn sync_panel(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<W
 mod tests {
     use super::*;
     use crate::conversation_view::tests::init_test;
-    use acp_thread::AgentSessionListResponse;
+    use crate::test_support::{active_session_id, open_thread_with_connection};
+    use acp_thread::{AgentSessionListResponse, StubAgentConnection};
+    use agent_client_protocol::v1::schema as acp_v1;
     use chrono::TimeZone as _;
     use fs::FakeFs;
-    use gpui::TestAppContext;
+    use gpui::{TestAppContext, VisualTestContext};
+    use serde_json::json;
     use std::cell::RefCell;
     use std::path::Path;
     use workspace::MultiWorkspace;
@@ -1020,6 +1159,111 @@ mod tests {
                 .is_some_and(|panel| panel.panel_key() == ClaudeCodeSessionsPanel::panel_key())
         });
         assert!(panel_is_active);
+    }
+
+    #[gpui::test]
+    async fn test_rate_limit_usage_update_reaches_the_sessions_panel(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+            crate::ui_styles::init(cx);
+            gpui::UpdateGlobal::update_global(cx, |store: &mut settings::SettingsStore, cx| {
+                store
+                    .set_user_settings(r#"{ "agent": { "ui_style": "claude_code" } }"#, cx)
+                    .expect("valid settings");
+            });
+        });
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .expect("window is open");
+        let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
+        cx.simulate_resize(gpui::size(px(1200.), px(800.)));
+
+        let sessions_panel = workspace
+            .read_with(cx, |workspace, cx| {
+                workspace.panel::<ClaudeCodeSessionsPanel>(cx)
+            })
+            .expect("the Claude Code style adds the sessions panel");
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.toggle_panel_focus::<ClaudeCodeSessionsPanel>(window, cx);
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("claude-code-usage-empty").is_some());
+
+        let connection = StubAgentConnection::new();
+        let agent_panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| AgentPanel::new(workspace, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+        open_thread_with_connection(&agent_panel, connection.clone(), cx);
+        let session_id = active_session_id(&agent_panel, cx);
+
+        let resets_at = Utc::now().timestamp() + 3 * 24 * 60 * 60;
+        let usage_updates = [
+            json!({
+                "sessionUpdate": "usage_update", "used": 1_000, "size": 200_000,
+                "_meta": {
+                    "_claude/model": "claude-opus-5-5",
+                    "_claude/rateLimit": {
+                        "status": "allowed_warning",
+                        "rateLimitType": "seven_day",
+                        "utilization": 0.81,
+                        "resetsAt": resets_at,
+                        "unifiedWindows": {
+                            "five_hour": { "utilization": 0.14, "resetsAt": resets_at - 3_600 },
+                            "seven_day": { "utilization": 0.81, "resetsAt": resets_at },
+                        },
+                    },
+                },
+            }),
+            // Later usage updates carry only the model.
+            json!({
+                "sessionUpdate": "usage_update", "used": 2_000, "size": 200_000,
+                "_meta": { "_claude/model": "claude-opus-5-5" },
+            }),
+        ];
+        for update in usage_updates {
+            let update: acp_v1::SessionUpdate =
+                serde_json::from_value(update).expect("valid usage update");
+            cx.update(|_, cx| connection.send_update(session_id.clone(), update, cx));
+            cx.run_until_parked();
+        }
+
+        let windows = sessions_panel.read_with(cx, |panel, cx| panel.usage_windows(cx));
+        let rows = windows
+            .iter()
+            .map(|window| {
+                (
+                    window.limit_type.label(),
+                    window.utilization.map(usage::format_percent),
+                    window.status,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    SharedString::from("Session (5 hour)"),
+                    Some("14%".to_string()),
+                    None
+                ),
+                (
+                    SharedString::from("Weekly (7 day)"),
+                    Some("81%".to_string()),
+                    Some(usage::RateLimitStatus::Warning)
+                ),
+            ]
+        );
+        assert!(cx.debug_bounds("claude-code-usage-seven_day").is_some());
+        assert!(cx.debug_bounds("claude-code-usage-five_hour").is_some());
+        assert!(cx.debug_bounds("claude-code-usage-empty").is_none());
     }
 
     #[test]
