@@ -3791,6 +3791,7 @@ pub struct AcpThread {
     reported_usage: Option<ReportedTokenUsage>,
     token_usage: Option<TokenUsage>,
     cost: Option<SessionCost>,
+    usage_meta: Option<acp_v2::Meta>,
     prompt_capabilities: acp_v2::PromptCapabilities,
     available_commands: Vec<acp_v2::AvailableCommand>,
     _observe_prompt_capabilities: Task<anyhow::Result<()>>,
@@ -4155,6 +4156,7 @@ impl AcpThread {
             connection,
             token_usage: None,
             cost: None,
+            usage_meta: None,
             prompt_capabilities,
             available_commands: Vec::new(),
             _observe_prompt_capabilities: task,
@@ -4981,6 +4983,11 @@ impl AcpThread {
 
     pub fn cost(&self) -> Option<&SessionCost> {
         self.cost.as_ref()
+    }
+
+    /// The latest value of each `_meta` key the agent sent on usage updates.
+    pub fn usage_meta(&self) -> Option<&acp_v2::Meta> {
+        self.usage_meta.as_ref()
     }
 
     pub fn has_pending_edit_tool_calls(&self) -> bool {
@@ -6288,6 +6295,14 @@ impl AcpThread {
                     meta: cost.meta,
                 });
             }
+        }
+        // Merged per key rather than replaced: agents may send a key on only some
+        // updates (claude-agent-acp sends its rate limit info only when it changes,
+        // but its model on every update).
+        if let Some(meta) = update.meta {
+            self.usage_meta
+                .get_or_insert_with(Default::default)
+                .extend(meta);
         }
         cx.emit(AcpThreadEvent::TokenUsageUpdated(
             OutputTokensUpdate::Unchanged,
@@ -23094,6 +23109,64 @@ mod tests {
                 .expect("token_usage should be restored by the next usage update");
             assert_eq!(usage.used_tokens, 1000);
             assert_eq!(usage.max_tokens, 10000);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_usage_update_meta_keeps_latest_value_per_key(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+        thread.read_with(cx, |thread, _| assert_eq!(thread.usage_meta(), None));
+
+        let updates = [
+            json!({
+                "sessionUpdate": "usage_update", "used": 10, "size": 100,
+                "_meta": { "agent/limit": { "status": "allowed" }, "agent/model": "first" }
+            }),
+            json!({
+                "sessionUpdate": "usage_update", "used": 20, "size": 100,
+                "_meta": { "agent/model": "second" }
+            }),
+            json!({ "sessionUpdate": "usage_update", "used": 30, "size": 100 }),
+        ];
+        for update in updates {
+            let update: acp_v1::SessionUpdate =
+                serde_json::from_value(update).expect("valid usage update");
+            thread.update(cx, |thread, cx| {
+                thread.handle_session_update(update, cx).unwrap();
+            });
+        }
+        thread.update(cx, |thread, cx| {
+            thread.update_usage(
+                acp_v2::UsageUpdate::new(40, 100).meta(
+                    json!({ "agent/limit": { "status": "rejected" } })
+                        .as_object()
+                        .cloned(),
+                ),
+                cx,
+            );
+        });
+
+        thread.read_with(cx, |thread, _| {
+            let meta = thread.usage_meta().expect("usage meta is kept");
+            assert_eq!(meta.get("agent/model"), Some(&json!("second")));
+            assert_eq!(
+                meta.get("agent/limit"),
+                Some(&json!({ "status": "rejected" }))
+            );
+            assert_eq!(
+                thread.token_usage().map(|usage| usage.used_tokens),
+                Some(40)
+            );
         });
     }
 
