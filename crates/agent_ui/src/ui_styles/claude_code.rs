@@ -6,7 +6,7 @@ pub(crate) mod usage;
 
 pub(crate) use agent_map::open_agent_map;
 pub(crate) use model_picker::{ClaudeCodeModelPicker, ConfigOptionsHandle};
-pub(crate) use tool_row::ToolRow;
+pub(crate) use tool_row::{FileLink, ToolRow};
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -247,6 +247,47 @@ pub(crate) struct ThreadActivity {
     /// The model picker, while it is open above the prompt box.
     model_picker: Option<AnyView>,
     model_picker_dismissed_at: Option<Instant>,
+    /// How Edit diffs are laid out, from the width they had in the last frame.
+    diff_layout: Rc<Cell<DiffLayout>>,
+    /// Edit diffs whose content is taller than their box, as measured in the last
+    /// frame.
+    overflowing_diffs: HashSet<acp_v2::ToolCallId>,
+    /// Whether a re-render is already waiting for a diff's language to load.
+    diff_language_pending: Rc<Cell<bool>>,
+}
+
+/// Claude Code lays an Edit's diff out side by side when it is wider than 900px,
+/// and keeps that down to 876px. Below 500px it leaves the diff out.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum DiffLayout {
+    /// Not measured yet.
+    #[default]
+    Unknown,
+    Hidden,
+    Inline,
+    SideBySide,
+}
+
+const DIFF_SIDE_BY_SIDE_WIDTH: f32 = 900.;
+const DIFF_KEEP_SIDE_BY_SIDE_WIDTH: f32 = 876.;
+const DIFF_HIDDEN_WIDTH: f32 = 500.;
+
+impl DiffLayout {
+    pub(crate) fn for_width(width: Pixels, previous: DiffLayout) -> DiffLayout {
+        let width = f32::from(width);
+        let side_by_side_width = if previous == DiffLayout::SideBySide {
+            DIFF_KEEP_SIDE_BY_SIDE_WIDTH
+        } else {
+            DIFF_SIDE_BY_SIDE_WIDTH
+        };
+        if width > side_by_side_width {
+            DiffLayout::SideBySide
+        } else if width < DIFF_HIDDEN_WIDTH {
+            DiffLayout::Hidden
+        } else {
+            DiffLayout::Inline
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -326,6 +367,18 @@ impl ThreadActivity {
 
     pub(crate) fn floating_prompt_height(&self) -> Rc<Cell<Pixels>> {
         self.floating_prompt_height.clone()
+    }
+
+    pub(crate) fn diff_layout(&self) -> Rc<Cell<DiffLayout>> {
+        self.diff_layout.clone()
+    }
+
+    pub(crate) fn diff_overflows(&self, tool_call_id: &acp_v2::ToolCallId) -> bool {
+        self.overflowing_diffs.contains(tool_call_id)
+    }
+
+    pub(crate) fn diff_language_pending(&self) -> Rc<Cell<bool>> {
+        self.diff_language_pending.clone()
     }
 
     pub(crate) fn model_picker(&self) -> Option<&AnyView> {
@@ -587,6 +640,27 @@ pub(crate) fn set_user_message_overflows(
         activity.overflowing_user_messages.insert(entry_ix)
     } else {
         activity.overflowing_user_messages.remove(&entry_ix)
+    };
+    if changed {
+        cx.notify(thread_view_id);
+    }
+}
+
+/// Records whether an Edit diff's content is taller than its box, and re-renders
+/// the thread view when that changes, because it is only known after layout.
+pub(crate) fn set_diff_overflows(
+    thread_view_id: EntityId,
+    tool_call_id: &acp_v2::ToolCallId,
+    overflows: bool,
+    cx: &mut App,
+) {
+    let Some(activity) = thread_activity_mut(thread_view_id, cx) else {
+        return;
+    };
+    let changed = if overflows {
+        activity.overflowing_diffs.insert(tool_call_id.clone())
+    } else {
+        activity.overflowing_diffs.remove(tool_call_id)
     };
     if changed {
         cx.notify(thread_view_id);
@@ -1047,33 +1121,35 @@ fn is_claude_code_tool_name(name: &str) -> bool {
     CLAUDE_CODE_TOOL_NAMES.contains(&name) || name.starts_with("mcp__")
 }
 
+/// The Claude Code tool behind a tool call, when the agent reports one.
+pub(crate) fn reported_claude_code_tool(tool_call: &ToolCall) -> Option<SharedString> {
+    claude_code_tool_name(tool_call.meta.as_ref()).or_else(|| {
+        tool_call
+            .name
+            .as_ref()
+            .or(tool_call.tool_name.as_ref())
+            .filter(|name| is_claude_code_tool_name(name.trim()))
+            .map(|name| SharedString::from(name.trim().to_string()))
+    })
+}
+
 pub(crate) fn summarize_tool_call(tool_call: &ToolCall, label: &str) -> ToolCallSummary {
     let label = label.trim();
     let is_execute = matches!(tool_call.kind(), acp_v2::ToolKind::Execute);
 
-    let reported_name = tool_call
-        .name
-        .as_ref()
-        .or(tool_call.tool_name.as_ref())
-        .filter(|name| is_claude_code_tool_name(name.trim()))
-        .map(|name| SharedString::from(name.trim().to_string()));
-    let name = claude_code_tool_name(tool_call.meta.as_ref())
-        .or(reported_name)
-        .unwrap_or_else(|| match tool_call.kind() {
-            acp_v2::ToolKind::Execute => "Bash".into(),
-            acp_v2::ToolKind::Read => "Read".into(),
-            acp_v2::ToolKind::Edit | acp_v2::ToolKind::Delete | acp_v2::ToolKind::Move => {
-                "Edit".into()
-            }
-            acp_v2::ToolKind::Search => "Grep".into(),
-            acp_v2::ToolKind::Fetch => "WebFetch".into(),
-            acp_v2::ToolKind::Think => "Think".into(),
-            _ => tool_call
-                .tool_name
-                .clone()
-                .filter(|name| !name.trim().is_empty())
-                .unwrap_or_else(|| SharedString::from(first_line(label).to_string())),
-        });
+    let name = reported_claude_code_tool(tool_call).unwrap_or_else(|| match tool_call.kind() {
+        acp_v2::ToolKind::Execute => "Bash".into(),
+        acp_v2::ToolKind::Read => "Read".into(),
+        acp_v2::ToolKind::Edit | acp_v2::ToolKind::Delete | acp_v2::ToolKind::Move => "Edit".into(),
+        acp_v2::ToolKind::Search => "Grep".into(),
+        acp_v2::ToolKind::Fetch => "WebFetch".into(),
+        acp_v2::ToolKind::Think => "Think".into(),
+        _ => tool_call
+            .tool_name
+            .clone()
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| SharedString::from(first_line(label).to_string())),
+    });
 
     let input = if is_execute {
         raw_input_str(tool_call, "command")
@@ -1288,6 +1364,84 @@ pub(crate) fn edit_line_stats(tool_call: &ToolCall) -> Option<(usize, usize)> {
                 (added + pair_added, removed + pair_removed)
             }),
     )
+}
+
+/// The text of an Edit, or of a Write's file, as Claude Code's tool input holds it.
+pub(crate) struct FileToolInput<'a> {
+    pub file_path: Option<&'a str>,
+    pub old_text: &'a str,
+    pub new_text: Option<&'a str>,
+}
+
+/// The input of a Claude Code Edit or Write call. The Write tool also accepts
+/// `path`, and `file_text` or `file_content` for its content.
+pub(crate) fn file_tool_input<'a>(tool_call: &'a ToolCall, tool: &str) -> FileToolInput<'a> {
+    let raw_input = tool_call.raw_input.as_ref();
+    let string_field = |key: &str| raw_input?.get(key)?.as_str();
+    let file_path = string_field("file_path").or_else(|| string_field("path"));
+    if tool == "Write" {
+        FileToolInput {
+            file_path,
+            old_text: "",
+            new_text: ["content", "file_text", "file_content"]
+                .into_iter()
+                .find_map(string_field),
+        }
+    } else {
+        FileToolInput {
+            file_path,
+            old_text: string_field("old_string").unwrap_or_default(),
+            new_text: string_field("new_string"),
+        }
+    }
+}
+
+/// The name Claude Code shows for a file: the last part of its path.
+pub(crate) fn display_file_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// Claude Code's summary under an Edit, from the line counts of its old and new
+/// text.
+pub(crate) fn edit_summary(old_text: &str, new_text: &str) -> String {
+    let old_line_count = old_text.split('\n').count();
+    let new_line_count = new_text.split('\n').count();
+    let plural = |count: usize| if count == 1 { "" } else { "s" };
+    if new_line_count > old_line_count {
+        let added = new_line_count - old_line_count;
+        format!("Added {added} line{}", plural(added))
+    } else if old_line_count > new_line_count {
+        let removed = old_line_count - new_line_count;
+        format!("Removed {removed} line{}", plural(removed))
+    } else {
+        "Modified".to_string()
+    }
+}
+
+/// Claude Code's summary under a Write: the line count of the new file.
+pub(crate) fn write_summary(content: Option<&str>) -> String {
+    match content {
+        Some(content) => {
+            let line_count = content.split('\n').count();
+            format!(
+                "{line_count} line{}",
+                if line_count == 1 { "" } else { "s" }
+            )
+        }
+        None => "Write succeeded".to_string(),
+    }
+}
+
+/// The range after a Read's file name, as Claude Code words it from the tool input.
+pub(crate) fn read_range_suffix(raw_input: Option<&serde_json::Value>) -> Option<SharedString> {
+    let number = |key: &str| raw_input?.get(key)?.as_u64();
+    match (number("offset"), number("limit")) {
+        (Some(offset), Some(limit)) => {
+            Some(format!("(lines {}-{})", offset + 1, offset + limit).into())
+        }
+        (Some(offset), None) => Some(format!("(from line {})", offset + 1).into()),
+        _ => None,
+    }
 }
 
 /// The value of one entry of a select config option.
@@ -2985,6 +3139,43 @@ mod tests {
         assert!(is_allow_option(&bash_options[1]));
         assert!(!is_allow_option(&bash_options[2]));
         assert_eq!(reject_option_index(&bash_options[..2]), None);
+    }
+
+    #[test]
+    fn test_file_tool_summaries() {
+        assert_eq!(edit_summary("a", "a\nb"), "Added 1 line");
+        assert_eq!(edit_summary("a", "a\nb\nc"), "Added 2 lines");
+        assert_eq!(edit_summary("a\nb\nc", "a"), "Removed 2 lines");
+        assert_eq!(edit_summary("a\nb", "c\nd"), "Modified");
+        assert_eq!(write_summary(Some("one\ntwo\n")), "3 lines");
+        assert_eq!(write_summary(Some("one")), "1 line");
+        assert_eq!(write_summary(None), "Write succeeded");
+        assert_eq!(display_file_name("/project/src/main.rs"), "main.rs");
+        assert_eq!(display_file_name("main.rs"), "main.rs");
+        assert_eq!(
+            read_range_suffix(Some(&serde_json::json!({ "offset": 0, "limit": 20 }))).as_deref(),
+            Some("(lines 1-20)")
+        );
+        assert_eq!(
+            read_range_suffix(Some(&serde_json::json!({ "offset": 9 }))).as_deref(),
+            Some("(from line 10)")
+        );
+        assert_eq!(
+            read_range_suffix(Some(&serde_json::json!({ "limit": 5 }))),
+            None
+        );
+        assert_eq!(read_range_suffix(None), None);
+    }
+
+    #[test]
+    fn test_diff_layout_for_width() {
+        let layout = |width: f32, previous| DiffLayout::for_width(px(width), previous);
+        assert_eq!(layout(400., DiffLayout::Unknown), DiffLayout::Hidden);
+        assert_eq!(layout(700., DiffLayout::Unknown), DiffLayout::Inline);
+        assert_eq!(layout(890., DiffLayout::Inline), DiffLayout::Inline);
+        assert_eq!(layout(901., DiffLayout::Inline), DiffLayout::SideBySide);
+        assert_eq!(layout(890., DiffLayout::SideBySide), DiffLayout::SideBySide);
+        assert_eq!(layout(870., DiffLayout::SideBySide), DiffLayout::Inline);
     }
 
     #[test]

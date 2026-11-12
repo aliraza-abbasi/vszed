@@ -3,6 +3,8 @@
 // `ThreadView`'s private state and render helpers without widening their
 // visibility upstream.
 
+#[path = "edit_diff.rs"]
+mod claude_code_edit_diff;
 #[path = "permission_card.rs"]
 mod claude_code_permission_card;
 #[path = "prompt_box.rs"]
@@ -10,12 +12,14 @@ mod claude_code_prompt_box;
 
 use super::*;
 use crate::ui_styles::claude_code::{
-    AgentSummary, ClaudeCodeSpinnerElement, StatusDot, StepStatus, TIMELINE_GUTTER, TimelineDot,
-    ToolOutputTab, ToolRow, agent_summaries, attachment_name, edit_line_stats, format_day,
-    format_timestamp, is_long_tool_text, remove_output_tab, sent_message_text, set_output_tab,
-    set_user_message_overflows, summarize_tool_call, thought_has_summary, thought_label,
-    thread_activity, timeline_row, toggle_thoughts_expanded, toggle_user_message_expanded,
-    tool_output_text, tool_output_title, transcript_markdown_style, ui_font_text_style,
+    AgentSummary, ClaudeCodeSpinnerElement, FileLink, StatusDot, StepStatus, TIMELINE_GUTTER,
+    TimelineDot, ToolOutputTab, ToolRow, agent_summaries, attachment_name, display_file_name,
+    edit_line_stats, edit_summary, file_tool_input, format_day, format_timestamp,
+    is_long_tool_text, read_range_suffix, remove_output_tab, reported_claude_code_tool,
+    sent_message_text, set_output_tab, set_user_message_overflows, summarize_tool_call,
+    thought_has_summary, thought_label, thread_activity, timeline_row, toggle_thoughts_expanded,
+    toggle_user_message_expanded, tool_output_text, tool_output_title, transcript_markdown_style,
+    ui_font_text_style, write_summary,
 };
 use chrono::Local;
 use claude_code_permission_card::claude_code_card_handles;
@@ -147,6 +151,15 @@ impl ThreadView {
             }
             AgentThreadEntry::ToolCall(tool_call) => {
                 if Self::claude_code_tool_call_is_hidden(tool_call, cx) {
+                    return Empty.into_any_element();
+                }
+                // Merged into the row of the read before it.
+                let entries = self.thread.read(cx).entries();
+                if is_coalescable_read(Some(entry))
+                    && entry_ix
+                        .checked_sub(1)
+                        .is_some_and(|previous| is_coalescable_read(entries.get(previous)))
+                {
                     return Empty.into_any_element();
                 }
                 // Claude Code's Agent and Task calls report the `think` kind.
@@ -1037,10 +1050,21 @@ impl ThreadView {
             self.claude_code_project_relative_path(&description, cx)
                 .unwrap_or(description)
         });
-        let mut row = ToolRow::new(("claude-code-tool", entry_ix), summary.name, step_status)
-            .description(description);
+        let file_tool_row = self.render_claude_code_file_tool_row(
+            entry_ix,
+            tool_call,
+            step_status,
+            has_failed,
+            window,
+            cx,
+        );
+        let is_file_tool_row = file_tool_row.is_some();
+        let mut row = file_tool_row.unwrap_or_else(|| {
+            ToolRow::new(("claude-code-tool", entry_ix), summary.name, step_status)
+                .description(description)
+        });
 
-        if is_edit {
+        if is_edit && !is_file_tool_row {
             if let Some((lines_added, lines_removed)) = edit_line_stats(tool_call) {
                 row = row.header_suffix(
                     DiffStat::new(
@@ -1092,7 +1116,7 @@ impl ThreadView {
                     );
                 }
             }
-        } else {
+        } else if !is_file_tool_row {
             let output = tool_output_text(tool_call, summary.description.as_deref(), cx);
             let output_is_long = output.as_deref().is_some_and(is_long_tool_text);
             row = row
@@ -1173,6 +1197,129 @@ impl ThreadView {
             .py_1()
             .text_ui(cx)
             .child(row)
+    }
+
+    /// Claude Code's own rows for its file tools: "Read" with the file names of a
+    /// run of reads and no output, "Edit" with the file, a summary and the diff of
+    /// its old and new text, "Write" with the file, its line count and content, and
+    /// "<skill> skill" with no output.
+    fn render_claude_code_file_tool_row(
+        &self,
+        entry_ix: usize,
+        tool_call: &ToolCall,
+        step_status: StepStatus,
+        has_failed: bool,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> Option<ToolRow> {
+        let tool = reported_claude_code_tool(tool_call)?;
+        let id = ("claude-code-tool", entry_ix);
+        let file_link = |entry_ix: usize, path: &str, suffix: Option<SharedString>| {
+            FileLink::new(
+                display_file_name(path).to_string(),
+                suffix,
+                cx.listener(move |this, _event: &ClickEvent, window, cx| {
+                    this.open_tool_call_location(entry_ix, 0, window, cx);
+                }),
+            )
+        };
+        match tool.as_ref() {
+            "Read" => {
+                let entries = self.thread.read(cx).entries();
+                let mut reads = vec![(entry_ix, tool_call)];
+                if is_coalescable_read(entries.get(entry_ix)) {
+                    reads.extend((entry_ix + 1..entries.len()).map_while(|next| {
+                        match entries.get(next) {
+                            Some(AgentThreadEntry::ToolCall(next_call))
+                                if is_coalescable_read(entries.get(next)) =>
+                            {
+                                Some((next, next_call))
+                            }
+                            _ => None,
+                        }
+                    }));
+                }
+                let links = reads
+                    .into_iter()
+                    .filter_map(|(read_ix, read)| {
+                        let path = read.raw_input.as_ref()?.get("file_path")?.as_str()?;
+                        Some(file_link(
+                            read_ix,
+                            path,
+                            read_range_suffix(read.raw_input.as_ref()),
+                        ))
+                    })
+                    .collect();
+                Some(ToolRow::new(id, tool, step_status).file_links(links))
+            }
+            "Edit" | "Write" => {
+                let input = file_tool_input(tool_call, &tool);
+                let links = input
+                    .file_path
+                    .map(|path| file_link(entry_ix, path, None))
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                let has_links = !links.is_empty();
+                let mut row = ToolRow::new(id, tool.clone(), step_status)
+                    .file_links(links)
+                    .description((!has_links).then(|| "file".into()));
+                if tool.as_ref() == "Write" {
+                    let summary = if has_failed {
+                        "Write failed".to_string()
+                    } else {
+                        write_summary(input.new_text)
+                    };
+                    let content = input
+                        .new_text
+                        .map(|content| SharedString::from(content.to_string()));
+                    let content_is_long = content.as_deref().is_some_and(is_long_tool_text);
+                    row = row
+                        .secondary_line(Some(summary.into()))
+                        .output(content)
+                        .unlabeled_output();
+                    if content_is_long {
+                        let tool_call_id = tool_call.id.clone();
+                        row = row.on_open_output(cx.listener(
+                            move |this, _event: &ClickEvent, window, cx| {
+                                this.open_claude_code_tool_output(tool_call_id.clone(), window, cx);
+                            },
+                        ));
+                    }
+                    return Some(row);
+                }
+                // The new text is the last of the input to arrive; without it the
+                // diff would read as a deletion.
+                let Some(new_text) = input.new_text else {
+                    return Some(row);
+                };
+                let summary = if has_failed {
+                    "Edit failed".to_string()
+                } else {
+                    edit_summary(input.old_text, new_text)
+                };
+                Some(row.secondary_line(Some(summary.into())).body(
+                    self.render_claude_code_edit_diff(
+                        &tool_call.id,
+                        input.file_path,
+                        input.old_text,
+                        new_text,
+                        window,
+                        cx,
+                    ),
+                ))
+            }
+            "Skill" => {
+                let skill = tool_call
+                    .raw_input
+                    .as_ref()?
+                    .get("skill")?
+                    .as_str()?
+                    .trim_start_matches('/')
+                    .to_string();
+                Some(ToolRow::new(id, skill, step_status).description(Some("skill".into())))
+            }
+            _ => None,
+        }
     }
 
     /// Claude Code opens a long tool output in a read-only editor tab, which
@@ -1346,6 +1493,12 @@ impl ThreadView {
     }
 
     fn full_tool_output(tool_call: &ToolCall, cx: &App) -> String {
+        if reported_claude_code_tool(tool_call).as_deref() == Some("Write") {
+            return file_tool_input(tool_call, "Write")
+                .new_text
+                .unwrap_or_default()
+                .to_string();
+        }
         let label = tool_call.label.read(cx).source().to_string();
         let summary = summarize_tool_call(tool_call, &label);
         tool_output_text(tool_call, summary.description.as_deref(), cx)
@@ -1480,6 +1633,16 @@ impl ThreadView {
             ))
             .into_any_element()
     }
+}
+
+/// Claude Code merges consecutive reads that succeeded into one "Read a, b" row.
+fn is_coalescable_read(entry: Option<&AgentThreadEntry>) -> bool {
+    matches!(
+        entry,
+        Some(AgentThreadEntry::ToolCall(tool_call))
+            if matches!(tool_call.status(), ToolCallStatus::Completed)
+                && reported_claude_code_tool(tool_call).as_deref() == Some("Read")
+    )
 }
 
 #[cfg(test)]
@@ -1756,6 +1919,85 @@ mod tests {
         );
         click("claude-code-thought-1-4", cx);
         assert_eq!(summaries_shown(cx), [false; 3]);
+    }
+
+    fn claude_tool_call(
+        id: &str,
+        tool: &str,
+        kind: acp_v1::ToolKind,
+        raw_input: serde_json::Value,
+    ) -> acp_v1::ToolCall {
+        acp_v1::ToolCall::new(id.to_string(), format!("{tool} file"))
+            .kind(kind)
+            .status(acp_v1::ToolCallStatus::Completed)
+            .raw_input(raw_input)
+            .content(vec!["```\n1\tcontent\n```".into()])
+            .meta(acp_v2::Meta::from_iter([(
+                "claudeCode".into(),
+                json!({ "toolName": tool }),
+            )]))
+    }
+
+    #[gpui::test]
+    async fn test_claude_code_file_tool_rows(cx: &mut TestAppContext) {
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![
+            acp_v1::SessionUpdate::ToolCall(claude_tool_call(
+                "read-1",
+                "Read",
+                acp_v1::ToolKind::Read,
+                json!({ "file_path": "/project/src/main.rs" }),
+            )),
+            acp_v1::SessionUpdate::ToolCall(claude_tool_call(
+                "read-2",
+                "Read",
+                acp_v1::ToolKind::Read,
+                json!({ "file_path": "/project/src/lib.rs", "offset": 10, "limit": 5 }),
+            )),
+            acp_v1::SessionUpdate::ToolCall(claude_tool_call(
+                "edit-1",
+                "Edit",
+                acp_v1::ToolKind::Edit,
+                json!({
+                    "file_path": "/project/src/lib.rs",
+                    "old_string": "fn a() {}",
+                    "new_string": "fn a() {}\nfn b() {}",
+                }),
+            )),
+        ]);
+        let (thread_view, cx) = setup_thread_view(connection, cx).await;
+        set_ui_style("claude_code", cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Read and edit", cx))
+            .await
+            .expect("prompt should succeed");
+        cx.run_until_parked();
+
+        assert!(cx.debug_bounds("claude-code-tool-1").is_some());
+        assert!(
+            cx.debug_bounds("claude-code-tool-2").is_none(),
+            "consecutive reads share the first read's row"
+        );
+        assert!(cx.debug_bounds("claude-code-tool-1-output").is_none());
+        assert!(cx.debug_bounds("claude-code-tool-3").is_some());
+        assert!(
+            cx.debug_bounds("claude-code-tool-3-output").is_none(),
+            "an edit shows its diff, not its output"
+        );
+
+        let layout = thread_view.read_with(cx, |_, cx| {
+            thread_activity(thread_view.entity_id(), cx)
+                .expect("thread activity is tracked")
+                .diff_layout()
+                .get()
+        });
+        assert_ne!(layout, crate::ui_styles::claude_code::DiffLayout::Unknown);
+        let diff_shown = cx.debug_bounds("claude-code-diff-edit-1").is_some();
+        assert_eq!(
+            diff_shown,
+            layout != crate::ui_styles::claude_code::DiffLayout::Hidden
+        );
     }
 
     #[gpui::test]
