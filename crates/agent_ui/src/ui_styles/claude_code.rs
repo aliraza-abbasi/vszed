@@ -1,25 +1,32 @@
+mod agent_map;
+mod model_picker;
 pub(crate) mod sessions_panel;
 mod tool_row;
 pub(crate) mod usage;
 
+pub(crate) use agent_map::open_agent_map;
+pub(crate) use model_picker::{ClaudeCodeModelPicker, ConfigOptionsHandle};
 pub(crate) use tool_row::ToolRow;
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::ops::Range;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use acp_thread::{
     AcpThread, AcpThreadEvent, AgentThreadEntry, AssistantMessageChunk, MentionUri,
-    PermissionRequestId, ToolCall, ToolCallContent, ToolCallStatus,
+    PermissionRequestId, ThreadStatus, ToolCall, ToolCallContent, ToolCallStatus,
 };
 use agent_client_protocol::v2::schema as acp_v2;
+use agent_servers::{AgentExtNotification, AgentExtNotifications};
 use chrono::{DateTime, Datelike as _, Local};
 use collections::{HashMap, HashSet};
 use editor::Editor;
 use gpui::{
-    Animation, AnimationExt as _, App, Context, ElementId, Entity, EntityId, FocusHandle,
+    Animation, AnimationExt as _, AnyView, App, Context, ElementId, Entity, EntityId, FocusHandle,
     Focusable as _, Global, Hsla, Pixels, Subscription, TextStyle, WeakEntity, pulsating_between,
-    px,
+    px, rgba,
 };
 use language::Buffer;
 use markdown::{MarkdownFont, MarkdownStyle};
@@ -27,6 +34,7 @@ use settings::{AgentUiStyle, Settings as _, SettingsStore};
 use theme_settings::ThemeSettings;
 use ui::prelude::*;
 use util::{ResultExt as _, paths::PathStyle};
+use workspace::{StatusItemView, Workspace, item::ItemHandle};
 
 use super::AgentUiStyleSettings;
 use crate::conversation_view::ThreadView;
@@ -42,7 +50,7 @@ const CLAUDE_CODE_TOOL_NAME_KEY: &str = "toolName";
 /// (`src/permissions/options/shared.ts`).
 const EXIT_PLAN_OPTION_PREFIX: &str = "exit-plan-";
 /// claude-agent-acp's config option id for Ultracode (`src/session-config-ids.ts`).
-const ULTRACODE_CONFIG_ID: &str = "ultracode";
+pub(crate) const ULTRACODE_CONFIG_ID: &str = "ultracode";
 /// The built-in tools claude-agent-acp reports by name (`src/tool-calls/reporters`).
 const CLAUDE_CODE_TOOL_NAMES: &[&str] = &[
     "Agent",
@@ -227,6 +235,18 @@ pub(crate) struct ThreadActivity {
     /// The highlighted option of the permission card, for the request it was
     /// chosen on.
     permission_selection: Option<(PermissionRequestId, usize)>,
+    /// claude-agent-acp's tasks from raw SDK messages (ACP v1), in start order.
+    sdk_tasks: Vec<SdkTask>,
+    /// When each ACP v2 subagent session was announced and last showed activity.
+    subagent_times: HashMap<acp_v2::SessionId, SubagentTimes>,
+    subagent_subscriptions: Vec<Subscription>,
+    prompt_cache: PromptCache,
+    /// The height of the floating prompt box, which the transcript keeps clear below its
+    /// last entry.
+    floating_prompt_height: Rc<Cell<Pixels>>,
+    /// The model picker, while it is open above the prompt box.
+    model_picker: Option<AnyView>,
+    model_picker_dismissed_at: Option<Instant>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -304,6 +324,22 @@ impl ThreadActivity {
         }
     }
 
+    pub(crate) fn floating_prompt_height(&self) -> Rc<Cell<Pixels>> {
+        self.floating_prompt_height.clone()
+    }
+
+    pub(crate) fn model_picker(&self) -> Option<&AnyView> {
+        self.model_picker.as_ref()
+    }
+
+    pub(crate) fn model_picker_dismissed_at(&self) -> Option<Instant> {
+        self.model_picker_dismissed_at
+    }
+
+    pub(crate) fn cache_clock(&self, now: Instant) -> CacheClock {
+        self.prompt_cache.clock(now)
+    }
+
     fn record_event(
         &mut self,
         thread: &AcpThread,
@@ -316,8 +352,18 @@ impl ThreadActivity {
                 let Some(entry_ix) = thread.entries().len().checked_sub(1) else {
                     return;
                 };
-                if let Some(AgentThreadEntry::UserMessage(_)) = thread.entries().get(entry_ix) {
-                    self.message_times.insert((entry_ix, 0), wall_clock);
+                match thread.entries().get(entry_ix) {
+                    Some(AgentThreadEntry::UserMessage(_)) => {
+                        self.message_times.insert((entry_ix, 0), wall_clock);
+                    }
+                    // Each model request starts a new response entry. Entries replayed
+                    // when a session loads are not requests made now.
+                    Some(AgentThreadEntry::AssistantMessage(_) | AgentThreadEntry::ToolCall(_))
+                        if thread.status() == ThreadStatus::Generating =>
+                    {
+                        self.prompt_cache.record_request(now);
+                    }
+                    _ => {}
                 }
                 self.record_assistant_text(thread, entry_ix, wall_clock);
                 self.record_streaming_thought(thread, entry_ix, now);
@@ -328,11 +374,28 @@ impl ThreadActivity {
                 self.record_assistant_text(thread, *entry_ix, wall_clock);
                 self.record_streaming_thought(thread, *entry_ix, now);
                 self.finish_open_thought(thread, now);
+                if let Some(AgentThreadEntry::ContextCompaction(compaction)) =
+                    thread.entries().get(*entry_ix)
+                    && matches!(
+                        compaction.status,
+                        acp_thread::ContextCompactionStatus::Completed
+                    )
+                {
+                    self.prompt_cache.record_compaction(now);
+                }
                 self.last_activity_at = Some(now);
             }
             AcpThreadEvent::EntriesRemoved(range) => self.remove_entries(range.clone()),
             AcpThreadEvent::Stopped { .. } | AcpThreadEvent::Error => {
                 self.open_thought = None;
+            }
+            AcpThreadEvent::SubagentSpawned(session_id) => {
+                self.subagent_times
+                    .entry(session_id.clone())
+                    .or_insert(SubagentTimes {
+                        started_at: now,
+                        last_activity_at: now,
+                    });
             }
             _ => {}
         }
@@ -375,6 +438,12 @@ impl ThreadActivity {
             timing.last_updated_at = now;
         }
         self.open_thought = None;
+    }
+
+    fn record_subagent_activity(&mut self, session_id: &acp_v2::SessionId, now: Instant) {
+        if let Some(times) = self.subagent_times.get_mut(session_id) {
+            times.last_activity_at = now;
+        }
     }
 
     /// A thought is timed from the previous activity in the thread (the model
@@ -471,7 +540,10 @@ pub(crate) fn thread_activity(thread_view_id: EntityId, cx: &App) -> Option<&Thr
         .get(&thread_view_id)
 }
 
-fn thread_activity_mut(thread_view_id: EntityId, cx: &mut App) -> Option<&mut ThreadActivity> {
+pub(crate) fn thread_activity_mut(
+    thread_view_id: EntityId,
+    cx: &mut App,
+) -> Option<&mut ThreadActivity> {
     cx.default_global::<ClaudeCodeActivity>()
         .threads
         .get_mut(&thread_view_id)
@@ -560,6 +632,7 @@ pub(crate) fn init(cx: &mut App) {
     .detach();
     sessions_panel::init(cx);
     usage::init(cx);
+    init_status_item(cx);
 }
 
 /// Records timeline activity for every thread view, whichever style is active,
@@ -591,6 +664,17 @@ fn track_thread_view(
                 thread_activity.record_event(thread.read(cx), event, now, wall_clock);
             }
         });
+        if let AcpThreadEvent::SubagentSpawned(session_id) = event
+            && let Some(subagent) = thread.read(cx).subagent(session_id).cloned()
+        {
+            track_subagent(thread_view_id, session_id.clone(), &subagent, cx);
+        }
+    });
+
+    let ext_notifications = AgentExtNotifications::global(cx);
+    let thread = thread_view.thread.downgrade();
+    let ext_subscription = cx.subscribe(&ext_notifications, move |_, _, notification, cx| {
+        record_ext_notification(thread_view_id, &thread, notification, cx);
     });
 
     let mut ui_style = AgentUiStyleSettings::get_global(cx).ui_style;
@@ -603,6 +687,9 @@ fn track_thread_view(
         }
         ui_style = new_ui_style;
         thread_view.list_state.remeasure();
+        if new_ui_style != AgentUiStyle::ClaudeCode {
+            thread_view.sync_editor_mode(cx);
+        }
         if new_ui_style != AgentUiStyle::ClaudeCode
             && let Some(window) = window
         {
@@ -637,9 +724,84 @@ fn track_thread_view(
 
     thread_view._subscriptions.extend([
         thread_subscription,
+        ext_subscription,
         settings_subscription,
         release_subscription,
     ]);
+}
+
+/// Times an ACP v2 subagent from its announcement to its last activity, for the
+/// agent map.
+fn track_subagent(
+    thread_view_id: EntityId,
+    session_id: acp_v2::SessionId,
+    subagent: &Entity<AcpThread>,
+    cx: &mut App,
+) {
+    let subscription = cx.subscribe(subagent, move |subagent, event, cx| {
+        let now = Instant::now();
+        match event {
+            AcpThreadEvent::NewEntry
+            | AcpThreadEvent::EntryUpdated(_)
+            | AcpThreadEvent::Stopped { .. } => {
+                if let Some(activity) = thread_activity_mut(thread_view_id, cx) {
+                    activity.record_subagent_activity(&session_id, now);
+                }
+            }
+            AcpThreadEvent::SubagentSpawned(nested_session_id) => {
+                if let Some(activity) = thread_activity_mut(thread_view_id, cx) {
+                    activity
+                        .subagent_times
+                        .entry(nested_session_id.clone())
+                        .or_insert(SubagentTimes {
+                            started_at: now,
+                            last_activity_at: now,
+                        });
+                }
+                if let Some(nested) = subagent.read(cx).subagent(nested_session_id).cloned() {
+                    track_subagent(thread_view_id, nested_session_id.clone(), &nested, cx);
+                }
+            }
+            _ => {}
+        }
+    });
+    if let Some(activity) = thread_activity_mut(thread_view_id, cx) {
+        activity.subagent_subscriptions.push(subscription);
+    }
+}
+
+fn record_ext_notification(
+    thread_view_id: EntityId,
+    thread: &WeakEntity<AcpThread>,
+    notification: &AgentExtNotification,
+    cx: &mut App,
+) {
+    if notification.method.as_ref() != CLAUDE_SDK_MESSAGE_METHOD {
+        return;
+    }
+    let Ok(session_id) = thread.read_with(cx, |thread, _| thread.session_id().clone()) else {
+        return;
+    };
+    if notification.session_id.as_ref() != Some(&session_id) {
+        return;
+    }
+    let Some(message) = notification.params.get("message") else {
+        return;
+    };
+    let Some(activity) = thread_activity_mut(thread_view_id, cx) else {
+        return;
+    };
+    apply_sdk_message(activity, message, Instant::now());
+    cx.notify(thread_view_id);
+}
+
+pub(crate) fn set_model_picker(thread_view_id: EntityId, picker: Option<AnyView>, cx: &mut App) {
+    if let Some(activity) = thread_activity_mut(thread_view_id, cx) {
+        if picker.is_none() && activity.model_picker.is_some() {
+            activity.model_picker_dismissed_at = Some(Instant::now());
+        }
+        activity.model_picker = picker;
+    }
 }
 
 fn restore_zed_placeholder(
@@ -1214,9 +1376,10 @@ pub(crate) fn effort_display_name(entry: &ConfigOptionEntry) -> SharedString {
 }
 
 /// The model name the chip shows. claude-agent-acp lists the account default
-/// as "Default (recommended)" and puts the model it resolves to in the
-/// description, which is what Claude Code shows.
-fn model_display_name(entry: &ConfigOptionEntry) -> SharedString {
+/// as "Default (recommended)" and puts the name of the model it resolves to in
+/// the description ("Opus"); Claude Code shows that model with its version, as
+/// the matching family row names it ("Opus 5.5").
+fn model_display_name(entry: &ConfigOptionEntry, entries: &[ConfigOptionEntry]) -> SharedString {
     if entry.value.0.as_ref() == "default"
         && let Some(description) = entry
             .description
@@ -1224,7 +1387,10 @@ fn model_display_name(entry: &ConfigOptionEntry) -> SharedString {
             .map(str::trim)
             .filter(|description| !description.is_empty())
     {
-        return description.to_string().into();
+        return default_model_row(description, entries)
+            .map(|row| row.name.clone())
+            .unwrap_or_else(|| description.to_string())
+            .into();
     }
     entry
         .name
@@ -1234,11 +1400,85 @@ fn model_display_name(entry: &ConfigOptionEntry) -> SharedString {
         .into()
 }
 
-/// The label of the model chip: "Opus 5.5 Extra high · Ultracode".
-pub(crate) fn model_chip_label(options: &[acp_v2::SessionConfigOption]) -> Option<SharedString> {
-    let model = first_select_option(options, &acp_v2::SessionConfigOptionCategory::Model)
+/// The row the `default` model resolves to, from the default row's description: the
+/// model's family name ("Opus" names "Opus 5.5") or its full name.
+fn default_model_row<'a>(
+    description: &str,
+    entries: &'a [ConfigOptionEntry],
+) -> Option<&'a ConfigOptionEntry> {
+    let rows = || {
+        entries
+            .iter()
+            .filter(|entry| entry.value.0.as_ref() != "default")
+    };
+    rows()
+        .find(|entry| entry.name == description)
+        .or_else(|| rows().find(|entry| strip_model_version(&entry.name) == description))
+}
+
+/// "Opus 5.5" without its version: "Opus".
+fn strip_model_version(name: &str) -> &str {
+    match name.rsplit_once(' ') {
+        Some((family, version))
+            if !version.is_empty()
+                && version
+                    .chars()
+                    .all(|character| character.is_ascii_digit() || character == '.') =>
+        {
+            family
+        }
+        _ => name,
+    }
+}
+
+/// The parts of the model pill: "Opus 5.5", "Extra high" (muted) and whether
+/// Ultracode is on.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ModelChipParts {
+    pub model: Option<SharedString>,
+    pub effort: Option<SharedString>,
+    pub ultracode: bool,
+}
+
+pub(crate) fn model_chip_parts(options: &[acp_v2::SessionConfigOption]) -> Option<ModelChipParts> {
+    let model_option = first_select_option(options, &acp_v2::SessionConfigOptionCategory::Model);
+    let model_entries = match model_option.map(|option| &option.kind) {
+        Some(acp_v2::SessionConfigKind::Select(select)) => select_entries(select),
+        _ => Vec::new(),
+    };
+    let model = model_option
         .and_then(current_select_entry)
-        .map(|entry| model_display_name(&entry));
+        .map(|entry| model_display_name(&entry, &model_entries));
+    let effort = first_select_option(options, &acp_v2::SessionConfigOptionCategory::ThoughtLevel)
+        .and_then(current_select_entry)
+        .filter(|entry| entry.value.0.as_ref() != "default")
+        .map(|entry| effort_display_name(&entry));
+    let ultracode = options
+        .iter()
+        .find(|option| option.config_id.0.as_ref() == ULTRACODE_CONFIG_ID)
+        .and_then(toggle_option_state)
+        .unwrap_or(false);
+    if model.is_none() && effort.is_none() {
+        return None;
+    }
+    Some(ModelChipParts {
+        model,
+        effort,
+        ultracode,
+    })
+}
+
+/// The label of the model chip: "Opus 5.5 Extra high · Ultracode".
+#[cfg(test)]
+pub(crate) fn model_chip_label(options: &[acp_v2::SessionConfigOption]) -> Option<SharedString> {
+    let model_option = first_select_option(options, &acp_v2::SessionConfigOptionCategory::Model);
+    let model_entries = match model_option.map(|option| &option.kind) {
+        Some(acp_v2::SessionConfigKind::Select(select)) => select_entries(select),
+        _ => Vec::new(),
+    };
+    let model = model_option
+        .and_then(current_select_entry)
+        .map(|entry| model_display_name(&entry, &model_entries));
     let effort = first_select_option(options, &acp_v2::SessionConfigOptionCategory::ThoughtLevel)
         .and_then(current_select_entry)
         .filter(|entry| entry.value.0.as_ref() != "default")
@@ -1283,7 +1523,7 @@ pub(crate) fn mode_icon(mode_id: &str) -> IconName {
         "default" => IconName::UserCheck,
         "acceptEdits" => IconName::Pencil,
         "plan" => IconName::ListTodo,
-        "auto" => IconName::Sparkle,
+        "auto" => IconName::BoltOutlined,
         "bypassPermissions" => IconName::Warning,
         _ => IconName::Circle,
     }
@@ -1291,12 +1531,18 @@ pub(crate) fn mode_icon(mode_id: &str) -> IconName {
 
 pub(crate) const QUEUE_PLACEHOLDER: &str = "Queue another message…";
 
-pub(crate) fn idle_placeholder(agent_display_name: &str) -> String {
-    format!("Message {agent_display_name}…")
+/// Claude Code's idle placeholder names the shortcut that moves focus between the
+/// editor and Claude: "⌘ Esc" on macOS and "ctrl esc" elsewhere.
+pub(crate) fn idle_placeholder() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "⌘ Esc to focus or unfocus Claude"
+    } else {
+        "ctrl esc to focus or unfocus Claude"
+    }
 }
 
 pub(crate) fn is_claude_code_placeholder(text: &str) -> bool {
-    text == QUEUE_PLACEHOLDER || (text.starts_with("Message ") && text.ends_with('…'))
+    text == QUEUE_PLACEHOLDER || text.ends_with(" to focus or unfocus Claude")
 }
 
 pub(crate) fn remember_zed_placeholder(
@@ -1310,6 +1556,1124 @@ pub(crate) fn remember_zed_placeholder(
         .get_mut(&thread_view_id)
     {
         activity.zed_placeholder = Some(placeholder);
+    }
+}
+
+// --- Model picker ---------------------------------------------------------------------
+
+/// claude-agent-acp's model family aliases (`MODEL_FAMILY_ALIASES`,
+/// `src/session-model.ts`). An alias always runs its family's newest model.
+const MODEL_FAMILY_ALIASES: [&str; 4] = ["opus", "sonnet", "haiku", "fable"];
+
+/// One row of the model picker.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ModelMenuRow {
+    pub value: acp_v2::SessionConfigValueId,
+    pub title: SharedString,
+    pub subtitle: Option<SharedString>,
+    pub is_current: bool,
+}
+
+/// The family of a model option value, and the version of a pinned one: `opus` and
+/// `opus[1m]` are the Opus alias, `claude-fable-5-1[1m]` is Fable 5.1 and
+/// `claude-haiku-4-5-20251001` is Haiku 4.5. `None` for other values, such as
+/// `default` or a custom model.
+fn model_family_version(value: &str) -> Option<(&'static str, Option<(u32, u32)>)> {
+    let value = value.split('[').next().unwrap_or(value);
+    if let Some(alias) = MODEL_FAMILY_ALIASES.iter().find(|alias| **alias == value) {
+        return Some((alias, None));
+    }
+    let mut parts = value.strip_prefix("claude-")?.split('-');
+    let family = parts.next()?;
+    let family = MODEL_FAMILY_ALIASES
+        .iter()
+        .find(|alias| **alias == family)?;
+    let major = parts.next()?.parse::<u32>().ok()?;
+    let minor = parts
+        .next()
+        .filter(|part| part.len() <= 2)
+        .and_then(|part| part.parse::<u32>().ok())
+        .unwrap_or(0);
+    Some((family, Some((major, minor))))
+}
+
+/// The rows of the model picker. Claude Code lists Default and one row per model family
+/// ("Opus", "Fable", "Sonnet", "Haiku"), titled with the family and described as
+/// "<model> · <what it is for>". claude-agent-acp can also list pinned older versions
+/// (`claude-opus-4-8`) next to the family aliases; those are left out, and a family
+/// without an alias is shown by its newest version. The current model always stays, so
+/// the check has a row.
+pub(crate) fn model_menu_rows(select: &acp_v2::SessionConfigSelect) -> Vec<ModelMenuRow> {
+    let entries = select_entries(select);
+    let mut families_with_alias = Vec::new();
+    let mut newest_versions: HashMap<&'static str, (u32, u32)> = HashMap::default();
+    for entry in &entries {
+        match model_family_version(&entry.value.0) {
+            Some((family, None)) => families_with_alias.push(family),
+            Some((family, Some(version))) => {
+                let newest = newest_versions.entry(family).or_insert(version);
+                *newest = (*newest).max(version);
+            }
+            None => {}
+        }
+    }
+
+    let mut shown_families = Vec::new();
+    let mut rows = Vec::new();
+    for entry in &entries {
+        let is_current = entry.value == select.current_value;
+        let is_family_row = match model_family_version(&entry.value.0) {
+            Some((family, version)) => {
+                let represents_family = match version {
+                    None => true,
+                    Some(version) => {
+                        !families_with_alias.contains(&family)
+                            && newest_versions.get(family) == Some(&version)
+                    }
+                };
+                let shown = represents_family && !shown_families.contains(&family);
+                if shown {
+                    shown_families.push(family);
+                } else if !is_current {
+                    continue;
+                }
+                shown
+            }
+            None => false,
+        };
+        let title = if is_family_row {
+            strip_model_version(&entry.name).to_string()
+        } else {
+            entry.name.clone()
+        };
+        let subtitle = if entry.value.0.as_ref() == "default" {
+            entry.description.as_deref().map(|description| {
+                default_model_row(description, &entries)
+                    .and_then(|row| row.description.clone())
+                    .unwrap_or_else(|| description.to_string())
+            })
+        } else {
+            entry.description.clone()
+        };
+        rows.push(ModelMenuRow {
+            value: entry.value.clone(),
+            title: title.into(),
+            subtitle: subtitle
+                .filter(|subtitle| !subtitle.trim().is_empty())
+                .map(SharedString::from),
+            is_current,
+        });
+    }
+    rows
+}
+
+/// The Effort row: the model's levels without `default`, the current one, and its name
+/// for the "(Extra high)" suffix.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct EffortSlider {
+    pub levels: Vec<ConfigOptionEntry>,
+    pub current: Option<usize>,
+    pub label: SharedString,
+}
+
+pub(crate) fn effort_slider(option: &acp_v2::SessionConfigOption) -> Option<EffortSlider> {
+    let acp_v2::SessionConfigKind::Select(select) = &option.kind else {
+        return None;
+    };
+    let levels = select_entries(select)
+        .into_iter()
+        .filter(|entry| entry.value.0.as_ref() != "default")
+        .collect::<Vec<_>>();
+    if levels.is_empty() {
+        return None;
+    }
+    let current = levels
+        .iter()
+        .position(|level| level.value == select.current_value);
+    // Claude Code calls an effort that was never chosen "Auto".
+    let label = current
+        .and_then(|current| levels.get(current))
+        .map(effort_display_name)
+        .unwrap_or_else(|| "Auto".into());
+    Some(EffortSlider {
+        levels,
+        current,
+        label,
+    })
+}
+
+// --- Colors ---------------------------------------------------------------------------
+
+/// The extension's `--app-claude-orange`: the prompt box focus ring in manual mode.
+const CLAUDE_ORANGE: u32 = 0xd97757ff;
+/// `--app-claude-clay-button-orange`: the send button in manual mode.
+const CLAUDE_CLAY_BUTTON_ORANGE: u32 = 0xc6613fff;
+/// `--app-claude-ivory`: the arrow on the clay send button.
+const CLAUDE_IVORY: u32 = 0xfaf9f5ff;
+/// `--app-status-busy` and `--app-status-pending`, the agent status dots.
+const STATUS_BUSY: u32 = 0x89d185ff;
+const STATUS_PENDING: u32 = 0x3b82f6ff;
+
+pub(crate) fn claude_orange() -> Hsla {
+    rgba(CLAUDE_ORANGE).into()
+}
+
+/// The prompt box's focus ring and send button colors, which follow the permission
+/// mode in the extension: Claude orange in manual mode, the text color for "Edit
+/// automatically", the focus color for Plan, and the error color for Auto and Bypass.
+pub(crate) struct PromptAccent {
+    pub ring: Hsla,
+    pub button_background: Hsla,
+    pub button_foreground: Hsla,
+}
+
+pub(crate) fn prompt_accent(mode_id: Option<&str>, cx: &App) -> PromptAccent {
+    let colors = cx.theme().colors();
+    match mode_id {
+        Some("acceptEdits") => PromptAccent {
+            ring: colors.text,
+            button_background: colors.text,
+            button_foreground: colors.editor_background,
+        },
+        Some("plan") => PromptAccent {
+            ring: colors.border_focused,
+            button_background: colors.border_focused,
+            button_foreground: colors.text,
+        },
+        Some("auto" | "bypassPermissions") => {
+            let error = cx.theme().status().error;
+            PromptAccent {
+                ring: error,
+                button_background: error,
+                button_foreground: colors.editor_background,
+            }
+        }
+        _ => PromptAccent {
+            ring: claude_orange(),
+            button_background: rgba(CLAUDE_CLAY_BUTTON_ORANGE).into(),
+            button_foreground: rgba(CLAUDE_IVORY).into(),
+        },
+    }
+}
+
+// --- Background tasks (raw SDK messages) ------------------------------------------
+
+/// claude-agent-acp's extension notification that carries a raw SDK message.
+const CLAUDE_SDK_MESSAGE_METHOD: &str = "_claude/sdkMessage";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AgentStatus {
+    Working,
+    Finished,
+    Failed,
+    Stopped,
+}
+
+/// A Claude Code task (`SDKTaskStartedMessage` and its updates).
+#[derive(Clone, Debug)]
+struct SdkTask {
+    task_id: String,
+    tool_use_id: Option<String>,
+    description: String,
+    /// Set for subagents (`local_agent` tasks).
+    subagent_type: Option<String>,
+    /// Such as `local_bash` or `local_agent`.
+    task_type: Option<String>,
+    /// The subagent task that launched this one.
+    parent_task_id: Option<String>,
+    backgrounded: bool,
+    ambient: bool,
+    status: AgentStatus,
+    error: Option<String>,
+    started_at: Instant,
+    ended_at: Option<Instant>,
+    total_tokens: Option<u64>,
+    duration: Option<Duration>,
+    summary: Option<String>,
+    /// The latest progress line, such as "Running Show the build log".
+    activity: Option<String>,
+}
+
+fn json_str<'a>(message: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    message
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn json_bool(message: &serde_json::Value, key: &str) -> Option<bool> {
+    message.get(key).and_then(serde_json::Value::as_bool)
+}
+
+/// The task usage of `task_progress` and `task_notification`: tokens and run time.
+fn task_usage(message: &serde_json::Value) -> Option<(u64, Duration)> {
+    let usage = message.get("usage")?;
+    let total_tokens = usage.get("total_tokens")?.as_u64()?;
+    let duration_ms = usage.get("duration_ms")?.as_u64()?;
+    Some((total_tokens, Duration::from_millis(duration_ms)))
+}
+
+/// Applies one raw SDK message: the task lifecycle (`task_started`, `task_progress`,
+/// `task_updated`, `task_notification`) and each turn's `result`, whose usage tells
+/// how long the prompt cache lives (`cache_creation` split by lifetime).
+fn apply_sdk_message(activity: &mut ThreadActivity, message: &serde_json::Value, now: Instant) {
+    match (json_str(message, "type"), json_str(message, "subtype")) {
+        (Some("result"), _) => {
+            if let Some(ttl) = message.get("usage").and_then(cache_ttl_from_usage) {
+                activity.prompt_cache.ttl = Some(ttl);
+            }
+        }
+        (Some("system"), Some("task_started")) => {
+            let Some(task_id) = json_str(message, "task_id") else {
+                return;
+            };
+            let task = SdkTask {
+                task_id: task_id.to_string(),
+                tool_use_id: json_str(message, "tool_use_id").map(str::to_string),
+                description: json_str(message, "description")
+                    .unwrap_or("Agent")
+                    .to_string(),
+                subagent_type: json_str(message, "subagent_type").map(str::to_string),
+                task_type: json_str(message, "task_type").map(str::to_string),
+                parent_task_id: json_str(message, "parent_task_id").map(str::to_string),
+                backgrounded: json_bool(message, "is_backgrounded").unwrap_or(false),
+                ambient: json_bool(message, "ambient").unwrap_or(false)
+                    || json_bool(message, "skip_transcript").unwrap_or(false),
+                status: AgentStatus::Working,
+                error: None,
+                started_at: now,
+                ended_at: None,
+                total_tokens: None,
+                duration: None,
+                summary: None,
+                activity: None,
+            };
+            match activity
+                .sdk_tasks
+                .iter_mut()
+                .find(|existing| existing.task_id == task.task_id)
+            {
+                // A resumed subagent starts again under the same task id.
+                Some(existing) => {
+                    existing.status = AgentStatus::Working;
+                    existing.ended_at = None;
+                    existing.backgrounded = task.backgrounded;
+                }
+                None => activity.sdk_tasks.push(task),
+            }
+        }
+        (Some("system"), Some("task_progress")) => {
+            let Some(task) = find_task(activity, message) else {
+                return;
+            };
+            if let Some((total_tokens, duration)) = task_usage(message) {
+                task.total_tokens = Some(total_tokens);
+                task.duration = Some(duration);
+            }
+            if let Some(summary) = json_str(message, "summary") {
+                task.summary = Some(summary.to_string());
+            }
+            let progress = json_str(message, "description")
+                .filter(|description| *description != task.description)
+                .or_else(|| json_str(message, "last_tool_name"));
+            if let Some(progress) = progress {
+                task.activity = Some(progress.to_string());
+            }
+        }
+        (Some("system"), Some("task_updated")) => {
+            let Some(task) = find_task(activity, message) else {
+                return;
+            };
+            let Some(patch) = message.get("patch") else {
+                return;
+            };
+            if let Some(backgrounded) = json_bool(patch, "is_backgrounded") {
+                task.backgrounded = backgrounded;
+            }
+            if let Some(description) = json_str(patch, "description") {
+                task.description = description.to_string();
+            }
+            match json_str(patch, "status") {
+                Some("completed") => task.finish(AgentStatus::Finished, now),
+                Some("failed") => {
+                    task.error = json_str(patch, "error").map(str::to_string);
+                    task.finish(AgentStatus::Failed, now);
+                }
+                Some("killed") => task.finish(AgentStatus::Stopped, now),
+                Some("running" | "pending") => {
+                    task.status = AgentStatus::Working;
+                    task.ended_at = None;
+                }
+                _ => {}
+            }
+        }
+        (Some("system"), Some("task_notification")) => {
+            let Some(task) = find_task(activity, message) else {
+                return;
+            };
+            if let Some((total_tokens, duration)) = task_usage(message) {
+                task.total_tokens = Some(total_tokens);
+                task.duration = Some(duration);
+            }
+            if let Some(summary) = json_str(message, "summary") {
+                task.summary = Some(summary.to_string());
+            }
+            match json_str(message, "status") {
+                Some("completed") => task.finish(AgentStatus::Finished, now),
+                Some("failed") => task.finish(AgentStatus::Failed, now),
+                Some("stopped") => task.finish(AgentStatus::Stopped, now),
+                _ => {}
+            }
+        }
+        (Some("system"), Some("background_tasks_changed")) => {
+            // A level signal with replace semantics: a background task missing from it
+            // ended, even if its end message was lost.
+            let Some(live) = message.get("tasks").and_then(serde_json::Value::as_array) else {
+                return;
+            };
+            let live_ids = live
+                .iter()
+                .filter_map(|task| json_str(task, "task_id"))
+                .collect::<Vec<_>>();
+            for task in &mut activity.sdk_tasks {
+                if task.status == AgentStatus::Working
+                    && task.backgrounded
+                    && !live_ids.contains(&task.task_id.as_str())
+                {
+                    task.finish(AgentStatus::Finished, now);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn find_task<'a>(
+    activity: &'a mut ThreadActivity,
+    message: &serde_json::Value,
+) -> Option<&'a mut SdkTask> {
+    let task_id = json_str(message, "task_id")?;
+    activity
+        .sdk_tasks
+        .iter_mut()
+        .find(|task| task.task_id == task_id)
+}
+
+impl SdkTask {
+    fn finish(&mut self, status: AgentStatus, now: Instant) {
+        if self.status == AgentStatus::Working || self.ended_at.is_none() {
+            self.ended_at = Some(now);
+        }
+        self.status = status;
+    }
+}
+
+// --- Prompt cache clock -------------------------------------------------------------
+
+/// The extension's prompt cache lifetimes.
+const CACHE_TTL_FIVE_MINUTES: Duration = Duration::from_secs(5 * 60);
+const CACHE_TTL_ONE_HOUR: Duration = Duration::from_secs(60 * 60);
+
+/// The lifetime of the cache a response wrote, from its usage: one hour if it wrote any
+/// one-hour cache tokens, five minutes if it wrote five-minute ones. A response that
+/// neither read nor wrote the cache says nothing about it.
+fn cache_ttl_from_usage(usage: &serde_json::Value) -> Option<Duration> {
+    let tokens =
+        |value: Option<&serde_json::Value>| value.and_then(serde_json::Value::as_u64).unwrap_or(0);
+    let creation = usage.get("cache_creation")?;
+    if tokens(creation.get("ephemeral_1h_input_tokens")) > 0 {
+        Some(CACHE_TTL_ONE_HOUR)
+    } else if tokens(creation.get("ephemeral_5m_input_tokens")) > 0 {
+        Some(CACHE_TTL_FIVE_MINUTES)
+    } else {
+        None
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PromptCache {
+    /// When the latest model request was made, which restarts the cache's lifetime.
+    request_at: Option<Instant>,
+    /// The cache lifetime, when the adapter reported one.
+    ttl: Option<Duration>,
+    compacted_at: Option<Instant>,
+}
+
+/// The prompt cache clock, as the extension computes it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum CacheClock {
+    Unknown,
+    Warm { minutes_left: u64 },
+    Expired { idle: Duration },
+    Compacted,
+}
+
+impl PromptCache {
+    fn record_request(&mut self, now: Instant) {
+        self.request_at = Some(now);
+        self.compacted_at = None;
+    }
+
+    fn record_compaction(&mut self, now: Instant) {
+        self.compacted_at = Some(now);
+    }
+
+    /// Without a reported lifetime (ACP v2 reports none) the clock assumes one hour,
+    /// Claude Code's lifetime for subscription accounts.
+    fn clock(&self, now: Instant) -> CacheClock {
+        if self.compacted_at.is_some() {
+            return CacheClock::Compacted;
+        }
+        let Some(request_at) = self.request_at else {
+            return CacheClock::Unknown;
+        };
+        let ttl = self.ttl.unwrap_or(CACHE_TTL_ONE_HOUR);
+        let elapsed = now.saturating_duration_since(request_at);
+        match ttl.checked_sub(elapsed).filter(|left| !left.is_zero()) {
+            Some(left) => CacheClock::Warm {
+                minutes_left: left.as_millis().div_ceil(60_000) as u64,
+            },
+            None => CacheClock::Expired { idle: elapsed },
+        }
+    }
+}
+
+impl CacheClock {
+    pub(crate) fn label(&self) -> Option<SharedString> {
+        match self {
+            Self::Warm { minutes_left } => Some(format!("{minutes_left}m").into()),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn tooltip(&self) -> Option<SharedString> {
+        match self {
+            Self::Unknown => None,
+            Self::Warm { minutes_left } => {
+                Some(format!("Prompt cache warm, about {minutes_left} min left.").into())
+            }
+            Self::Expired { idle } => Some(
+                format!(
+                    "Prompt cache likely expired (idle {}).",
+                    format_idle_time(*idle)
+                )
+                .into(),
+            ),
+            Self::Compacted => {
+                Some("Prompt cache does not cover the compacted conversation.".into())
+            }
+        }
+    }
+}
+
+/// "18m", "1h 18m" or "2d 3h", like the extension's idle time.
+pub(crate) fn format_idle_time(duration: Duration) -> String {
+    let minutes = duration.as_secs() / 60;
+    if minutes < 60 {
+        return format!("{minutes}m");
+    }
+    let hours = minutes / 60;
+    if hours < 24 {
+        return format!("{hours}h {}m", minutes % 60);
+    }
+    format!("{}d {}h", hours / 24, hours % 24)
+}
+
+// --- Agents ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug)]
+struct SubagentTimes {
+    started_at: Instant,
+    last_activity_at: Instant,
+}
+
+/// A subagent of the session, for the "N agents" chip, the agent map and the
+/// background line under its tool call.
+#[derive(Clone, Debug)]
+pub(crate) struct AgentSummary {
+    pub key: SharedString,
+    /// The tool call that launched it (ACP v1, where the task's `tool_use_id` is the
+    /// tool call id).
+    pub tool_call_id: Option<acp_v2::ToolCallId>,
+    /// Its child session (ACP v2).
+    pub session_id: Option<acp_v2::SessionId>,
+    /// The agent that launched it, if another agent did.
+    pub parent_key: Option<SharedString>,
+    pub description: SharedString,
+    pub status: AgentStatus,
+    pub waiting: bool,
+    pub backgrounded: bool,
+    pub elapsed: Option<Duration>,
+    pub total_tokens: Option<u64>,
+    pub activity: Option<SharedString>,
+    pub summary: Option<SharedString>,
+    pub error: Option<SharedString>,
+}
+
+/// The status dot states of the extension (`statusDot*`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DotState {
+    Running,
+    Waiting,
+    Idle,
+    Failed,
+}
+
+impl DotState {
+    pub(crate) fn color(self, cx: &App) -> Hsla {
+        match self {
+            Self::Running => rgba(STATUS_BUSY).into(),
+            Self::Waiting => rgba(STATUS_PENDING).into(),
+            Self::Idle => cx.theme().colors().text_muted.opacity(0.4),
+            Self::Failed => cx.theme().status().error,
+        }
+    }
+}
+
+impl AgentSummary {
+    pub(crate) fn dot_state(&self) -> DotState {
+        if self.waiting {
+            return DotState::Waiting;
+        }
+        match self.status {
+            AgentStatus::Working => DotState::Running,
+            AgentStatus::Finished => DotState::Idle,
+            AgentStatus::Failed | AgentStatus::Stopped => DotState::Failed,
+        }
+    }
+
+    /// "96m 14s · 177.3k tokens": run time and tokens, each left out when unknown.
+    pub(crate) fn meta(&self) -> String {
+        let elapsed = self
+            .elapsed
+            .filter(|elapsed| elapsed.as_millis() >= 1000)
+            .map(format_agent_duration);
+        let tokens = self
+            .total_tokens
+            .filter(|tokens| *tokens > 0)
+            .map(|tokens| format!("{} tokens", format_token_count(tokens)));
+        [elapsed, tokens]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" · ")
+    }
+
+    /// The status line Claude Code shows under a subagent that runs in the background.
+    pub(crate) fn background_line(&self) -> String {
+        let status = if self.waiting {
+            "Waiting for your permission: see the request below".to_string()
+        } else {
+            match self.status {
+                AgentStatus::Working => match self
+                    .summary
+                    .as_ref()
+                    .or(self.activity.as_ref())
+                    .filter(|activity| **activity != self.description)
+                {
+                    Some(activity) => format!("Working in the background: {activity}"),
+                    None => "Working in the background".to_string(),
+                },
+                AgentStatus::Failed => match &self.error {
+                    Some(error) => format!("Failed: {error}"),
+                    None => "Failed".to_string(),
+                },
+                AgentStatus::Finished => "Finished".to_string(),
+                AgentStatus::Stopped => "Stopped".to_string(),
+            }
+        };
+        format!("{status} · type /tasks to see its transcript")
+    }
+}
+
+/// "45s" or "96m 14s".
+pub(crate) fn format_agent_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else {
+        format!("{}m {}s", seconds / 60, seconds % 60)
+    }
+}
+
+/// "950", "177.3k" or "1.2M".
+pub(crate) fn format_token_count(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}M", tokens as f64 / 1_000_000.)
+    } else if tokens >= 1000 {
+        format!("{:.1}k", tokens as f64 / 1000.)
+    } else {
+        tokens.to_string()
+    }
+}
+
+/// "1 agent", "13 agents".
+pub(crate) fn agent_count_label(count: usize) -> String {
+    if count == 1 {
+        "1 agent".to_string()
+    } else {
+        format!("{count} agents")
+    }
+}
+
+fn subagent_title(thread: &AcpThread) -> SharedString {
+    thread
+        .subagent_association()
+        .and_then(|association| association.title.clone())
+        .or_else(|| thread.title())
+        .unwrap_or_else(|| "Agent".into())
+}
+
+/// The session's subagents: Claude Code's subagent tasks from raw SDK messages (ACP v1)
+/// or the subagent sessions of an ACP v2 session.
+pub(crate) fn agent_summaries(
+    thread: &AcpThread,
+    activity: Option<&ThreadActivity>,
+    now: Instant,
+    cx: &App,
+) -> Vec<AgentSummary> {
+    let sdk_agents = activity
+        .map(|activity| {
+            activity
+                .sdk_tasks
+                .iter()
+                .filter(|task| task.subagent_type.is_some() && !task.ambient)
+                .map(|task| AgentSummary {
+                    key: task.task_id.clone().into(),
+                    tool_call_id: task.tool_use_id.clone().map(acp_v2::ToolCallId::new),
+                    session_id: None,
+                    parent_key: task.parent_task_id.clone().map(SharedString::from),
+                    description: task.description.clone().into(),
+                    status: task.status,
+                    waiting: false,
+                    backgrounded: task.backgrounded,
+                    elapsed: match task.status {
+                        AgentStatus::Working => {
+                            Some(now.saturating_duration_since(task.started_at))
+                        }
+                        _ => task.duration.or_else(|| {
+                            task.ended_at
+                                .map(|ended_at| ended_at.saturating_duration_since(task.started_at))
+                        }),
+                    },
+                    total_tokens: task.total_tokens,
+                    activity: task.activity.clone().map(SharedString::from),
+                    summary: task.summary.clone().map(SharedString::from),
+                    error: task.error.clone().map(SharedString::from),
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if !sdk_agents.is_empty() {
+        return sdk_agents;
+    }
+
+    let mut agents = Vec::new();
+    collect_subagents(thread, None, activity, now, &mut agents, cx);
+    agents
+}
+
+/// The ACP v2 subagents of `thread`, each followed by its own subagents.
+fn collect_subagents(
+    thread: &AcpThread,
+    parent_key: Option<SharedString>,
+    activity: Option<&ThreadActivity>,
+    now: Instant,
+    agents: &mut Vec<AgentSummary>,
+    cx: &App,
+) {
+    let background_sessions = thread
+        .background_work()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|work| match work {
+            acp_v2::BackgroundWork::Subagent(subagent) => Some(subagent.session_id.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for subagent in thread.subagents() {
+        let subagent = subagent.read(cx);
+        let session_id = subagent.session_id().clone();
+        let (status, waiting) = match subagent.foreground_state() {
+            Some(acp_v2::StateUpdate::Running(_)) => (AgentStatus::Working, false),
+            Some(acp_v2::StateUpdate::RequiresAction(_)) => (AgentStatus::Working, true),
+            Some(acp_v2::StateUpdate::Idle(idle)) => match &idle.stop_reason {
+                Some(acp_v2::StopReason::Cancelled) => (AgentStatus::Stopped, false),
+                Some(
+                    acp_v2::StopReason::Error(_)
+                    | acp_v2::StopReason::MaxTokens
+                    | acp_v2::StopReason::MaxTurnRequests
+                    | acp_v2::StopReason::Refusal,
+                ) => (AgentStatus::Failed, false),
+                _ => (AgentStatus::Finished, false),
+            },
+            _ => (AgentStatus::Finished, false),
+        };
+        let times = activity.and_then(|activity| activity.subagent_times.get(&session_id));
+        let elapsed = times.map(|times| match status {
+            AgentStatus::Working => now.saturating_duration_since(times.started_at),
+            _ => times
+                .last_activity_at
+                .saturating_duration_since(times.started_at),
+        });
+        let latest_tool_call = subagent
+            .entries()
+            .iter()
+            .rev()
+            .find_map(|entry| match entry {
+                AgentThreadEntry::ToolCall(tool_call) => Some(SharedString::from(
+                    tool_call.label.read(cx).source().to_string(),
+                )),
+                _ => None,
+            });
+        let key = SharedString::from(session_id.0.to_string());
+        agents.push(AgentSummary {
+            key: key.clone(),
+            tool_call_id: None,
+            backgrounded: background_sessions.contains(&session_id),
+            session_id: Some(session_id),
+            parent_key: parent_key.clone(),
+            description: subagent_title(subagent),
+            status,
+            waiting,
+            elapsed,
+            total_tokens: subagent.token_usage().map(|usage| usage.used_tokens),
+            activity: latest_tool_call,
+            summary: None,
+            error: None,
+        });
+        collect_subagents(subagent, Some(key), activity, now, agents, cx);
+    }
+}
+
+/// A background task that is not an agent, such as a shell command, for the agent map.
+#[derive(Clone, Debug)]
+pub(crate) struct BackgroundTaskSummary {
+    pub key: SharedString,
+    pub title: SharedString,
+    /// The extension's word for its kind: "shell", "monitor", "workflow", …
+    pub kind: SharedString,
+    pub elapsed: Option<Duration>,
+}
+
+impl BackgroundTaskSummary {
+    /// "shell · 971m 37s".
+    pub(crate) fn meta(&self) -> String {
+        match self.elapsed.filter(|elapsed| elapsed.as_millis() >= 1000) {
+            Some(elapsed) => format!("{} · {}", self.kind, format_agent_duration(elapsed)),
+            None => self.kind.to_string(),
+        }
+    }
+}
+
+/// The extension's names for Claude Code task types.
+fn task_type_word(task_type: Option<&str>) -> &'static str {
+    match task_type {
+        Some("local_agent") => "subagent",
+        Some("local_workflow") => "workflow",
+        Some("local_bash") => "shell",
+        Some("monitor_mcp" | "monitor_ws") => "monitor",
+        Some("mcp_task") => "MCP task",
+        Some("in_process_teammate") => "teammate",
+        Some("dream") => "dream",
+        Some("auto_mode_scan") => "auto-mode scan",
+        Some("local_memory_import") => "memory import",
+        Some("post_turn_memory") => "memory save",
+        Some("remote_agent") => "cloud session",
+        _ => "task",
+    }
+}
+
+/// The session's live background tasks other than agents: from raw SDK messages (ACP
+/// v1), or the terminals and tool calls of an ACP v2 session's `background` list.
+pub(crate) fn background_task_summaries(
+    thread: &AcpThread,
+    activity: Option<&ThreadActivity>,
+    now: Instant,
+    cx: &App,
+) -> Vec<BackgroundTaskSummary> {
+    if let Some(activity) = activity
+        && !activity.sdk_tasks.is_empty()
+    {
+        return activity
+            .sdk_tasks
+            .iter()
+            .filter(|task| {
+                task.subagent_type.is_none()
+                    && task.backgrounded
+                    && !task.ambient
+                    && task.status == AgentStatus::Working
+            })
+            .map(|task| BackgroundTaskSummary {
+                key: task.task_id.clone().into(),
+                title: task.description.clone().into(),
+                kind: task_type_word(task.task_type.as_deref()).into(),
+                elapsed: Some(now.saturating_duration_since(task.started_at)),
+            })
+            .collect();
+    }
+    let tool_call_title = |tool_call_id: &acp_v2::ToolCallId| {
+        thread.entries().iter().find_map(|entry| match entry {
+            AgentThreadEntry::ToolCall(tool_call) if &tool_call.id == tool_call_id => Some(
+                SharedString::from(tool_call.label.read(cx).source().to_string()),
+            ),
+            _ => None,
+        })
+    };
+    thread
+        .background_work()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|work| {
+            let (id, kind) = match work {
+                // claude-agent-acp names a background command's terminal after its Bash
+                // tool call.
+                acp_v2::BackgroundWork::Terminal(terminal) => {
+                    (terminal.terminal_id.0.to_string(), "shell")
+                }
+                acp_v2::BackgroundWork::ToolCall(tool_call) => {
+                    (tool_call.tool_call_id.0.to_string(), "task")
+                }
+                _ => return None,
+            };
+            let title = tool_call_title(&acp_v2::ToolCallId::new(id.clone()))
+                .unwrap_or_else(|| kind.into());
+            Some(BackgroundTaskSummary {
+                key: id.into(),
+                title,
+                kind: kind.into(),
+                elapsed: None,
+            })
+        })
+        .collect()
+}
+
+/// The number on the agents chip: the agents still working, like the extension.
+pub(crate) fn live_agent_count(agents: &[AgentSummary]) -> usize {
+    agents
+        .iter()
+        .filter(|agent| agent.status == AgentStatus::Working)
+        .count()
+}
+
+pub(crate) fn agents_chip_tooltip(dot: DotState) -> &'static str {
+    match dot {
+        DotState::Waiting => {
+            "An agent is waiting for your permission · Click to open the agent map"
+        }
+        DotState::Running => "Agents are working · Click to open the agent map",
+        DotState::Failed => "An agent failed · Click to open the agent map",
+        DotState::Idle => "Click to open the agent map",
+    }
+}
+
+/// The agents chip's dot: waiting while a working agent waits for permission, running
+/// while any agent works, failed when a finished one failed, idle otherwise.
+pub(crate) fn agents_dot_state(agents: &[AgentSummary]) -> DotState {
+    let working = agents
+        .iter()
+        .filter(|agent| agent.status == AgentStatus::Working);
+    if working.clone().any(|agent| agent.waiting) {
+        DotState::Waiting
+    } else if working.count() > 0 {
+        DotState::Running
+    } else if agents
+        .iter()
+        .any(|agent| agent.status == AgentStatus::Failed)
+    {
+        DotState::Failed
+    } else {
+        DotState::Idle
+    }
+}
+
+#[derive(IntoElement)]
+pub(crate) struct StatusDot {
+    state: DotState,
+    size: Pixels,
+}
+
+impl StatusDot {
+    pub(crate) fn new(state: DotState) -> Self {
+        Self {
+            state,
+            size: px(8.),
+        }
+    }
+
+    pub(crate) fn size(mut self, size: Pixels) -> Self {
+        self.size = size;
+        self
+    }
+}
+
+impl RenderOnce for StatusDot {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        div()
+            .flex_none()
+            .size(self.size)
+            .rounded_full()
+            .bg(self.state.color(cx))
+    }
+}
+
+// --- Status bar item ------------------------------------------------------------------
+
+/// "✻ Claude Code" at the right of the status bar: opens the Claude tab, or a new
+/// session when there is none. Present only in the Claude Code style.
+pub(crate) struct ClaudeCodeStatusItem {
+    workspace: WeakEntity<Workspace>,
+}
+
+impl Render for ClaudeCodeStatusItem {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let workspace = self.workspace.clone();
+        Button::new("claude-code-status-item", "Claude Code")
+            .label_size(LabelSize::Small)
+            .color(Color::Muted)
+            .start_icon(
+                Icon::new(IconName::AiClaude)
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .tooltip(ui::Tooltip::text("Open Claude Code"))
+            .on_click(move |_, window, cx| {
+                let workspace = workspace.clone();
+                // The click can arrive while the workspace is updating its status bar.
+                window.defer(cx, move |window, cx| {
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            super::thread_item::focus_or_open_thread_tab(workspace, window, cx);
+                        })
+                        .log_err();
+                });
+            })
+    }
+}
+
+impl StatusItemView for ClaudeCodeStatusItem {
+    fn set_active_pane_item(
+        &mut self,
+        _active_pane_item: Option<&dyn ItemHandle>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+    }
+
+    fn hide_setting(&self, _cx: &App) -> Option<workspace::HideStatusItem> {
+        // Shown only while `agent.ui_style` is `claude_code`.
+        None
+    }
+}
+
+fn sync_status_item(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    let enabled = super::claude_code_style_enabled(cx);
+    let status_bar = workspace.status_bar().clone();
+    let position = status_bar
+        .read(cx)
+        .position_of_item::<ClaudeCodeStatusItem>();
+    match (enabled, position) {
+        (true, None) => {
+            let workspace = cx.weak_entity();
+            let item = cx.new(|_| ClaudeCodeStatusItem { workspace });
+            status_bar.update(cx, |status_bar, cx| {
+                status_bar.add_right_item(item, window, cx);
+            });
+        }
+        (false, Some(position)) => {
+            status_bar.update(cx, |status_bar, cx| status_bar.remove_item_at(position, cx));
+        }
+        _ => {}
+    }
+}
+
+fn init_status_item(cx: &mut App) {
+    cx.observe_new(|workspace: &mut Workspace, window, cx| {
+        let Some(window) = window else {
+            return;
+        };
+        sync_status_item(workspace, window, cx);
+        cx.observe_global_in::<SettingsStore>(window, sync_status_item)
+            .detach();
+    })
+    .detach();
+}
+
+/// The prompt cache clock in the footer: the minutes the cache has left, or a red
+/// clock once it has likely expired.
+#[derive(IntoElement)]
+pub(crate) struct CacheClockElement {
+    thread_view_id: EntityId,
+}
+
+impl CacheClockElement {
+    pub(crate) fn new(thread_view_id: EntityId) -> Self {
+        Self { thread_view_id }
+    }
+}
+
+impl RenderOnce for CacheClockElement {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        // Its own view, so that the minute ticks only re-render the clock.
+        window.with_id(("claude-code-cache-clock", self.thread_view_id), |window| {
+            window.use_state(cx, |_, cx| CacheClockView::new(self.thread_view_id, cx))
+        })
+    }
+}
+
+struct CacheClockView {
+    thread_view_id: EntityId,
+    _ticker: gpui::Task<()>,
+}
+
+impl CacheClockView {
+    fn new(thread_view_id: EntityId, cx: &mut Context<Self>) -> Self {
+        let ticker = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_secs(15))
+                    .await;
+                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            thread_view_id,
+            _ticker: ticker,
+        }
+    }
+}
+
+impl Render for CacheClockView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let clock = thread_activity(self.thread_view_id, cx)
+            .map(|activity| activity.cache_clock(Instant::now()))
+            .unwrap_or(CacheClock::Unknown);
+        let Some(tooltip) = clock.tooltip() else {
+            return gpui::Empty.into_any_element();
+        };
+        let icon_color = match clock {
+            CacheClock::Warm { .. } => Color::Muted,
+            _ => Color::Error,
+        };
+        h_flex()
+            .id("claude-code-cache-clock")
+            .flex_none()
+            .gap_1()
+            .h(px(24.))
+            .px_1()
+            .tooltip(ui::Tooltip::text(tooltip))
+            .child(
+                Icon::new(IconName::Clock)
+                    .size(IconSize::Small)
+                    .color(icon_color),
+            )
+            .when_some(clock.label(), |this, label| {
+                this.child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
+            })
+            .into_any_element()
     }
 }
 
@@ -1732,9 +3096,8 @@ mod tests {
     #[test]
     fn test_placeholders() {
         assert!(is_claude_code_placeholder(QUEUE_PLACEHOLDER));
-        assert!(is_claude_code_placeholder(&idle_placeholder(
-            "Claude Agent"
-        )));
+        assert!(is_claude_code_placeholder(idle_placeholder()));
+        assert!(idle_placeholder().ends_with("Esc to focus or unfocus Claude"));
         assert!(!is_claude_code_placeholder(
             "Message Claude Agent — @ to include context, / for commands"
         ));
@@ -1773,6 +3136,466 @@ mod tests {
     fn test_line_stats() {
         assert_eq!(line_stats("a\nb\nc\n", "a\nB\nc\nd\n"), (2, 1));
         assert_eq!(line_stats("", "one\ntwo\n"), (2, 0));
+    }
+
+    /// The `model` option claude-agent-acp 0.106.0 returned from `session/new` for a
+    /// Claude subscription (captured over stdio, no prompt sent).
+    fn captured_model_option(current: &str) -> acp_v2::SessionConfigOption {
+        select_option(
+            "model",
+            acp_v2::SessionConfigOptionCategory::Model,
+            current,
+            &[
+                ("default", "Default (recommended)", Some("Opus")),
+                (
+                    "opus",
+                    "Opus 5.5",
+                    Some("Opus 5.5 · Best for everyday, complex tasks"),
+                ),
+                (
+                    "claude-fable-5-1[1m]",
+                    "Fable 5.1",
+                    Some("Fable 5.1 · Most capable for your hardest and longest-running tasks"),
+                ),
+                (
+                    "sonnet",
+                    "Sonnet 5.5",
+                    Some("Sonnet 5.5 · Efficient for routine tasks"),
+                ),
+                (
+                    "haiku",
+                    "Haiku 5.5",
+                    Some("Haiku 5.5 · Fastest for quick answers"),
+                ),
+            ],
+        )
+    }
+
+    fn menu_rows(option: &acp_v2::SessionConfigOption) -> Vec<(String, Option<String>, bool)> {
+        let acp_v2::SessionConfigKind::Select(select) = &option.kind else {
+            panic!("model option is a select");
+        };
+        model_menu_rows(select)
+            .into_iter()
+            .map(|row| {
+                (
+                    row.title.to_string(),
+                    row.subtitle.map(|subtitle| subtitle.to_string()),
+                    row.is_current,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_model_menu_rows_match_the_extension() {
+        let rows = menu_rows(&captured_model_option("default"));
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "Default (recommended)".to_string(),
+                    Some("Opus 5.5 · Best for everyday, complex tasks".to_string()),
+                    true
+                ),
+                (
+                    "Opus".to_string(),
+                    Some("Opus 5.5 · Best for everyday, complex tasks".to_string()),
+                    false
+                ),
+                (
+                    "Fable".to_string(),
+                    Some(
+                        "Fable 5.1 · Most capable for your hardest and longest-running tasks"
+                            .to_string()
+                    ),
+                    false
+                ),
+                (
+                    "Sonnet".to_string(),
+                    Some("Sonnet 5.5 · Efficient for routine tasks".to_string()),
+                    false
+                ),
+                (
+                    "Haiku".to_string(),
+                    Some("Haiku 5.5 · Fastest for quick answers".to_string()),
+                    false
+                ),
+            ]
+        );
+        assert_eq!(
+            model_chip_label(&[captured_model_option("default")]).as_deref(),
+            Some("Opus 5.5")
+        );
+    }
+
+    #[test]
+    fn test_model_menu_rows_leave_out_pinned_versions() {
+        let option = select_option(
+            "model",
+            acp_v2::SessionConfigOptionCategory::Model,
+            "opus",
+            &[
+                ("default", "Default (recommended)", Some("Opus")),
+                (
+                    "opus",
+                    "Opus 5.5",
+                    Some("Opus 5.5 · Best for everyday, complex tasks"),
+                ),
+                ("fable", "Fable 5.2", Some("Fable 5.2 · Most capable")),
+                (
+                    "sonnet",
+                    "Sonnet 5.5",
+                    Some("Sonnet 5.5 · Efficient for routine tasks"),
+                ),
+                (
+                    "haiku",
+                    "Haiku 5.5",
+                    Some("Haiku 5.5 · Fastest for quick answers"),
+                ),
+                ("claude-fable-5-1[1m]", "Fable 5.1", Some("Fable 5.1")),
+                ("claude-haiku-4-5-20251001", "Haiku 4.5", Some("Haiku 4.5")),
+                ("claude-opus-4-8", "Opus 4.8", Some("Opus 4.8")),
+                ("claude-sonnet-4-6", "Sonnet 4.6", Some("Sonnet 4.6")),
+            ],
+        );
+        let titles = menu_rows(&option)
+            .into_iter()
+            .map(|(title, _, _)| title)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            titles,
+            ["Default (recommended)", "Opus", "Fable", "Sonnet", "Haiku"]
+        );
+
+        // A session running a pinned version keeps that row, so the check has a place.
+        let mut option = option;
+        if let acp_v2::SessionConfigKind::Select(select) = &mut option.kind {
+            select.current_value = acp_v2::SessionConfigValueId::new("claude-opus-4-8");
+        }
+        let rows = menu_rows(&option);
+        assert_eq!(rows.len(), 6);
+        assert_eq!(
+            rows[5],
+            ("Opus 4.8".to_string(), Some("Opus 4.8".to_string()), true)
+        );
+    }
+
+    #[test]
+    fn test_model_family_version() {
+        assert_eq!(model_family_version("opus"), Some(("opus", None)));
+        assert_eq!(model_family_version("opus[1m]"), Some(("opus", None)));
+        assert_eq!(
+            model_family_version("claude-fable-5-1[1m]"),
+            Some(("fable", Some((5, 1))))
+        );
+        assert_eq!(
+            model_family_version("claude-haiku-4-5-20251001"),
+            Some(("haiku", Some((4, 5))))
+        );
+        assert_eq!(
+            model_family_version("claude-sonnet-4-20250514"),
+            Some(("sonnet", Some((4, 0))))
+        );
+        assert_eq!(model_family_version("default"), None);
+        assert_eq!(model_family_version("my-gateway-model"), None);
+    }
+
+    #[test]
+    fn test_effort_slider() {
+        let options = adapter_options("default", "xhigh", false);
+        let effort =
+            first_select_option(&options, &acp_v2::SessionConfigOptionCategory::ThoughtLevel)
+                .and_then(effort_slider)
+                .expect("effort slider");
+        assert_eq!(effort.levels.len(), 2);
+        assert_eq!(effort.current, Some(1));
+        assert_eq!(effort.label.as_ref(), "Extra high");
+
+        let options = adapter_options("default", "default", false);
+        let effort =
+            first_select_option(&options, &acp_v2::SessionConfigOptionCategory::ThoughtLevel)
+                .and_then(effort_slider)
+                .expect("effort slider");
+        assert_eq!(effort.current, None);
+        assert_eq!(effort.label.as_ref(), "Auto");
+    }
+
+    #[test]
+    fn test_sdk_task_messages_build_agents() {
+        let started_at = Instant::now();
+        let mut activity = ThreadActivity::default();
+        apply_sdk_message(
+            &mut activity,
+            &serde_json::json!({
+                "type": "system",
+                "subtype": "task_started",
+                "task_id": "agent-1",
+                "tool_use_id": "toolu_1",
+                "description": "Explore agent UI architecture",
+                "subagent_type": "Explore",
+                "task_type": "local_agent",
+                "is_backgrounded": true,
+            }),
+            started_at,
+        );
+        apply_sdk_message(
+            &mut activity,
+            &serde_json::json!({
+                "type": "system",
+                "subtype": "task_started",
+                "task_id": "shell-1",
+                "description": "npm run dev",
+                "task_type": "local_bash",
+                "is_backgrounded": true,
+            }),
+            started_at,
+        );
+        apply_sdk_message(
+            &mut activity,
+            &serde_json::json!({
+                "type": "system",
+                "subtype": "task_progress",
+                "task_id": "agent-1",
+                "description": "Running Show code around rate_limit_event construction",
+                "usage": {"total_tokens": 177_300, "tool_uses": 12, "duration_ms": 5000},
+            }),
+            started_at,
+        );
+        let agents = activity
+            .sdk_tasks
+            .iter()
+            .filter(|task| task.subagent_type.is_some())
+            .count();
+        assert_eq!(agents, 1, "only subagents count as agents");
+        let task = &activity.sdk_tasks[0];
+        assert_eq!(task.total_tokens, Some(177_300));
+        assert_eq!(
+            task.activity.as_deref(),
+            Some("Running Show code around rate_limit_event construction")
+        );
+
+        let summary = AgentSummary {
+            key: "agent-1".into(),
+            tool_call_id: Some(acp_v2::ToolCallId::new("toolu_1")),
+            session_id: None,
+            parent_key: None,
+            description: task.description.clone().into(),
+            status: task.status,
+            waiting: false,
+            backgrounded: task.backgrounded,
+            elapsed: Some(Duration::from_secs(96 * 60 + 14)),
+            total_tokens: task.total_tokens,
+            activity: task.activity.clone().map(SharedString::from),
+            summary: None,
+            error: None,
+        };
+        assert_eq!(
+            summary.background_line(),
+            "Working in the background: Running Show code around rate_limit_event construction · type /tasks to see its transcript"
+        );
+        assert_eq!(summary.meta(), "96m 14s · 177.3k tokens");
+        assert_eq!(summary.dot_state(), DotState::Running);
+
+        apply_sdk_message(
+            &mut activity,
+            &serde_json::json!({
+                "type": "system",
+                "subtype": "task_notification",
+                "task_id": "agent-1",
+                "status": "completed",
+                "output_file": "/tmp/out",
+                "summary": "Done",
+                "usage": {"total_tokens": 180_000, "tool_uses": 14, "duration_ms": 61_000},
+            }),
+            started_at + Duration::from_secs(61),
+        );
+        let task = &activity.sdk_tasks[0];
+        assert_eq!(task.status, AgentStatus::Finished);
+        assert_eq!(task.duration, Some(Duration::from_secs(61)));
+
+        // A background task missing from the live level ended.
+        apply_sdk_message(
+            &mut activity,
+            &serde_json::json!({
+                "type": "system",
+                "subtype": "background_tasks_changed",
+                "tasks": [],
+            }),
+            started_at + Duration::from_secs(62),
+        );
+        assert_eq!(activity.sdk_tasks[1].status, AgentStatus::Finished);
+    }
+
+    #[test]
+    fn test_sdk_background_tasks_and_nested_agents() {
+        let now = Instant::now();
+        let mut activity = ThreadActivity::default();
+        for message in [
+            serde_json::json!({
+                "type": "system", "subtype": "task_started", "task_id": "agent-1",
+                "description": "Track B: thinking rows", "subagent_type": "general-purpose",
+                "task_type": "local_agent", "is_backgrounded": true,
+            }),
+            serde_json::json!({
+                "type": "system", "subtype": "task_started", "task_id": "agent-2",
+                "description": "Account usage", "subagent_type": "general-purpose",
+                "task_type": "local_agent", "parent_task_id": "agent-1",
+            }),
+            serde_json::json!({
+                "type": "system", "subtype": "task_started", "task_id": "shell-1",
+                "description": "Wait for zed check to finish", "task_type": "local_bash",
+                "is_backgrounded": true,
+            }),
+        ] {
+            apply_sdk_message(&mut activity, &message, now);
+        }
+        let task = activity
+            .sdk_tasks
+            .iter()
+            .find(|task| task.task_id == "agent-2")
+            .expect("nested agent");
+        assert_eq!(task.parent_task_id.as_deref(), Some("agent-1"));
+
+        let shell = activity
+            .sdk_tasks
+            .iter()
+            .find(|task| task.task_id == "shell-1")
+            .expect("shell task");
+        let summary = BackgroundTaskSummary {
+            key: shell.task_id.clone().into(),
+            title: shell.description.clone().into(),
+            kind: task_type_word(shell.task_type.as_deref()).into(),
+            elapsed: Some(Duration::from_secs(971 * 60 + 37)),
+        };
+        assert_eq!(summary.meta(), "shell · 971m 37s");
+    }
+
+    #[test]
+    fn test_agents_chip_dot() {
+        let agent = |status: AgentStatus, waiting: bool| AgentSummary {
+            key: "agent".into(),
+            tool_call_id: None,
+            session_id: None,
+            parent_key: None,
+            description: "Agent".into(),
+            status,
+            waiting,
+            backgrounded: true,
+            elapsed: None,
+            total_tokens: None,
+            activity: None,
+            summary: None,
+            error: None,
+        };
+        assert_eq!(
+            agents_dot_state(&[agent(AgentStatus::Finished, false)]),
+            DotState::Idle
+        );
+        assert_eq!(
+            agents_dot_state(&[
+                agent(AgentStatus::Finished, false),
+                agent(AgentStatus::Working, false)
+            ]),
+            DotState::Running
+        );
+        assert_eq!(
+            agents_dot_state(&[agent(AgentStatus::Working, true)]),
+            DotState::Waiting
+        );
+        assert_eq!(
+            agents_dot_state(&[agent(AgentStatus::Failed, false)]),
+            DotState::Failed
+        );
+        assert_eq!(
+            live_agent_count(&[
+                agent(AgentStatus::Finished, false),
+                agent(AgentStatus::Working, false)
+            ]),
+            1
+        );
+    }
+
+    #[test]
+    fn test_prompt_cache_clock() {
+        let start = Instant::now();
+        let mut cache = PromptCache::default();
+        assert_eq!(cache.clock(start), CacheClock::Unknown);
+
+        cache.record_request(start);
+        assert_eq!(
+            cache.clock(start + Duration::from_secs(2 * 60)),
+            CacheClock::Warm { minutes_left: 58 }
+        );
+        assert_eq!(
+            cache
+                .clock(start + Duration::from_secs(2 * 60))
+                .label()
+                .as_deref(),
+            Some("58m")
+        );
+        let expired = cache.clock(start + Duration::from_secs(78 * 60));
+        assert_eq!(
+            expired.tooltip().as_deref(),
+            Some("Prompt cache likely expired (idle 1h 18m).")
+        );
+        assert_eq!(expired.label(), None);
+
+        let mut activity = ThreadActivity::default();
+        activity.prompt_cache.record_request(start);
+        apply_sdk_message(
+            &mut activity,
+            &serde_json::json!({
+                "type": "result",
+                "subtype": "success",
+                "usage": {
+                    "cache_read_input_tokens": 1000,
+                    "cache_creation": {
+                        "ephemeral_5m_input_tokens": 200,
+                        "ephemeral_1h_input_tokens": 0,
+                    },
+                },
+            }),
+            start,
+        );
+        assert_eq!(
+            activity.cache_clock(start + Duration::from_secs(60)),
+            CacheClock::Warm { minutes_left: 4 }
+        );
+
+        activity
+            .prompt_cache
+            .record_compaction(start + Duration::from_secs(90));
+        assert_eq!(
+            activity
+                .cache_clock(start + Duration::from_secs(91))
+                .tooltip()
+                .as_deref(),
+            Some("Prompt cache does not cover the compacted conversation.")
+        );
+        activity
+            .prompt_cache
+            .record_request(start + Duration::from_secs(120));
+        assert!(matches!(
+            activity.cache_clock(start + Duration::from_secs(121)),
+            CacheClock::Warm { .. }
+        ));
+    }
+
+    #[test]
+    fn test_agent_formatting() {
+        assert_eq!(format_agent_duration(Duration::from_secs(45)), "45s");
+        assert_eq!(
+            format_agent_duration(Duration::from_secs(5 * 60 + 1)),
+            "5m 1s"
+        );
+        assert_eq!(format_token_count(950), "950");
+        assert_eq!(format_token_count(273_200), "273.2k");
+        assert_eq!(format_token_count(1_250_000), "1.2M");
+        assert_eq!(agent_count_label(1), "1 agent");
+        assert_eq!(agent_count_label(13), "13 agents");
+        assert_eq!(format_idle_time(Duration::from_secs(18 * 60)), "18m");
+        assert_eq!(format_idle_time(Duration::from_secs(26 * 3600)), "1d 2h");
     }
 
     #[test]

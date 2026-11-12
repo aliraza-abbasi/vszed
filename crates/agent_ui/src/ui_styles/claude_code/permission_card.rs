@@ -122,7 +122,6 @@ impl ThreadView {
         let is_focused = focus_handle.contains_focused(window, cx);
         let option_count = prompt.options.len();
         let selected_index = self.claude_code_permission_selection(&prompt, cx);
-        let max_content_width = AgentSettings::get_global(cx).max_content_width;
 
         let options =
             prompt
@@ -222,6 +221,7 @@ impl ThreadView {
                 colors.border
             })
             .bg(colors.editor_background)
+            .block_mouse_except_scroll()
             .text_ui(cx)
             .child(
                 div()
@@ -237,26 +237,8 @@ impl ThreadView {
             .children(plan)
             .child(v_flex().w_full().gap_1().children(options));
 
-        h_flex()
-            .w_full()
-            .flex_none()
-            .justify_center()
-            .px_3()
-            .pt_1()
-            .pb_3()
-            .bg(colors.editor_background)
-            .child(
-                div()
-                    .when_some(max_content_width, |this, max_width| {
-                        this.flex_basis(max_width)
-                    })
-                    .when(max_content_width.is_none(), |this| this.w_full())
-                    .min_w_0()
-                    .flex_shrink_1()
-                    .flex_grow_0()
-                    .child(card),
-            )
-            .into_any_element()
+        // Floats over the transcript in the prompt box's place.
+        card.into_any_element()
     }
 
     fn choose_claude_code_permission_option(
