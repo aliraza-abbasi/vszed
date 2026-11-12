@@ -13,6 +13,11 @@ upstream files. Check them first when a rebase conflicts.
 | `crates/workspace/src/status_bar.rs` | `StatusBar::add_rightmost_item`, which inserts at the front of `right_items` (drawn last, because right items are drawn in reverse). `insert_item_after` can never reach that slot | +18 |
 | `crates/workspace/src/status_bar.rs` | `show_sidebar_toggle` field (default `true`) with `set_show_sidebar_toggle` / `show_sidebar_toggle`. `render` ANDs it into `SidebarStatus::show_toggle`, so the threads sidebar toggle is drawn exactly as before unless a caller turns it off | +14 -1 |
 | `crates/title_bar/src/title_bar.rs` | `center_item` / `trailing_item` fields with setters and getters, plus a `workspace()` getter so `observe_new::<TitleBar>` can reach the workspace. The center item is pushed after the left items inside an absolutely positioned, full width `h_flex` that centers it over the title bar; the trailing item is the first child of the right side group. The children `ArrayVec` grows from 5 to 6. Unset, the render tree is unchanged | +41 -1 |
+| `crates/settings_content/src/editor.rs` | `MinimapContent::line_height: Option<BufferLineHeight>` (separate `feat(editor)` commit, meant for upstream) | +7 -1 |
+| `crates/editor/src/editor_settings.rs` | `Minimap::line_height`, read from the content | +4 |
+| `crates/editor/src/editor.rs` | `update_minimap_configuration` puts `minimap.line_height` into the minimap editor's text style refinement. It runs when the minimap is created and on settings changes | +5 |
+| `crates/editor/src/element.rs` | `get_minimap_line_height` takes the minimap editor's `TextStyleRefinement` instead of only its font size, so the layout uses the refined line height too; plus `test_minimap_line_height_setting` | +9 -12, test +53 -1 |
+| `assets/settings/default.json` | `"minimap": { "line_height": null }` with a comment | +4 |
 | `crates/settings_content/src/workbench.rs` | New file: `WorkbenchSettingsContent` (`activity_bar`, `dock_headers`, `command_center`, `layout_controls`, `status_bar`), `ActivityBarSettingsContent` | +43 (new) |
 | `crates/settings_content/src/settings_content.rs` | `mod workbench`, re-export, `workbench` field, `flattened_deserialize!` entry | +6 -1 |
 | `crates/settings/src/vscode_import.rs` | `workbench: None` in the exhaustive `SettingsContent` literal | +1 |
@@ -54,6 +59,11 @@ Defaults come from `unwrap_or_default()` in `WorkbenchSettings::from_settings`, 
 - The preset installs the `vscode-classic-themes` (themes `Dark 2026 (VS Code)` /
   `Light 2026 (VS Code)`) and `seti-icons` (`Seti Icon Theme`) extensions from the
   Zed extension registry and selects each one once it is installed.
+- The preset also sets, with restore, VS Code's editor status and minimap
+  defaults: `status_bar.active_encoding_button: "enabled"`,
+  `status_bar.line_endings_button: true`, `minimap.thumb: "hover"` (VS Code's
+  `showSlider: "mouseover"`), `minimap.max_width_columns: 120` (VS Code's
+  `maxColumn`) and `minimap.line_height: { "custom": 1.0 }` (see Minimap).
 - The preset also turns on `workbench.command_center`, `layout_controls` and
   `status_bar`, and turns off `title_bar.show_project_items` / `show_branch_name`
   (VS Code shows neither in its title bar). All of them are in the snapshot.
@@ -119,8 +129,38 @@ Defaults come from `unwrap_or_default()` in `WorkbenchSettings::from_settings`, 
 - Sync: `cloud-upload` publishes a branch without upstream (`git::Push`).
   Otherwise the sync icon shows `behind↓ ahead↑` and pulls when behind, pushes
   when ahead, and fetches otherwise. Zed has no combined pull and push action.
-- Right, drawn left to right: cursor position, encoding, line ending, language,
-  toolchain, edit prediction, bell. Zed has no indentation item.
+- Right, drawn left to right: git blame, cursor position, indentation,
+  encoding, line ending, language status, language, toolchain, edit
+  prediction, bell. Zed's vim mode, pending keystroke and image info items stay
+  left of them.
+- Cursor position (`CursorPositionItem`) replaces Zed's item, which leaves a
+  placeholder like the diagnostics indicator. It uses VS Code's formats:
+  `Ln 4, Col 2`, `Ln 4, Col 2 (12 selected)`, `3 selections` and
+  `3 selections (12 characters selected)`. The column counts a tab as the
+  columns it takes up and selected CRLF line breaks count as two characters,
+  as in VS Code. It honors `status_bar.cursor_position_button` and its Hide
+  Button, and a click toggles go to line.
+- Indentation (`IndentationItem`) shows `Spaces: N` or `Tab Size: N` from the
+  active file's `tab_size` and `hard_tabs`. Zed has no indentation size
+  separate from the tab size, so VS Code's `Spaces: 2 (Tab Size: 4)` never
+  appears. Its menu has only Convert Indentation to Spaces / to Tabs, which
+  convert the whole file like VS Code (Zed's actions convert the selected
+  lines, so the item selects everything, converts, and puts the cursors back
+  shifted by the indentation change). VS Code's Indent Using Spaces / Tabs,
+  Change Tab Display Size, Detect Indentation and Trim Trailing Whitespace are
+  left out: Zed has no per-file indentation or trim action.
+- Language status (`LanguageStatusItem`) is VS Code's `{ }`: shown while
+  language servers serve the active file (the servers that opened the buffer
+  locally; on remote projects, servers of the buffer's language), with the
+  `loading` codicon spinning while one reports progress. Its menu lists the
+  servers, with the progress title when busy, and Restart / Stop Language
+  Servers. VS Code fills its hover from extension status items, so the content
+  differs. Server health and failed starts aren't shown (the LSP store doesn't
+  keep them); Zed's own language server button still has them.
+- Zed's git blame item moves from the left side to the right side, left of
+  the cursor position. It only has text with
+  `git.inline_blame.location: "status_bar"`, which also removes the inline
+  blame, so the preset leaves the location alone.
 - The bell is added with `StatusBar::add_rightmost_item`, so it is the last
   item even when the right and bottom dock buttons are shown.
 - The threads sidebar toggle, which the status bar draws before every left item
@@ -133,6 +173,40 @@ Defaults come from `unwrap_or_default()` in `WorkbenchSettings::from_settings`, 
 - Zed has no notification center. The bell shows `bell-dot` while notifications
   are shown and clears them all on click (`Workspace::clear_all_notifications`).
 
+## Minimap
+
+VS Code (`EditorLayoutInfoComputer._computeMinimapLayout` in
+`src/vs/editor/common/config/editorOptions.ts`, defaults `size:
+"proportional"`, `scale: 1`, `maxColumn: 120`, `renderCharacters: true`):
+
+- Device pixel scale `minimapScale = round(scale * 2)` at pixel ratio 2 and
+  `max(scale, floor(scale * pixelRatio + 0.125))` below it. Line height is
+  `2 * minimapScale` device pixels and a character `minimapScale / pixelRatio`
+  CSS pixels wide, so 2px by 1px at scale 1 on any display.
+- `minimapWidth = min(floor(maxColumn * charWidth), floor((remainingWidth -
+  verticalScrollbarWidth - 2) * charWidth / (typicalHalfwidthCharacterWidth +
+  charWidth))) + 8`. The minimap shows as many columns as the editor viewport
+  (about 12% of the width for 12px Menlo) up to 120 columns plus an 8px gutter.
+- The slider is the viewport's lines times the minimap line height.
+
+Zed (`get_minimap_width` / `layout_minimap` in `crates/editor/src/element.rs`):
+
+- The minimap editor uses a 2px `.ZedMono` font (`MINIMAP_FONT_SIZE`), about
+  1.2px per column. Its line height is the buffer line height ratio applied to
+  2px and rounded, so 3px for both `comfortable` (1.618) and `standard` (1.3).
+- `minimap_width = min(text_width * 0.15, 1.2px * max_width_columns)`, hidden
+  below 20 columns. Proportional like VS Code, but the default cap of 80
+  columns (96px) is reached by editors wider than about 640px, so the minimap
+  barely shrinks in a split.
+- The thumb is the visible editor lines times the minimap line height, so it
+  was 1.5 times VS Code's slider (3px against 2px lines).
+
+The preset uses `max_width_columns: 120` and the new `minimap.line_height:
+{ "custom": 1.0 }` (2px lines). What remains different: Zed's columns are
+1.2px instead of 1px (the minimap is up to 144px wide instead of 128px), its
+width ratio is a fixed 15% instead of depending on the editor font, and it has
+no 8px gutter. Matching those would need a minimap font size or scale setting.
+
 ## Codicons
 
 `assets/icons/codicons/*.svg` are unmodified icons from
@@ -144,7 +218,9 @@ listed in the `Codicon` enum (`crates/vscode_workbench/src/vscode_workbench.rs`)
 are bundled; a test fails if the enum and the directory disagree. They are drawn
 with `Icon::from_path`, except in the activity bar, which draws the same SVGs
 with `svg()` to tint them on hover. All of them use `fill="currentColor"`, so Zed
-renders them monochrome in the requested color.
+renders them monochrome in the requested color. `json.svg` is the icon VS Code
+names `bracket` (an alias in the codicons mapping), used for the language
+status item.
 
 `script/generate-licenses` only collects `assets/icons/LICENSES`, so the codicons
 license isn't in the generated licenses file yet.
