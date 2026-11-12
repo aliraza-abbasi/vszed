@@ -9,17 +9,20 @@ mod claude_code_edit_diff;
 mod claude_code_permission_card;
 #[path = "prompt_box.rs"]
 mod claude_code_prompt_box;
+#[path = "question_card.rs"]
+mod claude_code_question_card;
 
 use super::*;
 use crate::ui_styles::claude_code::{
-    AgentSummary, ClaudeCodeSpinnerElement, FileLink, StatusDot, StepStatus, TIMELINE_GUTTER,
-    TimelineDot, ToolOutputTab, ToolRow, agent_summaries, attachment_name, display_file_name,
-    edit_line_stats, edit_summary, file_tool_input, format_day, format_timestamp,
-    is_long_tool_text, read_range_suffix, remove_output_tab, reported_claude_code_tool,
-    sent_message_text, set_output_tab, set_user_message_overflows, summarize_tool_call,
-    thought_has_summary, thought_label, thread_activity, timeline_row, toggle_thoughts_expanded,
-    toggle_user_message_expanded, tool_output_text, tool_output_title, transcript_markdown_style,
-    ui_font_text_style, write_summary,
+    ASK_USER_QUESTION_TOOL, AgentSummary, ClaudeCodeSpinnerElement, FileLink, StatusDot,
+    StepStatus, TIMELINE_GUTTER, TimelineDot, ToolOutputTab, ToolRow, agent_summaries,
+    ask_user_question_form, attachment_name, display_file_name, edit_line_stats, edit_summary,
+    file_tool_input, format_day, format_timestamp, is_long_tool_text, read_range_suffix,
+    remove_output_tab, reported_claude_code_tool, sent_message_text, set_output_tab,
+    set_user_message_overflows, summarize_tool_call, thought_has_summary, thought_label,
+    thread_activity, timeline_row, toggle_thoughts_expanded, toggle_user_message_expanded,
+    tool_output_text, tool_output_title, transcript_markdown_style, ui_font_text_style,
+    write_summary,
 };
 use chrono::Local;
 use claude_code_permission_card::claude_code_card_handles;
@@ -186,6 +189,12 @@ impl ThreadView {
             AgentThreadEntry::Elicitation(elicitation_id) => {
                 let thread = self.thread.read(cx);
                 match thread.elicitation(elicitation_id) {
+                    // The question card in the prompt box's place asks these.
+                    Some((_, elicitation))
+                        if ask_user_question_form(&elicitation.request).is_some() =>
+                    {
+                        Empty.into_any()
+                    }
                     Some((_, elicitation)) if should_render_elicitation(elicitation) => self
                         .render_elicitation(entry_ix, elicitation, window, cx)
                         .when_some(entry_focus_handle, |this, handle| this.track_focus(&handle))
@@ -359,9 +368,21 @@ impl ThreadView {
         )
     }
 
-    /// A canceled tool call that never produced output only adds noise.
+    /// A canceled tool call that never produced output only adds noise. A
+    /// question that was interrupted still lists its questions.
     fn claude_code_tool_call_is_hidden(tool_call: &ToolCall, cx: &App) -> bool {
         if !matches!(tool_call.status(), ToolCallStatus::Canceled) {
+            return false;
+        }
+        if reported_claude_code_tool(tool_call)
+            .is_some_and(|tool| tool.as_ref() == ASK_USER_QUESTION_TOOL)
+            && tool_call
+                .raw_input
+                .as_ref()
+                .and_then(|input| input.get("questions"))
+                .and_then(|questions| questions.as_array())
+                .is_some_and(|questions| !questions.is_empty())
+        {
             return false;
         }
         !tool_call.content().iter().any(|content| match content {
@@ -1005,6 +1026,10 @@ impl ThreadView {
                 window,
                 cx,
             );
+        }
+
+        if let Some(row) = self.render_claude_code_question_row(entry_ix, tool_call, cx) {
+            return row;
         }
 
         let label = tool_call.label.read(cx).source().to_string();
@@ -2811,5 +2836,539 @@ mod tests {
         connection.end_turn(session_id, acp_v1::StopReason::EndTurn);
         cx.run_until_parked();
         assert!(cx.debug_bounds("claude-code-spinner").is_none());
+    }
+
+    /// An AskUserQuestion tool call as claude-agent-acp 0.106.0 reports it over
+    /// ACP v1 once its input has streamed: the questions as display text.
+    fn ask_user_question_call(
+        id: &str,
+        questions: &serde_json::Value,
+        status: acp_v1::ToolCallStatus,
+    ) -> acp_v1::ToolCall {
+        let display = questions
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|question| question.get("question")?.as_str())
+            .map(|question| question.into())
+            .collect::<Vec<_>>();
+        acp_v1::ToolCall::new(id.to_string(), "Asking for your input")
+            .kind(acp_v1::ToolKind::Other)
+            .status(status)
+            .raw_input(json!({ "questions": questions }))
+            .content(display)
+            .meta(acp_v2::Meta::from_iter([(
+                "claudeCode".into(),
+                json!({ "toolName": "AskUserQuestion" }),
+            )]))
+    }
+
+    /// The elicitation claude-agent-acp 0.106.0 builds for these questions
+    /// (`askUserQuestionsToCreateRequest`).
+    fn ask_user_question_request(
+        session_id: &acp_v2::SessionId,
+        tool_call_id: &str,
+        questions: &serde_json::Value,
+    ) -> acp_v2::CreateElicitationRequest {
+        let questions = questions.as_array().cloned().unwrap_or_default();
+        let single = questions.len() == 1;
+        let mut properties = serde_json::Map::new();
+        for (index, question) in questions.iter().enumerate() {
+            let options = question["options"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|option| {
+                    let mut enum_option = json!({
+                        "const": option["label"],
+                        "title": option["label"],
+                    });
+                    if let Some(description) = option.get("description") {
+                        enum_option["description"] = description.clone();
+                    }
+                    if let Some(preview) = option.get("preview") {
+                        enum_option["_meta"] =
+                            json!({ "_claude/askUserQuestionOption": { "preview": preview } });
+                    }
+                    enum_option
+                })
+                .collect::<Vec<_>>();
+            let mut field = if question["multiSelect"].as_bool() == Some(true) {
+                json!({ "type": "array", "items": { "anyOf": options } })
+            } else {
+                json!({ "type": "string", "oneOf": options })
+            };
+            field["title"] = question["header"].clone();
+            if !single {
+                field["description"] = question["question"].clone();
+            }
+            properties.insert(format!("question_{index}"), field);
+            properties.insert(
+                format!("question_{index}_custom"),
+                json!({
+                    "type": "string",
+                    "title": "Other",
+                    "description": "Type your own answer, or add a note to the option you chose above (optional).",
+                }),
+            );
+        }
+        let message = if single {
+            questions[0]["question"].clone()
+        } else {
+            json!("Please answer the following questions.")
+        };
+        serde_json::from_value(json!({
+            "mode": "form",
+            "sessionId": session_id.0.to_string(),
+            "toolCallId": tool_call_id,
+            "message": message,
+            "requestedSchema": { "type": "object", "properties": properties },
+        }))
+        .expect("AskUserQuestion elicitation")
+    }
+
+    fn dock_and_features_questions() -> serde_json::Value {
+        json!([
+            {
+                "question": "Which panel should the agent dock into?",
+                "header": "Dock target",
+                "multiSelect": false,
+                "options": [
+                    { "label": "Right sidebar", "description": "Next to the editor." },
+                    { "label": "Bottom panel", "description": "Shares space with the terminal." }
+                ]
+            },
+            {
+                "question": "Which features do you want?",
+                "header": "Features",
+                "multiSelect": true,
+                "options": [
+                    { "label": "Inline diffs" },
+                    { "label": "Tool call rows" },
+                    { "label": "Codicon icons" }
+                ]
+            }
+        ])
+    }
+
+    /// Starts a turn that stays open, as a real one does while Claude asks.
+    async fn start_open_turn(
+        thread_view: &Entity<ThreadView>,
+        cx: &mut VisualTestContext,
+    ) -> acp_v2::SessionId {
+        let message_editor = thread_view.read_with(cx, |view, _| view.message_editor.clone());
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("Ask me some questions", window, cx);
+        });
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+        thread_view.read_with(cx, |view, cx| view.thread.read(cx).session_id().clone())
+    }
+
+    /// Adds the tool call and asks its questions, as claude-agent-acp does, and
+    /// returns the pending answer.
+    fn ask_questions(
+        thread_view: &Entity<ThreadView>,
+        connection: &StubAgentConnection,
+        session_id: &acp_v2::SessionId,
+        tool_call_id: &str,
+        questions: &serde_json::Value,
+        cx: &mut VisualTestContext,
+    ) -> Task<acp_v2::CreateElicitationResponse> {
+        cx.update(|_window, cx| {
+            connection.send_update(
+                session_id.clone(),
+                acp_v1::SessionUpdate::ToolCall(ask_user_question_call(
+                    tool_call_id,
+                    questions,
+                    acp_v1::ToolCallStatus::Pending,
+                )),
+                cx,
+            );
+        });
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let request = ask_user_question_request(session_id, tool_call_id, questions);
+        let response = thread.update(cx, |thread, cx| {
+            thread
+                .request_elicitation(request, cx)
+                .expect("the elicitation is valid")
+        });
+        cx.run_until_parked();
+        response
+    }
+
+    fn accepted_content(response: acp_v2::CreateElicitationResponse) -> serde_json::Value {
+        match response.action {
+            acp_v2::ElicitationAction::Accept(accept) => {
+                serde_json::to_value(accept.content).expect("content serializes")
+            }
+            other => panic!("expected the answers to be accepted, got {other:?}"),
+        }
+    }
+
+    /// The tool result claude-agent-acp reports once the CLI has the answers.
+    fn finish_question_call(
+        connection: &StubAgentConnection,
+        session_id: &acp_v2::SessionId,
+        tool_call_id: &str,
+        status: acp_v1::ToolCallStatus,
+        result: &str,
+        cx: &mut VisualTestContext,
+    ) {
+        cx.update(|_window, cx| {
+            connection.send_update(
+                session_id.clone(),
+                acp_v1::SessionUpdate::ToolCallUpdate(acp_v1::ToolCallUpdate::new(
+                    tool_call_id.to_string(),
+                    acp_v1::ToolCallUpdateFields::new()
+                        .status(status)
+                        .content(vec![result.into()])
+                        .raw_output(json!(result)),
+                )),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+    }
+
+    fn question_card(
+        thread_view: &Entity<ThreadView>,
+        cx: &mut VisualTestContext,
+    ) -> Option<(usize, usize, Vec<Vec<usize>>)> {
+        let thread_view_id = thread_view.entity_id();
+        cx.update(|_window, cx| {
+            crate::ui_styles::claude_code::question_card_state(thread_view_id, cx).map(|card| {
+                (
+                    card.active_question,
+                    card.highlighted_row,
+                    card.selections.clone(),
+                )
+            })
+        })
+    }
+
+    #[gpui::test]
+    async fn test_claude_code_question_card_keys(cx: &mut TestAppContext) {
+        let connection = StubAgentConnection::new();
+        let (thread_view, cx) = setup_thread_view(connection.clone(), cx).await;
+        set_ui_style("claude_code", cx);
+        bind_permission_keys(cx);
+        let session_id = start_open_turn(&thread_view, cx).await;
+        focus_message_editor(&thread_view, cx);
+
+        let questions = dock_and_features_questions();
+        let response = ask_questions(
+            &thread_view,
+            &connection,
+            &session_id,
+            "toolu_ask",
+            &questions,
+            cx,
+        );
+        assert!(cx.debug_bounds("claude-code-question-card").is_some());
+        assert!(
+            cx.debug_bounds("claude-code-prompt-box").is_none(),
+            "the card takes the prompt box's place"
+        );
+        assert!(
+            permission_card_is_focused(&thread_view, cx),
+            "focus moves from the prompt to the card"
+        );
+        assert!(cx.debug_bounds("claude-code-question-tab-1").is_some());
+        assert!(
+            cx.debug_bounds("claude-code-question-option-2").is_some(),
+            "Other follows the options"
+        );
+        assert!(cx.debug_bounds("claude-code-question-option-3").is_none());
+        assert!(
+            cx.debug_bounds("claude-code-tool-1-output").is_none(),
+            "the timeline shows the Questions row without the questions as OUT"
+        );
+
+        // A single choice moves on to the next question after a moment.
+        cx.simulate_keystrokes("down space");
+        assert_eq!(
+            question_card(&thread_view, cx),
+            Some((0, 1, vec![vec![1], vec![]]))
+        );
+        cx.executor().advance_clock(Duration::from_millis(300));
+        cx.run_until_parked();
+        assert_eq!(question_card(&thread_view, cx).map(|card| card.0), Some(1));
+
+        // Left and Right switch questions.
+        cx.simulate_keystrokes("left");
+        assert_eq!(question_card(&thread_view, cx).map(|card| card.0), Some(0));
+        cx.simulate_keystrokes("right");
+        assert_eq!(question_card(&thread_view, cx).map(|card| card.0), Some(1));
+
+        // Several choices toggle; `1` only submits once every question is answered.
+        cx.simulate_keystrokes("1");
+        assert!(cx.debug_bounds("claude-code-question-card").is_some());
+        cx.simulate_keystrokes("down space up space down down space space");
+        assert_eq!(
+            question_card(&thread_view, cx).map(|card| card.2),
+            Some(vec![vec![1], vec![1, 0]]),
+            "Codicon icons was chosen, then unchosen"
+        );
+        cx.simulate_keystrokes("1");
+        assert_eq!(
+            accepted_content(response.await),
+            json!({
+                "question_0": "Bottom panel",
+                "question_1": ["Tool call rows", "Inline diffs"],
+            })
+        );
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("claude-code-question-card").is_none());
+        assert!(cx.debug_bounds("claude-code-prompt-box").is_some());
+        let editor_focused = thread_view.update_in(cx, |view, window, cx| {
+            view.message_editor.focus_handle(cx).is_focused(window)
+        });
+        assert!(editor_focused, "focus returns to the prompt once answered");
+
+        finish_question_call(
+            &connection,
+            &session_id,
+            "toolu_ask",
+            acp_v1::ToolCallStatus::Completed,
+            "Your questions have been answered: \"Which panel should the agent dock into?\"=\"Bottom panel\", \"Which features do you want?\"=\"Tool call rows, Inline diffs\". You can now continue with these answers in mind.",
+            cx,
+        );
+        assert!(cx.debug_bounds("claude-code-question-status-1").is_some());
+        assert!(
+            cx.debug_bounds("claude-code-question-answer-1-0-1")
+                .is_some()
+        );
+        assert!(
+            cx.debug_bounds("claude-code-question-answer-1-0-0")
+                .is_none()
+        );
+        assert!(
+            cx.debug_bounds("claude-code-question-answer-1-1-0")
+                .is_some()
+        );
+        assert!(
+            cx.debug_bounds("claude-code-question-answer-1-1-1")
+                .is_some()
+        );
+        assert!(
+            cx.debug_bounds("claude-code-question-answer-1-1-2")
+                .is_none()
+        );
+        assert!(
+            cx.debug_bounds("claude-code-question-interrupted-1")
+                .is_none()
+        );
+        assert!(cx.debug_bounds("claude-code-tool-1-output").is_none());
+
+        // The status line hides and shows the questions.
+        let status = cx
+            .debug_bounds("claude-code-question-status-1")
+            .expect("the status line");
+        cx.simulate_click(status.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("claude-code-question-answer-1-0-1")
+                .is_none()
+        );
+    }
+
+    #[gpui::test]
+    async fn test_claude_code_question_card_other_and_enter(cx: &mut TestAppContext) {
+        let connection = StubAgentConnection::new();
+        let (thread_view, cx) = setup_thread_view(connection.clone(), cx).await;
+        set_ui_style("claude_code", cx);
+        bind_permission_keys(cx);
+        let session_id = start_open_turn(&thread_view, cx).await;
+        focus_message_editor(&thread_view, cx);
+
+        let questions = json!([{
+            "question": "Which database?",
+            "header": "Database",
+            "multiSelect": false,
+            "options": [
+                { "label": "Postgres", "description": "Relational", "preview": "CREATE TABLE t ();" },
+                { "label": "Redis", "description": "Key-value" }
+            ]
+        }]);
+        let response = ask_questions(
+            &thread_view,
+            &connection,
+            &session_id,
+            "toolu_db",
+            &questions,
+            cx,
+        );
+        assert!(
+            cx.debug_bounds("claude-code-question-preview").is_some(),
+            "an option with a preview shows the preview pane"
+        );
+
+        // Enter chooses the highlighted row until every question is answered;
+        // "Other" opens its text field.
+        cx.simulate_keystrokes("up enter");
+        let other_editor = thread_view
+            .read_with(cx, |_, cx| {
+                crate::ui_styles::claude_code::question_card_state(thread_view.entity_id(), cx)
+                    .and_then(|card| card.other_editors.first().cloned().flatten())
+            })
+            .expect("choosing Other opens its field");
+        let other_focused =
+            cx.update(|window, cx| other_editor.focus_handle(cx).is_focused(window));
+        assert!(other_focused, "the Other field takes focus");
+        cx.simulate_keystrokes("1");
+        cx.simulate_input(" SQLite");
+        assert_eq!(
+            other_editor.read_with(cx, |editor, cx| editor.text(cx)),
+            "1 SQLite",
+            "keys typed into the field stay there"
+        );
+        // Enter leaves the field of the last question; Enter again submits.
+        cx.simulate_keystrokes("enter");
+        assert!(permission_card_is_focused(&thread_view, cx));
+        cx.simulate_keystrokes("enter");
+        assert_eq!(
+            accepted_content(response.await),
+            json!({ "question_0_custom": "1 SQLite" })
+        );
+        cx.run_until_parked();
+
+        finish_question_call(
+            &connection,
+            &session_id,
+            "toolu_db",
+            acp_v1::ToolCallStatus::Completed,
+            "The user answered: \"Which database?\"=\"1 SQLite\". Read the answers carefully \u{2014} they may request clarification, changes, or that you not proceed \u{2014} and follow what they actually say.",
+            cx,
+        );
+        assert!(cx.debug_bounds("claude-code-question-status-1").is_some());
+        assert!(cx.debug_bounds("claude-code-question-other-1-0").is_some());
+        assert!(cx.debug_bounds("claude-code-question-typed-1-0").is_some());
+        assert!(
+            cx.debug_bounds("claude-code-question-answer-1-0-0")
+                .is_none()
+        );
+        assert!(
+            cx.debug_bounds("claude-code-question-answer-1-0-1")
+                .is_none()
+        );
+    }
+
+    #[gpui::test]
+    async fn test_claude_code_question_card_cancel(cx: &mut TestAppContext) {
+        let connection = StubAgentConnection::new();
+        let (thread_view, cx) = setup_thread_view(connection.clone(), cx).await;
+        set_ui_style("claude_code", cx);
+        bind_permission_keys(cx);
+        let session_id = start_open_turn(&thread_view, cx).await;
+        focus_message_editor(&thread_view, cx);
+
+        let questions = dock_and_features_questions();
+        let response = ask_questions(
+            &thread_view,
+            &connection,
+            &session_id,
+            "toolu_ask",
+            &questions,
+            cx,
+        );
+        assert!(permission_card_is_focused(&thread_view, cx));
+        cx.simulate_keystrokes("escape");
+        assert!(matches!(
+            response.await.action,
+            acp_v2::ElicitationAction::Cancel
+        ));
+        cx.run_until_parked();
+        assert_eq!(
+            connection.take_cancel_calls(),
+            vec![session_id],
+            "Esc interrupts the turn, as the extension's does"
+        );
+        assert!(cx.debug_bounds("claude-code-question-card").is_none());
+        assert!(cx.debug_bounds("claude-code-prompt-box").is_some());
+        assert!(cx.debug_bounds("claude-code-question-status-1").is_some());
+        assert!(
+            cx.debug_bounds("claude-code-question-interrupted-1")
+                .is_some()
+        );
+        assert!(
+            cx.debug_bounds("claude-code-question-answer-1-0-0")
+                .is_none()
+        );
+        assert!(cx.debug_bounds("claude-code-tool-1-output").is_none());
+    }
+
+    #[gpui::test]
+    async fn test_claude_code_question_rows_from_results(cx: &mut TestAppContext) {
+        let questions = dock_and_features_questions();
+        let result_update = |id: &str, status, result: &str| {
+            acp_v1::SessionUpdate::ToolCallUpdate(acp_v1::ToolCallUpdate::new(
+                id.to_string(),
+                acp_v1::ToolCallUpdateFields::new()
+                    .status(status)
+                    .content(vec![format!("```\n{result}\n```").into()])
+                    .raw_output(json!(result)),
+            ))
+        };
+        let pending = acp_v1::ToolCallStatus::Pending;
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![
+            acp_v1::SessionUpdate::ToolCall(ask_user_question_call("answered", &questions, pending)),
+            result_update(
+                "answered",
+                acp_v1::ToolCallStatus::Completed,
+                "Your questions have been answered: \"Which features do you want?\"=\"Codicon icons\". You can now continue with these answers in mind.",
+            ),
+            acp_v1::SessionUpdate::ToolCall(ask_user_question_call("aborted", &questions, pending)),
+            result_update(
+                "aborted",
+                acp_v1::ToolCallStatus::Failed,
+                "Tool permission request failed: Error: Tool use aborted",
+            ),
+            acp_v1::SessionUpdate::ToolCall(ask_user_question_call("skipped", &questions, pending)),
+            result_update(
+                "skipped",
+                acp_v1::ToolCallStatus::Completed,
+                "The user did not answer the questions.",
+            ),
+        ]);
+        let (thread_view, cx) = setup_thread_view(connection, cx).await;
+        set_ui_style("claude_code", cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Ask", cx))
+            .await
+            .expect("prompt should succeed");
+        cx.run_until_parked();
+
+        // A partial answer marks only the answered question's choice.
+        assert!(cx.debug_bounds("claude-code-question-status-1").is_some());
+        assert!(
+            cx.debug_bounds("claude-code-question-answer-1-1-2")
+                .is_some()
+        );
+        assert!(
+            cx.debug_bounds("claude-code-question-answer-1-0-0")
+                .is_none()
+        );
+        assert!(
+            cx.debug_bounds("claude-code-question-interrupted-1")
+                .is_none()
+        );
+
+        // An aborted question reads "Tool interrupted", not the raw error.
+        assert!(cx.debug_bounds("claude-code-question-status-2").is_some());
+        assert!(
+            cx.debug_bounds("claude-code-question-interrupted-2")
+                .is_some()
+        );
+        assert!(cx.debug_bounds("claude-code-tool-2-output").is_none());
+
+        assert!(cx.debug_bounds("claude-code-question-status-3").is_some());
+        assert!(
+            cx.debug_bounds("claude-code-question-interrupted-3")
+                .is_none()
+        );
+        assert!(cx.debug_bounds("claude-code-tool-3-output").is_none());
     }
 }

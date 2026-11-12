@@ -1,11 +1,20 @@
 mod agent_map;
 mod model_picker;
+mod questions;
 pub(crate) mod sessions_panel;
 mod tool_row;
 pub(crate) mod usage;
 
 pub(crate) use agent_map::open_agent_map;
 pub(crate) use model_picker::{ClaudeCodeModelPicker, ConfigOptionsHandle};
+pub(crate) use questions::{
+    ASK_USER_QUESTION_TOOL, CANCEL_HINT, NO_PREVIEW_LABEL, OTHER_LABEL, OTHER_PLACEHOLDER,
+    Question, QuestionCardState, QuestionForm, QuestionOutcome, QuestionStatus, RowChoice,
+    SUBMIT_LABEL, TOOL_INTERRUPTED_LABEL, ask_user_question_form, question_card_state,
+    question_card_state_mut, question_outcome, question_result_text, question_row_collapsed,
+    question_row_state, questions_from_input, response_content, review_answer,
+    set_question_outcome, sync_question_card, toggle_question_row,
+};
 pub(crate) use tool_row::{FileLink, ToolRow};
 
 use std::cell::Cell;
@@ -235,6 +244,12 @@ pub(crate) struct ThreadActivity {
     /// The highlighted option of the permission card, for the request it was
     /// chosen on.
     permission_selection: Option<(PermissionRequestId, usize)>,
+    /// The question card, while an AskUserQuestion elicitation is pending.
+    question_card: Option<QuestionCardState>,
+    /// What the user answered or declined in the question card, by tool call id.
+    question_outcomes: HashMap<acp_v2::ToolCallId, QuestionOutcome>,
+    /// AskUserQuestion rows whose questions were hidden with their status line.
+    collapsed_question_rows: HashSet<acp_v2::ToolCallId>,
     /// claude-agent-acp's tasks from raw SDK messages (ACP v1), in start order.
     sdk_tasks: Vec<SdkTask>,
     /// When each ACP v2 subagent session was announced and last showed activity.

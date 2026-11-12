@@ -42,8 +42,9 @@ impl ThreadView {
         self.sync_claude_code_placeholder(window, cx);
         self.sync_claude_code_editor_mode(cx);
 
-        // Like Claude Code, a pending permission prompt replaces the prompt box.
-        // Focus follows it: the card while it is up, the editor once it's answered.
+        // Like Claude Code, a pending permission prompt or question replaces the
+        // prompt box. Focus follows it: the card while it is up, the editor once
+        // it's answered.
         let permission_focus = thread_activity(cx.entity_id(), cx)
             .and_then(|activity| activity.permission_focus())
             .cloned();
@@ -62,6 +63,17 @@ impl ThreadView {
                     cx,
                 );
             }
+            // AskUserQuestion's card takes the same place, and the same focus.
+            if let Some(form) = self.claude_code_question_form(cx) {
+                if self.message_editor.focus_handle(cx).is_focused(window) {
+                    let permission_focus = permission_focus.clone();
+                    cx.defer_in(window, move |_, window, cx| {
+                        window.focus(&permission_focus, cx);
+                    });
+                }
+                return self.render_claude_code_question_card(form, &permission_focus, window, cx);
+            }
+            self.close_claude_code_question_card(window, cx);
             if permission_focus.is_focused(window) {
                 let editor_focus = self.message_editor.focus_handle(cx);
                 cx.defer_in(window, move |_, window, cx| {
