@@ -6344,6 +6344,7 @@ mod tests {
                 "vim",
                 "which_key",
                 "window",
+                "workbench",
                 "workspace",
                 "worktree_picker",
                 "zed",
