@@ -29,10 +29,10 @@ const TRANSCRIPT_FADE_HEIGHT: Pixels = px(150.);
 const MAX_INPUT_LINES: usize = 9;
 
 impl ThreadView {
-    /// The Claude Code prompt box: a rounded, bordered box at the bottom of the
-    /// chat column with the message editor on top and a footer of `+`, `/`, the
-    /// model chip and the context indicator on the left, and the mode chip and
-    /// the send/stop button on the right.
+    /// The Claude Code prompt box: a rounded, bordered box with the message editor on
+    /// top and a footer of `+`, `/`, the prompt cache clock, the agents pill, the model
+    /// pill and the context indicator on the left, and the mode chip and the send/stop
+    /// button on the right.
     pub(in crate::conversation_view::thread_view) fn render_claude_code_message_editor(
         &mut self,
         window: &mut Window,
@@ -259,8 +259,9 @@ impl ThreadView {
         let prompt_box =
             (!self.is_subagent()).then(|| self.render_claude_code_message_editor(window, cx));
         let editor_background = cx.theme().colors().editor_background;
+        let thread_view_id = cx.entity_id();
         let floating_height =
-            thread_activity(cx.entity_id(), cx).map(|activity| activity.floating_prompt_height());
+            thread_activity(thread_view_id, cx).map(|activity| activity.floating_prompt_height());
 
         let floating = h_flex()
             .absolute()
@@ -283,11 +284,13 @@ impl ThreadView {
             .when_some(floating_height, |this, floating_height| {
                 this.child(
                     canvas(
-                        move |bounds, window, _| {
+                        move |bounds, _, cx| {
                             let height = bounds.size.height;
                             if floating_height.get() != height {
                                 floating_height.set(height);
-                                window.refresh();
+                                // Re-render with the new list padding once this frame is
+                                // drawn; views can't be invalidated while drawing.
+                                cx.defer(move |cx| cx.notify(thread_view_id));
                             }
                         },
                         |_, _, _, _| {},
