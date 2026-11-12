@@ -713,26 +713,9 @@ impl Render for ClaudeCodeSessionsPanel {
             .track_focus(&self.focus_handle)
             .size_full()
             .bg(cx.theme().colors().panel_background)
+            // No title row of its own: a dock header, when there is one, already names the panel.
             .child(
-                h_flex()
-                    .h(px(35.))
-                    .flex_none()
-                    .px_3()
-                    .justify_between()
-                    .child(
-                        Label::new("CLAUDE CODE")
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    )
-                    .child(
-                        IconButton::new("refresh-claude-sessions", IconName::RotateCw)
-                            .icon_size(IconSize::Small)
-                            .tooltip(Tooltip::text("Refresh"))
-                            .on_click(cx.listener(|this, _, window, cx| this.refresh(window, cx))),
-                    ),
-            )
-            .child(
-                div().px_2().pb_1().child(
+                div().px_2().pt_2().pb_1().child(
                     Button::new("new-claude-session", "New session")
                         .start_icon(Icon::new(IconName::Plus).size(IconSize::Small))
                         .full_width()
@@ -741,15 +724,28 @@ impl Render for ClaudeCodeSessionsPanel {
                 ),
             )
             .child(
-                div()
+                h_flex()
                     .mx_2()
                     .mb_1()
-                    .px_2()
-                    .py_1()
-                    .rounded_sm()
-                    .border_1()
-                    .border_color(cx.theme().colors().border)
-                    .child(self.search_editor.clone()),
+                    .gap_1()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .px_2()
+                            .py_1()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(cx.theme().colors().border)
+                            .child(self.search_editor.clone()),
+                    )
+                    .child(
+                        IconButton::new("refresh-claude-sessions", IconName::RotateCw)
+                            .icon_size(IconSize::Small)
+                            .icon_color(Color::Muted)
+                            .tooltip(Tooltip::text("Refresh"))
+                            .on_click(cx.listener(|this, _, window, cx| this.refresh(window, cx))),
+                    ),
             )
             .child(
                 v_flex()
