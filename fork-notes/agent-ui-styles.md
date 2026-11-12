@@ -18,6 +18,10 @@ upstream files. Use this list when resolving rebase conflicts and when folding i
 | `crates/agent_ui/src/agent_panel.rs` (imports, `NewThread` handler ~366, `open_thread` ~1680, `new_thread` ~1770, `load_agent_thread` ~4530) | route thread opens to editor tabs when `agent.thread_location` is `editor` (`ui_styles::thread_item::route_to_thread_tab`); `load_agent_thread` only routes user-initiated opens (`focus`), so the panel's startup restore stays in the panel | +20 |
 | `assets/keymaps/default-{macos,linux,windows}.json` (end) | `Workspace` block: `cmd-escape` / `ctrl-escape` → `agent::ToggleThreadTabFocus`, `cmd-shift-escape` / `ctrl-shift-escape` → `agent::NewThreadTab`. Both actions call `cx.propagate()` unless thread tabs or the Claude Code style are on, so the stock `menu::Cancel` binding still gets the keystroke | +10 each |
 | `crates/acp_thread/src/acp_thread.rs` (`usage_meta` field, `update_usage` ~6299, `usage_meta()` getter ~4989) | generic hook, no Claude parsing: keeps the latest value of each `_meta` key from `usage_update` (ACP v1 and v2), merged per key because claude-agent-acp sends `_claude/rateLimit` only when it changes but `_claude/model` on every update. Read by the Account & usage section. Own commit (`feat(acp_thread): keep the latest usage update _meta on the thread`); upstream candidate | +15 (+58 test) |
+| `crates/agent_ui/src/conversation_view/thread_view.rs` (`render_activity_bar` ~4011, `render_message_editor` ~5575, `ThreadView::render` ~14343) | floating prompt box: in the Claude Code style `render_activity_bar` returns `None` and `render_message_editor` returns `Empty` (after the subagent case), and `render` passes the conversation through `render_ui_style_conversation` (`prompt_box.rs`), which lays the transcript over the whole area and floats the activity bar and prompt box over its bottom; Zed's style gets the conversation back unchanged | 5 changed |
+| `crates/agent_servers/src/acp.rs` (after `ClientContext`) | `AgentExtNotification` and the global `AgentExtNotifications` entity, which rebroadcasts agents' `_`-prefixed extension notifications | +29 |
+| `crates/agent_servers/src/acp/v1.rs` (`client_builder`, `new_session`, `load_session`, `resume_session`, tests) | an untyped notification handler (last in the chain, `Handled::No` for non-`_` methods) that forwards extension notifications to `AgentExtNotifications`; `claude_session_meta` adds `_meta.claudeCode.emitRawSDKMessages` (task lifecycle + `result`) to new, load and resume requests of `claude-acp` sessions | +100 |
+| `crates/agent_servers/src/agent_servers.rs` | re-export `AgentExtNotification`, `AgentExtNotifications` | 2 changed |
 | `crates/acp_thread/src/terminal.rs` (display terminals) | bug fix, not a style hook: agent display terminal output with bare LF line endings (claude-agent-acp over ACP v2) gets CRLF before it reaches the emulator, so lines no longer "staircase". Upstream candidate on its own | +45 |
 | `crates/agent_servers/src/acp/v1.rs` (test `v2_terminal_sdk_snapshots_chunks_and_metadata`, ~4852) | test expectation follows the line-ending fix above: the snapshot's last chunk `"\nZ"` now reads `"new\n¢\nZ"` instead of `"new\n¢\n Z"`. Own commit (`test(agent_servers): expect normalized line endings in the display terminal snapshot`); goes with the terminal fix if that is upstreamed | 2 changed, +1 comment |
 
@@ -70,3 +74,27 @@ Notes:
 - Timeline state in `ThreadActivity` (`ui_styles/claude_code.rs`), all keyed by entry index and shifted on `EntriesRemoved`: thought timings (a thought ends when the next step arrives), one open/closed flag for every thought summary of the thread (the extension toggles them all at once), the wall-clock time each user message and each run of assistant text first appeared (for the timestamps and date lines), and which long user messages overflow their 60px box (measured with `on_children_prepainted`) or were expanded with "Show more". Tool output tabs (`ToolOutputTab`: weak editor and buffer plus the thread and terminal subscriptions that stream into it) are kept there by tool call id.
 - Tool output tabs: a read-only buffer with no file, titled "<Tool> tool output" (the extension's title), added to the pane right of the active pane, or to a new split there. It follows the output (appends when the old text is a prefix, else replaces) on the tool call's `EntryUpdated` and on its terminals' notifications; display terminals grow without touching the entry.
 - Transcript text size: assistant markdown, thought summaries and compaction summaries use `transcript_markdown_style`, the agent markdown style scaled by 14/16 (the size Zed's labels reach), so the transcript matches VS Code's 13px workbench text when `ui_font_size` is 15. The prompt branch scales `ui_font_text_style` (prompt and sent messages) the same way.
+- Floating prompt box: `render_ui_style_conversation` (`prompt_box.rs`) overlays a 150px fade
+  (transparent to the editor background, full width) and the activity bar plus prompt box
+  (centered, at most 680px, opaque) on the transcript. The overlay's height is measured with a
+  `canvas` into `ThreadActivity::floating_prompt_height` and used as the transcript list's bottom
+  padding (`render_claude_code_entries`), so the last entry scrolls clear of the box. The prompt
+  editor is switched to `AutoHeight { min_lines: 1, max_lines: 9 }` while the style is on, and
+  `ThreadView::sync_editor_mode` restores Zed's mode when it is switched off.
+- Model picker (`ui_styles/claude_code/model_picker.rs`): its own view, opened above the prompt
+  box (kept in `ThreadActivity::model_picker` as an `AnyView`), not a `PopoverMenu`, so it can
+  take the box's width like the extension's. `ConfigOptionsHandle` moved there.
+- Agents and background tasks: ACP v2 sessions (the `acp-beta` path, which debug and staff
+  builds use) read subagents from `AcpThread::subagents()` (nested through each child's own
+  subagents) and background work from `AcpThread::background_work()`; claude-agent-acp 0.106.0
+  ignores `emitRawSDKMessages` over v2. ACP v1 sessions read Claude Code's `task_*` and
+  `background_tasks_changed` system messages from `_claude/sdkMessage`, through
+  `AgentExtNotifications`. Both feed `agent_summaries` / `background_task_summaries` in
+  `claude_code.rs`; subagent run times over v2 are measured locally (announcement to last
+  activity). The agent map is a workspace modal (`ui_styles/claude_code/agent_map.rs`).
+- Prompt cache clock: `PromptCache` in `ThreadActivity`, anchored at the latest model request
+  (a new assistant or tool entry while a turn runs), reset to "compacted" by a finished
+  compaction. The lifetime comes from v1 `result` usage (`cache_creation` split), else one hour.
+- Status bar item: `ClaudeCodeStatusItem` (`claude_code.rs`), added to and removed from every
+  workspace's status bar by a settings observer, like the sessions panel. Clicking it runs
+  `thread_item::focus_or_open_thread_tab`.
