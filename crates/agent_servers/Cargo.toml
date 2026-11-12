@@ -66,6 +66,7 @@ zed_credentials_provider.workspace = true
 [dev-dependencies]
 client = { workspace = true, features = ["test-support"] }
 env_logger.workspace = true
+feature_flags = { workspace = true, features = ["test-support"] }
 fs.workspace = true
 
 indoc.workspace = true
