@@ -1,11 +1,10 @@
 use gpui::{
-    Action, Anchor, AnyView, ClickEvent, Empty, Focusable as _, MouseButton, Role, TaskExt as _,
-    WeakEntity, relative,
+    Action, AnyView, ClickEvent, Empty, MouseButton, Role, TaskExt as _, WeakEntity, relative,
 };
 use settings::{Settings, SettingsStore};
 use title_bar::TitleBar;
-use ui::{ContextMenu, PopoverMenu, Tooltip, prelude::*};
-use workspace::{GoBack, GoForward, ToggleFileFinder, ToggleProjectSymbols, Workspace};
+use ui::{Tooltip, prelude::*};
+use workspace::{GoBack, GoForward, ToggleFileFinder, Workspace};
 
 use crate::{Codicon, WorkbenchSettings, action_button};
 
@@ -16,7 +15,6 @@ const SEARCH_BOX_MAX_WIDTH: Pixels = px(600.);
 const SEARCH_BOX_HEIGHT: Pixels = px(22.);
 const SEARCH_BOX_MARGIN: Pixels = px(6.);
 const SEARCH_BOX_RADIUS: Pixels = px(6.);
-const GO_TO_LINE_ACTION: &str = "go_to_line::Toggle";
 
 pub(crate) fn init(cx: &mut App) {
     cx.observe_new(|title_bar: &mut TitleBar, window, cx| {
@@ -132,6 +130,8 @@ impl CommandCenter {
             .max_w(SEARCH_BOX_MAX_WIDTH)
             .h(SEARCH_BOX_HEIGHT)
             .ml(SEARCH_BOX_MARGIN)
+            .px_2()
+            .justify_center()
             .overflow_hidden()
             .rounded(SEARCH_BOX_RADIUS)
             .border_1()
@@ -146,11 +146,8 @@ impl CommandCenter {
             .on_click(|_: &ClickEvent, window, cx| {
                 window.dispatch_action(ToggleFileFinder::default().boxed_clone(), cx);
             })
-            // Equal space on both sides keeps the title centered next to the menu.
-            .child(div().flex_1())
             .child(
                 h_flex()
-                    .flex_shrink(1.)
                     .min_w_0()
                     .gap_1()
                     .child(
@@ -166,61 +163,6 @@ impl CommandCenter {
                             .truncate(),
                     ),
             )
-            .child(
-                h_flex()
-                    .flex_1()
-                    .justify_end()
-                    .child(self.render_quick_access_menu()),
-            )
-    }
-
-    fn render_quick_access_menu(&self) -> impl IntoElement {
-        let workspace = self.workspace.clone();
-        PopoverMenu::new("command-center-menu")
-            .anchor(Anchor::TopRight)
-            .trigger_with_tooltip(
-                action_button(
-                    "command-center-menu-button",
-                    Codicon::ChevronDown.icon().color(Color::Muted),
-                )
-                .height(px(20.).into())
-                .tab_index(0isize)
-                .aria_label("Quick Access"),
-                Tooltip::text("Quick Access"),
-            )
-            .menu(move |window, cx| {
-                // Go to Line only reaches the editor from inside of it, and the
-                // other actions bubble up from there to the workspace.
-                let context = workspace.upgrade().map(|workspace| {
-                    let workspace = workspace.read(cx);
-                    workspace
-                        .active_item(cx)
-                        .map(|item| item.item_focus_handle(cx))
-                        .unwrap_or_else(|| workspace.focus_handle(cx))
-                });
-                let go_to_line = match cx.build_action(GO_TO_LINE_ACTION, None) {
-                    Ok(action) => Some(action),
-                    Err(error) => {
-                        log::error!("failed to build the {GO_TO_LINE_ACTION} action: {error}");
-                        None
-                    }
-                };
-                Some(ContextMenu::build(window, cx, move |menu, _window, _cx| {
-                    menu.when_some(context, |menu, context| menu.context(context))
-                        .action("Go to File", ToggleFileFinder::default().boxed_clone())
-                        .action(
-                            "Show and Run Commands",
-                            zed_actions::command_palette::Toggle.boxed_clone(),
-                        )
-                        .action(
-                            "Go to Symbol in Workspace",
-                            ToggleProjectSymbols.boxed_clone(),
-                        )
-                        .when_some(go_to_line, |menu, go_to_line| {
-                            menu.action("Go to Line/Column", go_to_line)
-                        })
-                }))
-            })
     }
 }
 
@@ -283,8 +225,10 @@ impl Render for CommandCenter {
 
 #[cfg(test)]
 mod tests {
+    use std::{cell::Cell, rc::Rc};
+
     use super::*;
-    use gpui::{Entity, TestAppContext, VisualTestContext};
+    use gpui::{Entity, Focusable as _, Modifiers, TestAppContext, VisualTestContext, point};
     use settings::TitleBarVisibility;
 
     use crate::test_support::{
@@ -335,6 +279,36 @@ mod tests {
         set_command_center(false, cx);
         assert!(installed_command_center(&title_bar, cx).is_none());
         assert!(cx.debug_bounds("command-center-search").is_none());
+    }
+
+    #[gpui::test]
+    async fn test_command_center_search_opens_file_finder(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (workspace, cx) = open_workspace_with_title_bar(cx).await;
+        set_command_center(true, cx);
+        let file_finder_toggles = Rc::new(Cell::new(0));
+        workspace.update_in(cx, |workspace, window, cx| {
+            let file_finder_toggles = file_finder_toggles.clone();
+            workspace.register_action(move |_, _: &ToggleFileFinder, _window, _cx| {
+                file_finder_toggles.set(file_finder_toggles.get() + 1);
+            });
+            window.focus(&workspace.focus_handle(cx), cx);
+        });
+        cx.run_until_parked();
+
+        let search_box = cx
+            .debug_bounds("command-center-search")
+            .expect("the search box should be rendered");
+        cx.simulate_click(search_box.center(), Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(file_finder_toggles.get(), 1);
+
+        // Its right edge, where the quick access menu's chevron used to be, also
+        // opens the file finder.
+        let right_edge = point(search_box.right() - px(8.), search_box.center().y);
+        cx.simulate_click(right_edge, Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(file_finder_toggles.get(), 2);
     }
 
     #[gpui::test]
