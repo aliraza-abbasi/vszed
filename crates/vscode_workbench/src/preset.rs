@@ -289,6 +289,10 @@ struct LayoutSnapshot {
     status_bar: Option<bool>,
     title_bar_project_items: Option<bool>,
     title_bar_branch_name: Option<bool>,
+    title_bar_sign_in: Option<bool>,
+    title_bar_user_menu: Option<bool>,
+    search_button: Option<bool>,
+    tab_bar_nav_history_buttons: Option<bool>,
     tab_file_icons: Option<bool>,
     tab_git_status: Option<bool>,
     tab_diagnostics: Option<ShowDiagnostics>,
@@ -305,6 +309,7 @@ impl LayoutSnapshot {
     fn read_from(content: &SettingsContent) -> Self {
         let workbench = content.workbench.as_ref();
         let title_bar = content.title_bar.as_ref();
+        let tab_bar = content.tab_bar.as_ref();
         let tabs = content.tabs.as_ref();
         Self {
             base_keymap: content.base_keymap,
@@ -328,6 +333,15 @@ impl LayoutSnapshot {
             status_bar: workbench.and_then(|workbench| workbench.status_bar),
             title_bar_project_items: title_bar.and_then(|title_bar| title_bar.show_project_items),
             title_bar_branch_name: title_bar.and_then(|title_bar| title_bar.show_branch_name),
+            title_bar_sign_in: title_bar.and_then(|title_bar| title_bar.show_sign_in),
+            title_bar_user_menu: title_bar.and_then(|title_bar| title_bar.show_user_menu),
+            search_button: content
+                .editor
+                .search
+                .as_ref()
+                .and_then(|search| search.button),
+            tab_bar_nav_history_buttons: tab_bar
+                .and_then(|tab_bar| tab_bar.show_nav_history_buttons),
             tab_file_icons: tabs.and_then(|tabs| tabs.file_icons),
             tab_git_status: tabs.and_then(|tabs| tabs.git_status),
             tab_diagnostics: tabs.and_then(|tabs| tabs.show_diagnostics),
@@ -383,6 +397,14 @@ impl LayoutSnapshot {
         update_nested(&mut content.title_bar, |title_bar| {
             title_bar.show_project_items = self.title_bar_project_items;
             title_bar.show_branch_name = self.title_bar_branch_name;
+            title_bar.show_sign_in = self.title_bar_sign_in;
+            title_bar.show_user_menu = self.title_bar_user_menu;
+        });
+        update_nested(&mut content.editor.search, |search| {
+            search.button = self.search_button;
+        });
+        update_nested(&mut content.tab_bar, |tab_bar| {
+            tab_bar.show_nav_history_buttons = self.tab_bar_nav_history_buttons;
         });
         update_nested(&mut content.tabs, |tabs| {
             tabs.file_icons = self.tab_file_icons;
@@ -422,6 +444,13 @@ impl LayoutSnapshot {
         // VS Code's title bar shows neither, the status bar has the branch.
         self.title_bar_project_items = Some(false);
         self.title_bar_branch_name = Some(false);
+        // The activity bar's Accounts and Manage menus have their entries.
+        self.title_bar_sign_in = Some(false);
+        self.title_bar_user_menu = Some(false);
+        // Search is in the activity bar.
+        self.search_button = Some(false);
+        // The command center has back and forward buttons.
+        self.tab_bar_nav_history_buttons = Some(false);
         self.tab_file_icons = Some(true);
         self.tab_git_status = Some(true);
         self.tab_diagnostics = Some(ShowDiagnostics::Errors);
@@ -471,6 +500,8 @@ mod tests {
         "vim_mode": true,
         "project_panel": { "dock": "right", "default_width": 300 },
         "tabs": { "close_position": "left", "file_icons": false },
+        "tab_bar": { "show": true, "show_nav_history_buttons": true },
+        "search": { "button": true, "regex": true },
         "title_bar": { "show_branch_name": true, "show_user_picture": false }
     }"#;
 
@@ -550,6 +581,10 @@ mod tests {
         assert_eq!(applied["workbench"]["status_bar"], json!(true));
         assert_eq!(applied["title_bar"]["show_project_items"], json!(false));
         assert_eq!(applied["title_bar"]["show_branch_name"], json!(false));
+        assert_eq!(applied["title_bar"]["show_sign_in"], json!(false));
+        assert_eq!(applied["title_bar"]["show_user_menu"], json!(false));
+        assert_eq!(applied["search"]["button"], json!(false));
+        assert_eq!(applied["tab_bar"]["show_nav_history_buttons"], json!(false));
         assert_eq!(applied["tabs"]["file_icons"], json!(true));
         assert_eq!(applied["tabs"]["git_status"], json!(true));
         assert_eq!(applied["tabs"]["show_diagnostics"], json!("errors"));
@@ -574,10 +609,20 @@ mod tests {
         assert_eq!(applied["project_panel"]["default_width"], json!(300));
         assert_eq!(applied["tabs"]["close_position"], json!("left"));
         assert_eq!(applied["title_bar"]["show_user_picture"], json!(false));
+        assert_eq!(applied["search"]["regex"], json!(true));
+        assert_eq!(applied["tab_bar"]["show"], json!(true));
 
         assert!(restore(&fs, cx).await);
         let (restored, restored_settings) = load_settings_file(&fs).await;
         assert_eq!(restored_settings, original_settings);
+        assert_eq!(restored["search"]["button"], json!(true));
+        assert_eq!(restored["tab_bar"]["show_nav_history_buttons"], json!(true));
+        for key in ["show_sign_in", "show_user_menu"] {
+            assert!(
+                restored["title_bar"].get(key).is_none(),
+                "title_bar.{key} was not set before the layout was applied: {restored:#}"
+            );
+        }
         for key in [
             "workbench",
             "minimap",
