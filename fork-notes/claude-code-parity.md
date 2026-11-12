@@ -38,7 +38,9 @@ There is no Thinking toggle option: per the docs Thinking lives in the `/` menu,
 
 **`session/list`**: honors `cwd` exactly (`listSessions({ dir: cwd, includeWorktrees: false })`, absolute paths only), so another git worktree of the same repository is a different project, as in `claude --resume`. Pages hold `SESSION_LIST_PAGE_SIZE` sessions with an `offset:N` cursor. Each session carries `cwd`, `title` (the transcript summary) and `updatedAt`. The v1 core hides archived sessions; the v2 core does not filter them. Rename and archive exist only as v1 extension methods (`_session/rename`, `_session/archive`, `_session/unarchive`), which Zed does not call.
 
-**Not exposed**: prompt-cache time left (the clock chip), account usage, a Thinking toggle, a running-agents count beyond what subagent tool calls show.
+**Rate limits** (`rate_limit_event` handling in the adapter; shape from the bundled CLI's `SDKRateLimitInfo` schema): on each Claude `rate_limit_event` the adapter sends a `usage_update` whose `_meta["_claude/rateLimit"]` is the CLI's `rate_limit_info`, verbatim. Before the first assistant message has a usage total it holds the info and attaches it to the next usage update. Every usage update also carries `_meta["_claude/model"]`. Fields: `status` (`allowed` / `allowed_warning` / `rejected`, the only required one), `rateLimitType` (`five_hour`, `seven_day`, `seven_day_opus`, `seven_day_sonnet`, `seven_day_overage_included`, `overage`), `utilization` (a fraction, usually 0..1, above 1 when usage ran past the cap), `resetsAt` (unix seconds, integer), the overage fields (`overageStatus`, `overageResetsAt`, `overageDisabledReason`, `isUsingOverage`, ...), and `unifiedWindows` (`five_hour`, `seven_day`, `seven_day_overage_included`, each `{ utilization, resetsAt, status?, surpassedThreshold? }`, marked `@internal` but sent to SDK hosts). The top-level `rateLimitType` / `utilization` / `resetsAt` describe the window that currently limits requests and are mostly absent while the status is a plain `allowed`; `unifiedWindows` has every window on every event. The CLI emits the event when this state changes (status, limiting window, reset time, or a window's rounded percentage or threshold), not on every response; a new CLI process (one per session) emits on its first response that carries the limit headers. Only claude.ai subscription sign-ins get these headers: API key, Bedrock and Vertex sessions never get a rate limit event. The CLI calls `seven_day_overage_included` "Fable limit".
+
+**Not exposed**: prompt-cache time left (the clock chip), account identity (email, plan: the adapter calls `query.accountInfo()` only internally), the `/usage` dialog's data (the CLI's `get_usage` control request), a Thinking toggle, a running-agents count beyond what subagent tool calls show.
 
 ## Placement and entry points
 
@@ -65,7 +67,8 @@ Closing a thread tab while a turn runs asks for confirmation when closed with `p
 | Auto-archive inactive sessions after 14 days (setting, 0 = off) | yes | setting + B6 | todo |
 | Sessions started in the terminal CLI appear and resume | yes | from ACP `session/list`; resume through `ConversationView::new` with the session id | done (not verified against a live CLI session) |
 | "Open here anyway" notice when the session is open in another Claude process | yes | | gap? (check adapter) |
-| Web tab (claude.ai cloud sessions), Account & usage header | yes | | gap (not in ACP) |
+| Account & usage header in the Activity Bar sessions list (docs: "Check account and usage"; screenshot: collapsible ACCOUNT & USAGE above SESSION MANAGER) | yes | top section of the sessions panel. USAGE: one row per limit type from `_claude/rateLimit` (newest report across the project's open threads): label ("Session (5 hour)", "Weekly (7 day)", "Fable limit", "Opus limit", ...), percent, thin bar, "Resets Sat, Nov 14 at 1:00 PM", warning ("Approaching limit") and "Limit reached" states; "Usage appears after Claude's next reply" until a report arrives. ACCOUNT: Email reads "Not available through the Claude adapter". "View details" left out (undocumented target; the docs open the Account & usage dialog with `/usage`) | partial (usage done; account identity and the dialog are gaps) |
+| Web tab (claude.ai cloud sessions) | yes | | gap (not in ACP) |
 | Resume restores the permission mode, including plan mode | yes | ACP session mode on load | todo |
 
 ## Prompt box
@@ -148,4 +151,4 @@ User messages render as plain UI-font text in the bordered box (the read-only me
 
 ## Out of scope / gaps to confirm with the adapter
 
-Account & usage dialog and header, Web sessions, prompt-cache clock, Remote Control, Claude in Chrome (`@browser`), dictation, Focus view, terminal mode (`useTerminal`).
+Account & usage dialog (`/usage`, "View details") and account identity, Web sessions, prompt-cache clock, Remote Control, Claude in Chrome (`@browser`), dictation, Focus view, terminal mode (`useTerminal`).
