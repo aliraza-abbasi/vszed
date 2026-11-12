@@ -1677,6 +1677,33 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_claude_code_replayed_thought_has_no_duration(cx: &mut TestAppContext) {
+        let connection = StubAgentConnection::new();
+        let (thread_view, cx) = setup_thread_view(connection.clone(), cx).await;
+        set_ui_style("claude_code", cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+        // Updates outside a turn, as a loaded session replays its history.
+        cx.update(|_window, cx| {
+            connection.send_update(
+                session_id,
+                acp_v1::SessionUpdate::AgentThoughtChunk(acp_v1::ContentChunk::new(
+                    "An earlier thought.".into(),
+                )),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        assert!(cx.debug_bounds("claude-code-thought-0-0").is_some());
+        thread_view.read_with(cx, |_, cx| {
+            let activity =
+                thread_activity(thread_view.entity_id(), cx).expect("thread activity is tracked");
+            assert_eq!(activity.thought_duration(0, 0), None);
+        });
+    }
+
+    #[gpui::test]
     async fn test_claude_code_thought_rows(cx: &mut TestAppContext) {
         let thought = |text: &str| {
             acp_v1::SessionUpdate::AgentThoughtChunk(acp_v1::ContentChunk::new(text.into()))

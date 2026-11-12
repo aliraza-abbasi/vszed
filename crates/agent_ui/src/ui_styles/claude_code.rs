@@ -448,8 +448,12 @@ impl ThreadActivity {
 
     /// A thought is timed from the previous activity in the thread (the model
     /// starts thinking as soon as it has the previous step's result) until its
-    /// last streamed chunk.
+    /// last streamed chunk. Thoughts replayed from a loaded session arrive all at
+    /// once, so they get no time and read "Thinking", as in Claude Code.
     fn record_streaming_thought(&mut self, thread: &AcpThread, entry_ix: usize, now: Instant) {
+        if thread.status() != ThreadStatus::Generating {
+            return;
+        }
         let Some(AgentThreadEntry::AssistantMessage(message)) = thread.entries().get(entry_ix)
         else {
             return;
@@ -892,8 +896,9 @@ pub(crate) fn thought_label(duration: Option<Duration>, is_streaming: bool) -> S
 }
 
 /// Whether a thought carries summary text. claude-agent-acp only sends a
-/// thought when Claude streams thinking text, which it does when the user
-/// turned on `showThinkingSummaries`; other agents may send empty ones.
+/// thought when Claude streams thinking text, which needs the thinking display
+/// that vszed asks for when `showThinkingSummaries` is on; other agents may
+/// send empty ones.
 pub(crate) fn thought_has_summary(block: &acp_thread::MessageContent) -> bool {
     block.source_blocks().iter().any(|source| match source {
         acp_v2::ContentBlock::Text(text) => !text.text.trim().is_empty(),
