@@ -1076,7 +1076,7 @@ impl ClaudeCodeSessionsPanel {
             return row_element.into_any_element();
         }
         let panel = cx.weak_entity();
-        let session_id = session.session_id.clone();
+        let session_id = session.session_id;
         let current_group = self.group_of(&session_id);
         let other_groups = self
             .groups
@@ -1118,7 +1118,6 @@ impl ClaudeCodeSessionsPanel {
                     if current_group.is_some() {
                         menu = menu.entry("Remove from group", None, {
                             let panel = panel.clone();
-                            let session_id = session_id.clone();
                             move |_, cx| {
                                 panel
                                     .update(cx, |panel, cx| {
