@@ -20,9 +20,6 @@ use crate::{Codicon, WorkbenchSettings};
 
 const MAX_BRANCH_NAME_LENGTH: usize = 40;
 const SHORT_SHA_LENGTH: usize = 8;
-/// `Workspace::new` adds the right and bottom dock buttons before any other right
-/// side item, so they are the last two items of the status bar.
-const DOCK_BUTTON_SLOTS: usize = 2;
 
 pub(crate) fn init(cx: &mut App) {
     cx.observe_new(|_workspace: &mut Workspace, window, cx| {
@@ -62,7 +59,6 @@ impl_status_item_view!(RemoteIndicator);
 impl_status_item_view!(GitBranchItem);
 impl_status_item_view!(ProblemsItem);
 impl_status_item_view!(NotificationBell);
-impl_status_item_view!(StatusBarProbe);
 
 fn apply_status_bar_items(
     workspace: &mut Workspace,
@@ -105,7 +101,9 @@ fn apply_status_bar_items(
         // another one shows up to its left.
         move_status_item_after::<ActiveBufferEncoding, LineEndingIndicator>(workspace, window, cx);
         move_status_item_after::<ActiveBufferLanguage, ActiveToolchain>(workspace, window, cx);
-        add_notification_bell(workspace, notification_bell, window, cx);
+        workspace.status_bar().update(cx, |status_bar, cx| {
+            status_bar.add_rightmost_item(notification_bell, window, cx);
+        });
     } else {
         remove_status_items::<NotificationBell>(workspace, cx);
         remove_status_items::<ProblemsItem>(workspace, cx);
@@ -242,59 +240,6 @@ fn left_dock_buttons_position(workspace: &Workspace, cx: &App) -> Option<usize> 
     .into_iter()
     .flatten()
     .min()
-}
-
-/// Shows the bell after every right side item except the dock buttons. While the
-/// activity bar hides those, that makes it the last item, as in VS Code.
-fn add_notification_bell(
-    workspace: &Workspace,
-    notification_bell: Entity<NotificationBell>,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    workspace.status_bar().update(cx, |status_bar, cx| {
-        // The status bar doesn't expose how many items each side has, but the
-        // position of an item appended to a side is the number of items before it.
-        let probe = cx.new(|_| StatusBarProbe);
-        status_bar.add_left_item(probe, window, cx);
-        let left_item_count = status_bar.position_of_item::<StatusBarProbe>();
-        if let Some(position) = left_item_count {
-            status_bar.remove_item_at(position, cx);
-        }
-        let probe = cx.new(|_| StatusBarProbe);
-        status_bar.add_right_item(probe, window, cx);
-        let item_count = status_bar.position_of_item::<StatusBarProbe>();
-        if let Some(position) = item_count {
-            status_bar.remove_item_at(position, cx);
-        }
-
-        let slots_after_bell =
-            item_count
-                .zip(left_item_count)
-                .map(|(item_count, left_item_count)| {
-                    let right_item_count = item_count.saturating_sub(left_item_count);
-                    (left_item_count, right_item_count.min(DOCK_BUTTON_SLOTS))
-                });
-        match slots_after_bell {
-            Some((left_item_count, slots_after_bell)) if slots_after_bell > 0 => {
-                status_bar.insert_item_after(
-                    left_item_count + slots_after_bell - 1,
-                    notification_bell,
-                    window,
-                    cx,
-                );
-            }
-            _ => status_bar.add_right_item(notification_bell, window, cx),
-        }
-    });
-}
-
-struct StatusBarProbe;
-
-impl Render for StatusBarProbe {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        Empty
-    }
 }
 
 /// VS Code's remote indicator: an accent colored button at the start of the
@@ -762,8 +707,9 @@ mod tests {
                 diagnostics: None,
                 hidden_diagnostics: Some(4),
                 other_item: Some(5),
-                // Right after the two dock buttons (6 and 7), so it is drawn last.
-                notification_bell: Some(8),
+                // The first right side item, so it is drawn last, after the right
+                // and bottom dock buttons (7 and 8).
+                notification_bell: Some(6),
                 // Placeholders for encoding and language hold 9 and 10. Drawn from
                 // left to right: encoding, line ending, language, toolchain.
                 toolchain: Some(11),
@@ -792,7 +738,7 @@ mod tests {
         assert_eq!(positions.remote_indicator, Some(1));
         assert_eq!(positions.git_branch, Some(2));
         assert_eq!(positions.problems, Some(3));
-        assert_eq!(positions.notification_bell, Some(8));
+        assert_eq!(positions.notification_bell, Some(6));
 
         // Turned off in the order they were turned on in, which leaves each one
         // restoring items while the other one's are still in place.
