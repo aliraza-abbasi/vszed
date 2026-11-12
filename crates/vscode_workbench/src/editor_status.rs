@@ -1,13 +1,17 @@
 //! The status bar items of VS Code's `editorStatus.ts` and `languageStatus.ts`
-//! that Zed has no equivalent for.
+//! that Zed has no equivalent for, and GitLens's current line blame.
+
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use editor::{
-    Editor, EditorEvent, EditorMode, MBTextSummary, MultiBufferSnapshot, SelectionEffects,
+    Editor, EditorEvent, EditorMode, MBTextSummary, MultiBufferSnapshot, RowInfo, SelectionEffects,
+    ToPoint as _,
     actions::{
-        ConvertIndentationToSpaces, ConvertIndentationToTabs, RestartLanguageServer, SelectAll,
-        StopLanguageServer, ToggleGoToLine,
+        ConvertIndentationToSpaces, ConvertIndentationToTabs, OpenGitBlameCommit,
+        RestartLanguageServer, SelectAll, StopLanguageServer, ToggleGoToLine,
     },
 };
+use git::blame::BlameEntry;
 use gpui::{Action, Anchor, Empty, Entity, Focusable as _, Subscription, WeakEntity};
 use language::{LineEnding, Point, language_settings::LanguageSettings};
 use project::{LspStoreEvent, Project};
@@ -562,13 +566,206 @@ impl StatusItemView for LanguageStatusItem {
     }
 }
 
+/// GitLens's current line blame, `$(git-commit) Michael Sloan, 18 months ago`,
+/// for the newest cursor of the active editor. It reads the blame that the
+/// editor keeps for its inline and gutter blame, so it shows next to Zed's
+/// inline blame and is hidden whenever the editor has no blame for the line:
+/// outside a repository, in untracked files, on uncommitted lines, and in
+/// editors that never turned on inline blame or the blame gutter.
+pub struct CurrentLineBlameItem {
+    blame: Option<CurrentLineBlame>,
+    editor: Option<WeakEntity<Editor>>,
+    _editor_subscription: Option<Subscription>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct CurrentLineBlame {
+    label: SharedString,
+    summary: SharedString,
+}
+
+impl CurrentLineBlame {
+    fn new(entry: &BlameEntry, now: i64) -> Self {
+        let author = entry.author.clone().unwrap_or_default();
+        let label = match entry.author_time {
+            Some(author_time) => format!("{author}, {}", relative_time(author_time, now)),
+            None => author,
+        };
+        let summary = match &entry.summary {
+            Some(summary) => summary.clone(),
+            None => entry.sha.display_short(),
+        };
+        Self {
+            label: label.into(),
+            summary: summary.into(),
+        }
+    }
+}
+
+impl CurrentLineBlameItem {
+    pub(crate) fn new() -> Self {
+        Self {
+            blame: None,
+            editor: None,
+            _editor_subscription: None,
+        }
+    }
+
+    fn update_blame(&mut self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
+        let blame = cursor_line_blame_entry(editor, cx)
+            .map(|entry| CurrentLineBlame::new(&entry, unix_now()));
+        if blame != self.blame {
+            self.blame = blame;
+            cx.notify();
+        }
+    }
+}
+
+/// Unlike `Editor::active_git_blame_entry`, this doesn't wait for inline blame's
+/// delay and also covers empty lines, as GitLens does.
+fn cursor_line_blame_entry(editor: &Entity<Editor>, cx: &mut App) -> Option<BlameEntry> {
+    let (blame, row_info) = {
+        let editor = editor.read(cx);
+        if !matches!(editor.mode(), EditorMode::Full { .. }) {
+            return None;
+        }
+        let blame = editor.blame()?.clone();
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let cursor = editor.selections.newest_anchor().head().to_point(&snapshot);
+        let (buffer, position) = snapshot.point_to_buffer_point(cursor)?;
+        let row_info = RowInfo {
+            buffer_id: Some(buffer.remote_id()),
+            buffer_row: Some(position.row),
+            ..RowInfo::default()
+        };
+        (blame, row_info)
+    };
+    blame
+        .update(cx, |blame, cx| {
+            blame.blame_for_rows(&[row_info], cx).next().flatten()
+        })
+        .map(|(_, entry)| entry)
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since_epoch| since_epoch.as_secs() as i64)
+}
+
+/// GitLens's `fromNow` (`packages/utils/src/date.ts`), with the English text of
+/// the `Intl.RelativeTimeFormat` it uses (`numeric: "auto"`). Unlike Zed's
+/// relative dates it never combines units, and years only start at 729 days, so
+/// a commit from a year and a half ago is `18 months ago`.
+fn relative_time(timestamp: i64, now: i64) -> String {
+    const MINUTE: i64 = 60;
+    const HOUR: i64 = 60 * MINUTE;
+    const DAY: i64 = 24 * HOUR;
+    const WEEK: i64 = 7 * DAY;
+    const YEAR: i64 = 365 * DAY;
+    const MONTH: i64 = YEAR / 12;
+    // Unit, the elapsed seconds from which it is used, the seconds per unit, and
+    // the words for one unit ago and ahead.
+    const UNITS: [(&str, i64, i64, Option<(&str, &str)>); 7] = [
+        ("year", 729 * DAY, YEAR, Some(("last year", "next year"))),
+        ("month", MONTH, MONTH, Some(("last month", "next month"))),
+        ("week", WEEK, WEEK, Some(("last week", "next week"))),
+        ("day", DAY, DAY, Some(("yesterday", "tomorrow"))),
+        ("hour", HOUR, HOUR, None),
+        ("minute", MINUTE, MINUTE, None),
+        ("second", 1, 1, None),
+    ];
+
+    let elapsed = timestamp - now;
+    let (unit, seconds_per_unit, adjacent_words) = UNITS
+        .into_iter()
+        .find(|(_, threshold, _, _)| elapsed.abs() >= *threshold)
+        .map(|(unit, _, seconds_per_unit, adjacent_words)| (unit, seconds_per_unit, adjacent_words))
+        .unwrap_or(("second", 1, None));
+    // Truncates toward zero, like GitLens's `Math.trunc`.
+    let value = elapsed / seconds_per_unit;
+    match (value, adjacent_words) {
+        (0, _) => "now".to_string(),
+        (-1, Some((ago, _))) => ago.to_string(),
+        (1, Some((_, ahead))) => ahead.to_string(),
+        (value, _) => {
+            let count = value.unsigned_abs();
+            let plural = if count == 1 { "" } else { "s" };
+            if value < 0 {
+                format!("{count} {unit}{plural} ago")
+            } else {
+                format!("in {count} {unit}{plural}")
+            }
+        }
+    }
+}
+
+impl Render for CurrentLineBlameItem {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let blame = self.blame.clone();
+        let editor = self.editor.as_ref().and_then(WeakEntity::upgrade);
+        let (Some(blame), Some(editor)) = (blame, editor) else {
+            return Empty.into_any_element();
+        };
+        let focus_handle = editor.focus_handle(cx);
+        let summary = blame.summary;
+
+        ButtonLike::new("vscode-current-line-blame")
+            .tab_index(0isize)
+            .aria_label(blame.label.clone())
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(Codicon::GitCommit.icon().size(IconSize::Small))
+                    .child(Label::new(blame.label).size(LabelSize::Small)),
+            )
+            .tooltip({
+                let focus_handle = focus_handle.clone();
+                move |_window, cx| {
+                    Tooltip::for_action_in(summary.clone(), &OpenGitBlameCommit, &focus_handle, cx)
+                }
+            })
+            .on_click(move |_, window, cx| {
+                focus_handle.dispatch_action(&OpenGitBlameCommit, window, cx);
+            })
+            .into_any_element()
+    }
+}
+
+impl StatusItemView for CurrentLineBlameItem {
+    fn set_active_pane_item(
+        &mut self,
+        active_pane_item: Option<&dyn ItemHandle>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.blame = None;
+        self.editor = None;
+        self._editor_subscription = None;
+        if let Some(editor) = active_pane_item.and_then(|item| item.act_as::<Editor>(cx)) {
+            // The editor notifies when its selections change and when its blame
+            // is loaded or updated.
+            self._editor_subscription =
+                Some(cx.observe(&editor, |this, editor, cx| this.update_blame(&editor, cx)));
+            self.editor = Some(editor.downgrade());
+            self.update_blame(&editor, cx);
+        }
+        cx.notify();
+    }
+
+    fn hide_setting(&self, _cx: &App) -> Option<HideStatusItem> {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use fs::FakeFs;
     use futures::StreamExt as _;
+    use git::{blame::Blame, repository::RepoPath};
     use gpui::{TestAppContext, VisualTestContext};
-    use std::{num::NonZeroU32, ops::Range};
+    use std::{num::NonZeroU32, ops::Range, path::Path};
     use util::{path, rel_path::rel_path};
     use workspace::MultiWorkspace;
 
@@ -841,6 +1038,173 @@ mod tests {
         fake_server.end_progress("indexing");
         cx.run_until_parked();
         assert!(language_servers(cx).iter().all(|server| !server.busy));
+    }
+
+    const DAY: i64 = 24 * 60 * 60;
+
+    fn blame_entry(
+        sha: &str,
+        rows: Range<u32>,
+        author: &str,
+        author_time: i64,
+        summary: &str,
+    ) -> BlameEntry {
+        BlameEntry {
+            sha: sha.parse().expect("the sha should be valid"),
+            original_line_number: rows.start,
+            range: rows,
+            author: Some(author.to_string()),
+            author_mail: None,
+            author_time: Some(author_time),
+            author_tz: Some("+0000".to_string()),
+            committer_name: None,
+            committer_email: None,
+            committer_time: Some(author_time),
+            committer_tz: Some("+0000".to_string()),
+            summary: Some(summary.to_string()),
+            previous: None,
+            filename: "blamed.txt".to_string(),
+            boundary: false,
+        }
+    }
+
+    /// A repository with a blamed file and a file that git doesn't know about.
+    async fn create_repository_project(now: i64, cx: &mut TestAppContext) -> Entity<Project> {
+        init_test(cx);
+        cx.update(editor::init);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/repo"),
+            serde_json::json!({
+                ".git": {},
+                "blamed.txt": "one\ntwo\n\nfour\n",
+                "untracked.txt": "new\n",
+            }),
+        )
+        .await;
+        fs.set_blame_for_repo(
+            Path::new(path!("/repo/.git")),
+            vec![(
+                RepoPath::new("blamed.txt").expect("the path should be valid"),
+                Blame {
+                    entries: vec![
+                        blame_entry(
+                            "1b1b1b",
+                            0..1,
+                            "Michael Sloan",
+                            now - 3 * DAY,
+                            "Fix parsing",
+                        ),
+                        blame_entry(
+                            "0d0d0d",
+                            1..4,
+                            "Max Brunsfeld",
+                            now - 548 * DAY,
+                            "Add the editor",
+                        ),
+                    ],
+                    ..Blame::default()
+                },
+            )],
+        );
+        Project::test(fs, [path!("/repo").as_ref()], cx).await
+    }
+
+    fn current_line_blame(
+        item: &Entity<CurrentLineBlameItem>,
+        cx: &mut VisualTestContext,
+    ) -> Option<(String, String)> {
+        item.read_with(cx, |item, _| {
+            item.blame
+                .as_ref()
+                .map(|blame| (blame.label.to_string(), blame.summary.to_string()))
+        })
+    }
+
+    #[gpui::test]
+    async fn test_current_line_blame_follows_cursor(cx: &mut TestAppContext) {
+        let now = unix_now();
+        let project = create_repository_project(now, cx).await;
+        let (workspace, editor, cx) = open_project_file(project, "blamed.txt", cx).await;
+        let item = add_status_item(&workspace, cx, |_, _| CurrentLineBlameItem::new());
+        assert_eq!(
+            current_line_blame(&item, cx),
+            Some((
+                "Michael Sloan, 3 days ago".to_string(),
+                "Fix parsing".to_string()
+            ))
+        );
+
+        // Unlike Zed's inline blame, the blame of empty lines is shown too.
+        select(&editor, vec![Point::new(2, 0)..Point::new(2, 0)], cx);
+        assert_eq!(
+            current_line_blame(&item, cx),
+            Some((
+                "Max Brunsfeld, 18 months ago".to_string(),
+                "Add the editor".to_string()
+            ))
+        );
+
+        let worktree_id = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .project()
+                .read(cx)
+                .worktrees(cx)
+                .next()
+                .expect("the project should have a worktree")
+                .read(cx)
+                .id()
+        });
+        workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.open_path(
+                    (worktree_id, rel_path("untracked.txt")),
+                    None,
+                    true,
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .expect("the file should open");
+        cx.run_until_parked();
+        assert_eq!(
+            current_line_blame(&item, cx),
+            None,
+            "a file without blame has no current line blame"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_current_line_blame_hidden_outside_repository(cx: &mut TestAppContext) {
+        let (workspace, _editor, cx) = open_file("one\n", cx).await;
+        let item = add_status_item(&workspace, cx, |_, _| CurrentLineBlameItem::new());
+        assert_eq!(current_line_blame(&item, cx), None);
+    }
+
+    #[test]
+    fn test_relative_time() {
+        let now = 1_700_000_000;
+        let ago = |seconds: i64| relative_time(now - seconds, now);
+        assert_eq!(ago(0), "now");
+        assert_eq!(ago(1), "1 second ago");
+        assert_eq!(ago(59), "59 seconds ago");
+        assert_eq!(ago(60), "1 minute ago");
+        assert_eq!(ago(60 * 60 - 1), "59 minutes ago");
+        assert_eq!(ago(60 * 60), "1 hour ago");
+        assert_eq!(ago(DAY - 1), "23 hours ago");
+        assert_eq!(ago(DAY), "yesterday");
+        assert_eq!(ago(6 * DAY), "6 days ago");
+        assert_eq!(ago(7 * DAY), "last week");
+        assert_eq!(ago(30 * DAY), "4 weeks ago");
+        assert_eq!(ago(31 * DAY), "last month");
+        assert_eq!(ago(548 * DAY), "18 months ago");
+        assert_eq!(ago(728 * DAY), "23 months ago");
+        assert_eq!(ago(729 * DAY), "last year");
+        assert_eq!(ago(730 * DAY), "2 years ago");
+        assert_eq!(ago(-90), "in 1 minute");
+        assert_eq!(ago(-DAY), "tomorrow");
+        assert_eq!(ago(-2 * DAY), "in 2 days");
     }
 
     #[test]
