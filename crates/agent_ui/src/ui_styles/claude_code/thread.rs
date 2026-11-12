@@ -2449,6 +2449,64 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_claude_code_add_context_types_a_mention(cx: &mut TestAppContext) {
+        let (thread_view, cx) = setup_thread_view(StubAgentConnection::new(), cx).await;
+        set_ui_style("claude_code", cx);
+        let message_editor = thread_view.read_with(cx, |view, _| view.message_editor.clone());
+
+        thread_view.update_in(cx, |view, window, cx| {
+            view.insert_claude_code_mention_trigger(window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            message_editor.read_with(cx, |editor, cx| editor.text(cx)),
+            "@"
+        );
+
+        // The cursor sits mid-word; the extension types at the end, after a space.
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("check these", window, cx);
+            editor.editor().update(cx, |editor, cx| {
+                editor.move_to_beginning(&editor::actions::MoveToBeginning, window, cx)
+            });
+        });
+        thread_view.update_in(cx, |view, window, cx| {
+            view.insert_claude_code_mention_trigger(window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            message_editor.read_with(cx, |editor, cx| editor.text(cx)),
+            "check these @"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_claude_code_context_ring_after_half_the_context(cx: &mut TestAppContext) {
+        let (thread_view, cx) = setup_thread_view(StubAgentConnection::new(), cx).await;
+        set_ui_style("claude_code", cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+
+        // 200k tokens leave 167k before auto-compact: 80k is under half of it.
+        thread.update(cx, |thread, cx| {
+            thread.update_usage(acp_v2::UsageUpdate::new(80_000, 200_000), cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("claude-code-context-ring").is_none());
+
+        thread.update(cx, |thread, cx| {
+            thread.update_usage(acp_v2::UsageUpdate::new(120_000, 200_000), cx)
+        });
+        cx.run_until_parked();
+        let ring = cx
+            .debug_bounds("claude-code-context-ring")
+            .expect("the ring shows once less than half is left");
+        let slash = cx
+            .debug_bounds("claude-code-slash-commands")
+            .expect("the slash button");
+        assert!(ring.left() > slash.left(), "the ring follows the / button");
+    }
+
+    #[gpui::test]
     async fn test_claude_code_spinner_while_generating(cx: &mut TestAppContext) {
         let connection = StubAgentConnection::new();
         let (thread_view, cx) = setup_thread_view(connection.clone(), cx).await;

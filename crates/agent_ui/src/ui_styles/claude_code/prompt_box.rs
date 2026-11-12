@@ -12,11 +12,12 @@ use ui::DocumentationSide;
 use super::*;
 use crate::ui::documentation_aside_side;
 use crate::ui_styles::claude_code::{
-    CacheClockElement, ClaudeCodeModelPicker, ConfigOptionsHandle, PromptAccent, QUEUE_PLACEHOLDER,
-    StatusDot, agent_count_label, agent_summaries, agents_chip_tooltip, agents_dot_state,
+    COMPACT_COMMAND, CacheClockElement, ClaudeCodeModelPicker, ConfigOptionsHandle, ContextRing,
+    PromptAccent, QUEUE_PLACEHOLDER, StatusDot, agent_count_label, agent_summaries,
+    agents_chip_tooltip, agents_dot_state, context_ring_percentage, context_ring_tooltip,
     first_select_option, idle_placeholder, is_claude_code_placeholder, live_agent_count,
-    mode_display_name, mode_icon, model_chip_parts, open_agent_map, prompt_accent,
-    remember_zed_placeholder, select_entries, set_model_picker, thread_activity,
+    mention_trigger_text, mode_display_name, mode_icon, model_chip_parts, open_agent_map,
+    prompt_accent, remember_zed_placeholder, select_entries, set_model_picker, thread_activity,
 };
 
 pub(super) const PROMPT_BOX_RADIUS: Pixels = px(8.);
@@ -172,13 +173,13 @@ impl ThreadView {
                     .min_w_0()
                     .flex_wrap()
                     .gap_1()
-                    .child(self.render_add_context_button(cx))
+                    .child(self.render_claude_code_add_menu(cx))
                     .child(self.render_claude_code_slash_button(cx))
+                    .children(self.render_claude_code_context_ring(cx))
                     .child(CacheClockElement::new(cx.entity_id()))
                     .children(self.render_claude_code_agents_chip(cx))
                     .children(model_chip)
-                    .children(native_controls)
-                    .children(self.render_token_usage(cx)),
+                    .children(native_controls),
             )
             .child(
                 h_flex()
@@ -469,11 +470,186 @@ impl ThreadView {
         });
     }
 
+    /// The extension's `+` menu: "Upload from computer" and "Add context". Its third
+    /// entry, "Browse the web", is Claude in Chrome, which the extension leaves out
+    /// when the browser integration isn't available; vszed has none. It shares Zed's
+    /// add-context menu handle, so `agent::OpenAddContextMenu` opens it.
+    fn render_claude_code_add_menu(&self, cx: &Context<Self>) -> impl IntoElement {
+        let thread_view = cx.weak_entity();
+        PopoverMenu::new("claude-code-add-menu")
+            .trigger_with_tooltip(
+                IconButton::new("claude-code-add", IconName::Plus)
+                    .icon_size(IconSize::Small)
+                    .icon_color(Color::Muted),
+                Tooltip::text("Add"),
+            )
+            .anchor(gpui::Anchor::BottomLeft)
+            .with_handle(self.add_context_menu_handle.clone())
+            .offset(gpui::Point {
+                x: px(0.0),
+                y: px(-2.0),
+            })
+            .menu(move |window, cx| {
+                let thread_view = thread_view.clone();
+                Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                    let upload_target = thread_view.clone();
+                    let context_target = thread_view.clone();
+                    menu.item(
+                        ContextMenuEntry::new("Upload from computer")
+                            .icon(IconName::Share)
+                            .icon_color(Color::Muted)
+                            .handler(move |window, cx| {
+                                upload_target
+                                    .update(cx, |this, cx| {
+                                        this.upload_claude_code_attachments(window, cx)
+                                    })
+                                    .log_err();
+                            }),
+                    )
+                    .item(
+                        ContextMenuEntry::new("Add context")
+                            .icon(IconName::FileTextOutlined)
+                            .icon_color(Color::Muted)
+                            .handler(move |window, cx| {
+                                context_target
+                                    .update(cx, |this, cx| {
+                                        this.insert_claude_code_mention_trigger(window, cx)
+                                    })
+                                    .log_err();
+                            }),
+                    )
+                }))
+            })
+    }
+
+    /// Attaches files picked in the OS file dialog the way pasted or dropped files
+    /// are: images as image content, other files as file mentions.
+    fn upload_claude_code_attachments(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let message_editor = self.message_editor.clone();
+        if message_editor.read(cx).editor().read(cx).read_only(cx) {
+            return;
+        }
+        let paths_receiver = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: None,
+        });
+        cx.spawn_in(window, async move |_, cx| {
+            let paths = match paths_receiver.await {
+                Ok(Ok(Some(paths))) if !paths.is_empty() => paths,
+                Ok(Err(error)) => return Err(error),
+                _ => return Ok(()),
+            };
+            message_editor.update_in(cx, |message_editor, window, cx| {
+                window.focus(&message_editor.focus_handle(cx), cx);
+                let attachments = ClipboardItem {
+                    entries: vec![gpui::ClipboardEntry::ExternalPaths(gpui::ExternalPaths(
+                        paths.into(),
+                    ))],
+                };
+                message_editor.paste_item(&attachments, window, cx);
+            })
+        })
+        .detach_and_log_err(cx);
+    }
+
+    /// The extension's "Add context" types an `@` at the end of the prompt (after a
+    /// space when it would touch a word), which opens the mention menu.
+    pub(in crate::conversation_view::thread_view) fn insert_claude_code_mention_trigger(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let editor = self.message_editor.read(cx).editor().clone();
+        window.focus(&editor.focus_handle(cx), cx);
+        cx.spawn_in(window, async move |_, cx| {
+            editor
+                .update_in(cx, |editor, window, cx| {
+                    if editor.read_only(cx) {
+                        return;
+                    }
+                    editor.move_to_end(&editor::actions::MoveToEnd, window, cx);
+                    let previous_character = {
+                        let snapshot = editor.buffer().read(cx).snapshot(cx);
+                        snapshot.reversed_chars_at(snapshot.len()).next()
+                    };
+                    editor.insert(mention_trigger_text(previous_character), window, cx);
+                    editor.show_completions(&editor::actions::ShowCompletions, window, cx);
+                })
+                .log_err();
+        })
+        .detach();
+    }
+
+    /// Claude Code's context ring, right after the `/` button: shown once less than
+    /// half of the context is left, and a click compacts the conversation.
+    fn render_claude_code_context_ring(&self, cx: &Context<Self>) -> Option<impl IntoElement> {
+        let usage = self.thread.read(cx).token_usage()?;
+        let percentage_used =
+            context_ring_percentage(usage.used_tokens, usage.max_tokens, usage.max_output_tokens)?;
+        let can_compact = self
+            .session_capabilities
+            .read()
+            .available_commands()
+            .iter()
+            .any(|command| command.name() == COMPACT_COMMAND);
+        let tooltip = context_ring_tooltip(percentage_used);
+        Some(
+            div()
+                .id("claude-code-context-ring")
+                .debug_selector(|| "claude-code-context-ring".into())
+                .flex_none()
+                .rounded(px(5.))
+                .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
+                .tooltip(move |_window, cx| {
+                    if can_compact {
+                        Tooltip::with_meta(tooltip.clone(), None, "Click to compact now.", cx)
+                    } else {
+                        Tooltip::simple(tooltip.clone(), cx)
+                    }
+                })
+                .when(can_compact, |this| {
+                    this.cursor_pointer()
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.compact_claude_code_conversation(window, cx);
+                        }))
+                })
+                .child(ContextRing::new(percentage_used)),
+        )
+    }
+
+    /// Sends `/compact`, as clicking the extension's ring does; queued behind a
+    /// running turn.
+    fn compact_claude_code_conversation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let command = format!("/{COMPACT_COMMAND}");
+        let is_native = leading_native_command(
+            &command,
+            self.session_capabilities.read().available_commands(),
+        )
+        .is_some();
+        let content = vec![acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
+            command,
+        ))];
+        cx.emit(AcpThreadViewEvent::Interacted);
+        if self.thread.read(cx).status() == ThreadStatus::Generating {
+            self.add_to_queue(content, Vec::new(), window, cx);
+        } else {
+            self.send_content(
+                Task::ready(Ok(Some((content, Vec::new())))),
+                is_native,
+                window,
+                cx,
+            );
+        }
+    }
+
     /// The extension's command button: a slash in a small outlined square.
     fn render_claude_code_slash_button(&self, cx: &Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
         div()
             .id("claude-code-slash-commands")
+            .debug_selector(|| "claude-code-slash-commands".into())
             .flex()
             .flex_none()
             .items_center()
