@@ -102,6 +102,15 @@ fn show_toast<Source: 'static>(
         .log_err();
 }
 
+/// Whether `workbench: restore previous layout` has anything to restore.
+pub(crate) fn has_previous_layout(cx: &App) -> bool {
+    KeyValueStore::global(cx)
+        .read_kvp(PREVIOUS_LAYOUT_KEY)
+        .log_err()
+        .flatten()
+        .is_some()
+}
+
 /// Writes the VS Code layout to the user settings file after remembering the
 /// user's own values for every key it changes.
 fn apply_vscode_layout(fs: Arc<dyn Fs>, cx: &App) -> Task<Result<()>> {
