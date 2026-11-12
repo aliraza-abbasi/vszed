@@ -16,6 +16,7 @@ doctest = false
 default = []
 
 [dependencies]
+agent_settings.workspace = true
 anyhow.workspace = true
 auto_update.workspace = true
 client.workspace = true
