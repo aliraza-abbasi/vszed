@@ -4009,7 +4009,8 @@ impl ThreadView {
         cx: &Context<Self>,
     ) -> Option<AnyElement> {
         if crate::ui_styles::claude_code_style_enabled(cx) {
-            return self.render_claude_code_activity_bar(window, cx);
+            // Drawn with the prompt box, floating over the transcript.
+            return None;
         }
         let thread = self.thread.read(cx);
         let action_log = thread.action_log();
@@ -5573,7 +5574,8 @@ impl ThreadView {
                 .into_any_element();
         }
         if crate::ui_styles::claude_code_style_enabled(cx) {
-            return self.render_claude_code_message_editor(window, cx);
+            // Floats over the transcript; see `render_ui_style_conversation`.
+            return Empty.into_any_element();
         }
 
         let focus_handle = self.message_editor.focus_handle(cx);
@@ -14339,7 +14341,7 @@ impl Render for ThreadView {
                     .flatten(),
                 |this, bar| this.child(bar),
             )
-            .child(conversation)
+            .child(self.render_ui_style_conversation(conversation, window, cx))
             .children(self.render_multi_root_callout(cx))
             .children(self.render_activity_bar(window, cx))
             .when_some(
