@@ -1731,6 +1731,10 @@ pub(crate) struct PromptAccent {
 
 pub(crate) fn prompt_accent(mode_id: Option<&str>, cx: &App) -> PromptAccent {
     let colors = cx.theme().colors();
+    // The extension draws the Plan, Auto and Bypass send icons in VS Code's
+    // `button.foreground`, which is white in the default themes. Zed themes have no
+    // equivalent token.
+    let button_foreground = gpui::white();
     match mode_id {
         Some("acceptEdits") => PromptAccent {
             ring: colors.text,
@@ -1740,14 +1744,14 @@ pub(crate) fn prompt_accent(mode_id: Option<&str>, cx: &App) -> PromptAccent {
         Some("plan") => PromptAccent {
             ring: colors.border_focused,
             button_background: colors.border_focused,
-            button_foreground: colors.text,
+            button_foreground,
         },
         Some("auto" | "bypassPermissions") => {
             let error = cx.theme().status().error;
             PromptAccent {
                 ring: error,
                 button_background: error,
-                button_foreground: colors.editor_background,
+                button_foreground,
             }
         }
         _ => PromptAccent {
