@@ -22,12 +22,16 @@ auto_update.workspace = true
 client.workspace = true
 db.workspace = true
 diagnostics.workspace = true
+editor.workspace = true
 encoding_selector.workspace = true
 extension_host.workspace = true
 fs.workspace = true
 futures.workspace = true
 git.workspace = true
+git_ui.workspace = true
+go_to_line.workspace = true
 gpui.workspace = true
+language.workspace = true
 language_selector.workspace = true
 line_ending_selector.workspace = true
 log.workspace = true
@@ -49,6 +53,7 @@ command_palette_hooks.workspace = true
 db = { workspace = true, features = ["test-support"] }
 fs = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
+language = { workspace = true, features = ["test-support"] }
 paths.workspace = true
 project = { workspace = true, features = ["test-support"] }
 settings = { workspace = true, features = ["test-support"] }

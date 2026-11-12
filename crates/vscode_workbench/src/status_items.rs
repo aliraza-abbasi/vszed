@@ -2,6 +2,8 @@ use std::time::Duration;
 
 use diagnostics::items::DiagnosticIndicator;
 use encoding_selector::ActiveBufferEncoding;
+use git_ui::GitBlameStatus;
+use go_to_line::cursor_position::CursorPosition;
 use gpui::{Action, Anchor, Empty, Entity, Subscription, Task, WeakEntity};
 use language_selector::ActiveBufferLanguage;
 use line_ending_selector::LineEndingIndicator;
@@ -16,7 +18,10 @@ use workspace::{
     dock::PanelButtons,
 };
 
-use crate::{Codicon, WorkbenchSettings};
+use crate::{
+    Codicon, WorkbenchSettings,
+    editor_status::{CursorPositionItem, IndentationItem, LanguageStatusItem},
+};
 
 const MAX_BRANCH_NAME_LENGTH: usize = 40;
 const SHORT_SHA_LENGTH: usize = 8;
@@ -98,9 +103,19 @@ fn apply_status_bar_items(
             }
         });
         // Right side items are drawn in reverse order, so an item inserted after
-        // another one shows up to its left.
+        // another one shows up to its left. This gives VS Code's order: blame,
+        // cursor position, indentation, encoding, line ending, language status,
+        // language.
         move_status_item_after::<ActiveBufferEncoding, LineEndingIndicator>(workspace, window, cx);
         move_status_item_after::<ActiveBufferLanguage, ActiveToolchain>(workspace, window, cx);
+        let language_status = cx.new(|cx| LanguageStatusItem::new(workspace, cx));
+        insert_status_item_after::<ActiveBufferLanguage, _>(workspace, language_status, window, cx);
+        let indentation = cx.new(IndentationItem::new);
+        insert_status_item_after::<ActiveBufferEncoding, _>(workspace, indentation, window, cx);
+        hide_status_items::<CursorPosition>(workspace, window, cx);
+        let cursor_position = cx.new(|_| CursorPositionItem::new());
+        insert_status_item_after::<IndentationItem, _>(workspace, cursor_position, window, cx);
+        move_status_item_after::<GitBlameStatus, CursorPositionItem>(workspace, window, cx);
         workspace.status_bar().update(cx, |status_bar, cx| {
             status_bar.add_rightmost_item(notification_bell, window, cx);
             // VS Code starts the status bar with the remote indicator. The threads
@@ -115,6 +130,11 @@ fn apply_status_bar_items(
         remove_status_items::<ProblemsItem>(workspace, cx);
         remove_status_items::<GitBranchItem>(workspace, cx);
         remove_status_items::<RemoteIndicator>(workspace, cx);
+        remove_status_items::<CursorPositionItem>(workspace, cx);
+        remove_status_items::<IndentationItem>(workspace, cx);
+        remove_status_items::<LanguageStatusItem>(workspace, cx);
+        return_moved_status_item::<GitBlameStatus>(workspace, window, cx);
+        restore_status_items::<CursorPosition>(workspace, window, cx);
         return_moved_status_item::<ActiveBufferLanguage>(workspace, window, cx);
         return_moved_status_item::<ActiveBufferEncoding>(workspace, window, cx);
         restore_status_items::<DiagnosticIndicator>(workspace, window, cx);
@@ -206,6 +226,24 @@ fn move_status_item_after<T: StatusItemView, Anchor: StatusItemView>(
     workspace.status_bar().update(cx, |status_bar, cx| {
         if let Some(anchor_position) = status_bar.position_of_item::<Anchor>() {
             status_bar.insert_item_after(anchor_position, item, window, cx);
+        }
+    });
+}
+
+/// Inserts `item` right after the status bar item of type `Anchor`, or at the
+/// left end of the right side when there is no such item.
+fn insert_status_item_after<Anchor: StatusItemView, T: StatusItemView>(
+    workspace: &Workspace,
+    item: Entity<T>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    workspace.status_bar().update(cx, |status_bar, cx| {
+        match status_bar.position_of_item::<Anchor>() {
+            Some(anchor_position) => {
+                status_bar.insert_item_after(anchor_position, item, window, cx)
+            }
+            None => status_bar.add_right_item(item, window, cx),
         }
     });
 }
@@ -603,18 +641,22 @@ mod tests {
     fn add_editor_items(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) {
         workspace.update_in(cx, |workspace, window, cx| {
             let diagnostics = cx.new(|cx| DiagnosticIndicator::new(workspace, cx));
+            let git_blame = cx.new(|_| GitBlameStatus::default());
             let other_item = cx.new(|_| OtherStatusItem);
             let encoding = cx.new(|_| ActiveBufferEncoding::new(workspace));
             let language = cx.new(|_| ActiveBufferLanguage::new(workspace));
             let toolchain = cx.new(|cx| ActiveToolchain::new(workspace, window, cx));
             let line_ending = cx.new(|_| LineEndingIndicator::default());
+            let cursor_position = cx.new(|_| CursorPosition::new(workspace));
             workspace.status_bar().update(cx, |status_bar, cx| {
                 status_bar.add_left_item(diagnostics, window, cx);
+                status_bar.add_left_item(git_blame, window, cx);
                 status_bar.add_left_item(other_item, window, cx);
                 status_bar.add_right_item(encoding, window, cx);
                 status_bar.add_right_item(language, window, cx);
                 status_bar.add_right_item(toolchain, window, cx);
                 status_bar.add_right_item(line_ending, window, cx);
+                status_bar.add_right_item(cursor_position, window, cx);
             });
         });
     }
@@ -628,12 +670,19 @@ mod tests {
         problems: Option<usize>,
         diagnostics: Option<usize>,
         hidden_diagnostics: Option<usize>,
+        git_blame: Option<usize>,
+        hidden_git_blame: Option<usize>,
         other_item: Option<usize>,
         notification_bell: Option<usize>,
         encoding: Option<usize>,
         language: Option<usize>,
+        language_status: Option<usize>,
         toolchain: Option<usize>,
         line_ending: Option<usize>,
+        indentation: Option<usize>,
+        cursor_position: Option<usize>,
+        hidden_cursor_position: Option<usize>,
+        vscode_cursor_position: Option<usize>,
     }
 
     fn item_positions(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> ItemPositions {
@@ -649,12 +698,21 @@ mod tests {
                 diagnostics: status_bar.position_of_item::<DiagnosticIndicator>(),
                 hidden_diagnostics: status_bar
                     .position_of_item::<StatusItemPlaceholder<DiagnosticIndicator>>(),
+                git_blame: status_bar.position_of_item::<GitBlameStatus>(),
+                hidden_git_blame: status_bar
+                    .position_of_item::<StatusItemPlaceholder<GitBlameStatus>>(),
                 other_item: status_bar.position_of_item::<OtherStatusItem>(),
                 notification_bell: status_bar.position_of_item::<NotificationBell>(),
                 encoding: status_bar.position_of_item::<ActiveBufferEncoding>(),
                 language: status_bar.position_of_item::<ActiveBufferLanguage>(),
+                language_status: status_bar.position_of_item::<LanguageStatusItem>(),
                 toolchain: status_bar.position_of_item::<ActiveToolchain>(),
                 line_ending: status_bar.position_of_item::<LineEndingIndicator>(),
+                indentation: status_bar.position_of_item::<IndentationItem>(),
+                cursor_position: status_bar.position_of_item::<CursorPosition>(),
+                hidden_cursor_position: status_bar
+                    .position_of_item::<StatusItemPlaceholder<CursorPosition>>(),
+                vscode_cursor_position: status_bar.position_of_item::<CursorPositionItem>(),
             }
         })
     }
@@ -681,8 +739,9 @@ mod tests {
         let (workspace, cx) = open_workspace(cx).await;
         add_editor_items(&workspace, cx);
         let original_positions = item_positions(&workspace, cx);
-        // Left: dock buttons, diagnostics, other item. Right, drawn in reverse:
-        // right and bottom dock buttons, encoding, language, toolchain, line ending.
+        // Left: dock buttons, diagnostics, blame, other item. Right, drawn in
+        // reverse: right and bottom dock buttons, encoding, language, toolchain,
+        // line ending, cursor position.
         assert_eq!(
             original_positions,
             ItemPositions {
@@ -693,12 +752,19 @@ mod tests {
                 problems: None,
                 diagnostics: Some(1),
                 hidden_diagnostics: None,
-                other_item: Some(2),
+                git_blame: Some(2),
+                hidden_git_blame: None,
+                other_item: Some(3),
                 notification_bell: None,
-                encoding: Some(5),
-                language: Some(6),
-                toolchain: Some(7),
-                line_ending: Some(8),
+                encoding: Some(6),
+                language: Some(7),
+                language_status: None,
+                toolchain: Some(8),
+                line_ending: Some(9),
+                indentation: None,
+                cursor_position: Some(10),
+                hidden_cursor_position: None,
+                vscode_cursor_position: None,
             }
         );
 
@@ -713,16 +779,24 @@ mod tests {
                 problems: Some(3),
                 diagnostics: None,
                 hidden_diagnostics: Some(4),
-                other_item: Some(5),
+                git_blame: Some(19),
+                hidden_git_blame: Some(5),
+                other_item: Some(6),
                 // The first right side item, so it is drawn last, after the right
-                // and bottom dock buttons (7 and 8).
-                notification_bell: Some(6),
-                // Placeholders for encoding and language hold 9 and 10. Drawn from
-                // left to right: encoding, line ending, language, toolchain.
-                toolchain: Some(11),
-                language: Some(12),
-                line_ending: Some(13),
-                encoding: Some(14),
+                // and bottom dock buttons (8 and 9).
+                notification_bell: Some(7),
+                // Placeholders for encoding and language hold 10 and 11. Drawn
+                // from left to right: blame, cursor position, indentation,
+                // encoding, line ending, language status, language, toolchain.
+                toolchain: Some(12),
+                language: Some(13),
+                language_status: Some(14),
+                line_ending: Some(15),
+                encoding: Some(16),
+                indentation: Some(17),
+                vscode_cursor_position: Some(18),
+                cursor_position: None,
+                hidden_cursor_position: Some(20),
             }
         );
 
@@ -763,7 +837,7 @@ mod tests {
         assert_eq!(positions.remote_indicator, Some(1));
         assert_eq!(positions.git_branch, Some(2));
         assert_eq!(positions.problems, Some(3));
-        assert_eq!(positions.notification_bell, Some(6));
+        assert_eq!(positions.notification_bell, Some(7));
 
         // Turned off in the order they were turned on in, which leaves each one
         // restoring items while the other one's are still in place.
