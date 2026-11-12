@@ -19750,6 +19750,7 @@ dependencies = [
 name = "vscode_workbench"
 version = "0.1.0"
 dependencies = [
+ "agent_settings",
  "anyhow",
  "auto_update",
  "call",
