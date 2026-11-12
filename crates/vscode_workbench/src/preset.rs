@@ -8,10 +8,10 @@ use futures::channel::oneshot;
 use gpui::{App, AsyncApp, Context, Entity, Task, WeakEntity, Window, actions};
 use serde::{Deserialize, Serialize};
 use settings::{
-    BaseKeymapContent, BottomDockLayout, DockPosition, DockSide, FontFamilyName, FontSize,
-    IconThemeName, IconThemeSelection, SettingsContent, SettingsStore, ShowDiagnostics,
-    ShowMinimap, TerminalDockPosition, ThemeAppearanceMode, ThemeName, ThemeSelection,
-    update_settings_file_with_completion,
+    BaseKeymapContent, BottomDockLayout, DockPosition, DockSide, EncodingDisplayOptions,
+    FontFamilyName, FontSize, IconThemeName, IconThemeSelection, MinimapThumb, SettingsContent,
+    SettingsStore, ShowDiagnostics, ShowMinimap, TerminalDockPosition, ThemeAppearanceMode,
+    ThemeName, ThemeSelection, update_settings_file_with_completion,
 };
 use util::ResultExt as _;
 use workspace::{Toast, Workspace, notifications::NotificationId};
@@ -297,6 +297,9 @@ struct LayoutSnapshot {
     tab_git_status: Option<bool>,
     tab_diagnostics: Option<ShowDiagnostics>,
     minimap: Option<ShowMinimap>,
+    minimap_thumb: Option<MinimapThumb>,
+    status_bar_encoding_button: Option<EncodingDisplayOptions>,
+    status_bar_line_endings_button: Option<bool>,
     breadcrumbs: Option<bool>,
     buffer_font_family: Option<FontFamilyName>,
     buffer_font_size: Option<FontSize>,
@@ -311,6 +314,8 @@ impl LayoutSnapshot {
         let title_bar = content.title_bar.as_ref();
         let tab_bar = content.tab_bar.as_ref();
         let tabs = content.tabs.as_ref();
+        let minimap = content.editor.minimap.as_ref();
+        let status_bar = content.status_bar.as_ref();
         Self {
             base_keymap: content.base_keymap,
             project_panel_dock: content.project_panel.as_ref().and_then(|panel| panel.dock),
@@ -345,11 +350,12 @@ impl LayoutSnapshot {
             tab_file_icons: tabs.and_then(|tabs| tabs.file_icons),
             tab_git_status: tabs.and_then(|tabs| tabs.git_status),
             tab_diagnostics: tabs.and_then(|tabs| tabs.show_diagnostics),
-            minimap: content
-                .editor
-                .minimap
-                .as_ref()
-                .and_then(|minimap| minimap.show),
+            minimap: minimap.and_then(|minimap| minimap.show),
+            minimap_thumb: minimap.and_then(|minimap| minimap.thumb),
+            status_bar_encoding_button: status_bar
+                .and_then(|status_bar| status_bar.active_encoding_button),
+            status_bar_line_endings_button: status_bar
+                .and_then(|status_bar| status_bar.line_endings_button),
             breadcrumbs: content
                 .editor
                 .toolbar
@@ -413,6 +419,11 @@ impl LayoutSnapshot {
         });
         update_nested(&mut content.editor.minimap, |minimap| {
             minimap.show = self.minimap;
+            minimap.thumb = self.minimap_thumb;
+        });
+        update_nested(&mut content.status_bar, |status_bar| {
+            status_bar.active_encoding_button = self.status_bar_encoding_button;
+            status_bar.line_endings_button = self.status_bar_line_endings_button;
         });
         update_nested(&mut content.editor.toolbar, |toolbar| {
             toolbar.breadcrumbs = self.breadcrumbs;
@@ -455,6 +466,11 @@ impl LayoutSnapshot {
         self.tab_git_status = Some(true);
         self.tab_diagnostics = Some(ShowDiagnostics::Errors);
         self.minimap = Some(ShowMinimap::Always);
+        // VS Code's `editor.minimap.showSlider` default.
+        self.minimap_thumb = Some(MinimapThumb::Hover);
+        // VS Code always shows the encoding and line ending of the active file.
+        self.status_bar_encoding_button = Some(EncodingDisplayOptions::Enabled);
+        self.status_bar_line_endings_button = Some(true);
         self.breadcrumbs = Some(true);
         // VS Code's per-platform editor defaults, from its `fontInfo.ts`.
         let (buffer_font_family, buffer_font_size) = if cfg!(target_os = "macos") {
@@ -502,6 +518,7 @@ mod tests {
         "tabs": { "close_position": "left", "file_icons": false },
         "tab_bar": { "show": true, "show_nav_history_buttons": true },
         "search": { "button": true, "regex": true },
+        "status_bar": { "line_endings_button": false, "cursor_position_button": true },
         "title_bar": { "show_branch_name": true, "show_user_picture": false }
     }"#;
 
@@ -589,6 +606,13 @@ mod tests {
         assert_eq!(applied["tabs"]["git_status"], json!(true));
         assert_eq!(applied["tabs"]["show_diagnostics"], json!("errors"));
         assert_eq!(applied["minimap"]["show"], json!("always"));
+        assert_eq!(applied["minimap"]["thumb"], json!("hover"));
+        assert_eq!(
+            applied["status_bar"]["active_encoding_button"],
+            json!("enabled")
+        );
+        assert_eq!(applied["status_bar"]["line_endings_button"], json!(true));
+        assert_eq!(applied["status_bar"]["cursor_position_button"], json!(true));
         assert_eq!(applied["toolbar"]["breadcrumbs"], json!(true));
         let (expected_font_family, expected_font_size) = if cfg!(target_os = "macos") {
             ("Menlo", 12.0)
@@ -617,6 +641,13 @@ mod tests {
         assert_eq!(restored_settings, original_settings);
         assert_eq!(restored["search"]["button"], json!(true));
         assert_eq!(restored["tab_bar"]["show_nav_history_buttons"], json!(true));
+        assert_eq!(restored["status_bar"]["line_endings_button"], json!(false));
+        assert!(
+            restored["status_bar"]
+                .get("active_encoding_button")
+                .is_none(),
+            "status_bar.active_encoding_button was not set before the layout was applied: {restored:#}"
+        );
         for key in ["show_sign_in", "show_user_menu"] {
             assert!(
                 restored["title_bar"].get(key).is_none(),
