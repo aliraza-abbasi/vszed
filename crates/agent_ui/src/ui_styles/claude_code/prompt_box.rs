@@ -2,56 +2,31 @@
 // descendant of `thread_view` and can reuse `ThreadView`'s private state and
 // helpers, such as the add-context menu and the token usage ring.
 
-use std::rc::Rc;
+use std::time::Instant;
 
-use acp_thread::AgentSessionConfigOptions;
-use agent_servers::AgentServer;
-use editor::ToOffset as _;
 use editor::code_context_menus::CodeContextMenu;
-use fs::Fs;
+use editor::{EditorMode, ToOffset as _};
+use gpui::{BoxShadow, canvas, linear_color_stop, linear_gradient, point};
 use ui::DocumentationSide;
 
 use super::*;
-use crate::config_options::set_config_option_and_default;
 use crate::ui::documentation_aside_side;
 use crate::ui_styles::claude_code::{
-    QUEUE_PLACEHOLDER, effort_display_name, first_select_option, idle_placeholder,
-    is_claude_code_placeholder, mode_display_name, mode_icon, model_chip_label,
-    remember_zed_placeholder, select_entries, toggle_option_state, toggled_option_value,
+    CacheClockElement, ClaudeCodeModelPicker, ConfigOptionsHandle, PromptAccent, QUEUE_PLACEHOLDER,
+    StatusDot, agent_count_label, agent_summaries, agents_chip_tooltip, agents_dot_state,
+    first_select_option, idle_placeholder, is_claude_code_placeholder, live_agent_count,
+    mode_display_name, mode_icon, model_chip_parts, open_agent_map, prompt_accent,
+    remember_zed_placeholder, select_entries, set_model_picker, thread_activity,
 };
 
 pub(super) const PROMPT_BOX_RADIUS: Pixels = px(8.);
-
-/// What the chips need to read and change the session's config options.
-#[derive(Clone)]
-struct ConfigOptionsHandle {
-    config_options: Rc<dyn AgentSessionConfigOptions>,
-    agent_server: Rc<dyn AgentServer>,
-    fs: Arc<dyn Fs>,
-}
-
-impl ConfigOptionsHandle {
-    fn options(&self) -> Vec<acp_v2::SessionConfigOption> {
-        self.config_options.config_options()
-    }
-
-    fn set(
-        &self,
-        config_id: acp_v2::SessionConfigId,
-        value: acp_v2::SessionConfigOptionValue,
-        cx: &mut App,
-    ) {
-        set_config_option_and_default(
-            self.config_options.clone(),
-            self.agent_server.clone(),
-            config_id,
-            value,
-            self.fs.clone(),
-            cx,
-        )
-        .detach_and_log_err(cx);
-    }
-}
+/// The extension's prompt box is at most 680px wide, centered in the editor.
+const PROMPT_BOX_MAX_WIDTH: Pixels = px(680.);
+/// The transcript fades out over this height above the bottom of the editor, behind
+/// and beside the floating prompt box.
+const TRANSCRIPT_FADE_HEIGHT: Pixels = px(150.);
+/// The input grows with its content up to about 200px, then scrolls.
+const MAX_INPUT_LINES: usize = 9;
 
 impl ThreadView {
     /// The Claude Code prompt box: a rounded, bordered box at the bottom of the
@@ -64,6 +39,7 @@ impl ThreadView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         self.sync_claude_code_placeholder(window, cx);
+        self.sync_claude_code_editor_mode(cx);
 
         // Like Claude Code, a pending permission prompt replaces the prompt box.
         // Focus follows it: the card while it is up, the editor once it's answered.
@@ -93,17 +69,56 @@ impl ThreadView {
             }
         }
 
-        let editor_background = cx.theme().colors().editor_background;
-        let border_color = if self
+        let colors = cx.theme().colors().clone();
+        let editor_background = colors.editor_background;
+        let config_options = self.claude_code_config_options(cx);
+        let mode_id = config_options.as_ref().and_then(|config_options| {
+            let options = config_options.options();
+            let mode = first_select_option(&options, &acp_v2::SessionConfigOptionCategory::Mode)?;
+            match &mode.kind {
+                acp_v2::SessionConfigKind::Select(select) => {
+                    Some(select.current_value.0.to_string())
+                }
+                _ => None,
+            }
+        });
+        let accent = prompt_accent(mode_id.as_deref(), cx);
+        let is_focused = self
             .message_editor
             .focus_handle(cx)
-            .contains_focused(window, cx)
-        {
-            cx.theme().colors().border_focused
+            .contains_focused(window, cx);
+        let (border_color, shadows) = if is_focused {
+            (
+                accent.ring,
+                vec![
+                    BoxShadow {
+                        color: accent.ring.opacity(0.12),
+                        offset: point(px(0.), px(0.)),
+                        blur_radius: px(0.),
+                        spread_radius: px(3.),
+                        inset: false,
+                    },
+                    BoxShadow {
+                        color: accent.ring.opacity(0.2),
+                        offset: point(px(0.), px(1.)),
+                        blur_radius: px(2.),
+                        spread_radius: px(0.),
+                        inset: false,
+                    },
+                ],
+            )
         } else {
-            cx.theme().colors().border
+            (
+                colors.border,
+                vec![BoxShadow {
+                    color: gpui::black().opacity(0.1),
+                    offset: point(px(0.), px(1.)),
+                    blur_radius: px(2.),
+                    spread_radius: px(0.),
+                    inset: false,
+                }],
+            )
         };
-        let max_content_width = AgentSettings::get_global(cx).max_content_width;
         let editor_expanded = self.editor_expanded && self.has_visible_conversation(cx);
         let composer_is_read_only = self.message_editor.read(cx).editor().read(cx).read_only(cx);
         let discard_draft_button = composer_is_read_only.then(|| {
@@ -119,10 +134,9 @@ impl ThreadView {
                 }))
         });
 
-        let config_options = self.claude_code_config_options(cx);
         let model_chip = match &config_options {
             Some(config_options) => self
-                .render_claude_code_model_chip(config_options)
+                .render_claude_code_model_chip(config_options, cx)
                 .map(IntoElement::into_any_element),
             None => self
                 .model_selector
@@ -158,16 +172,19 @@ impl ThreadView {
             .flex_none()
             .flex_wrap()
             .justify_between()
-            .gap_1()
-            .px_1p5()
-            .pb_1p5()
+            .gap_1p5()
+            .p_1()
+            .border_t_1()
+            .border_color(colors.border_variant)
             .child(
                 h_flex()
                     .min_w_0()
                     .flex_wrap()
-                    .gap_0p5()
+                    .gap_1()
                     .child(self.render_add_context_button(cx))
                     .child(self.render_claude_code_slash_button(cx))
+                    .child(CacheClockElement::new(cx.entity_id()))
+                    .children(self.render_claude_code_agents_chip(cx))
                     .children(model_chip)
                     .children(native_controls)
                     .children(self.render_token_usage(cx)),
@@ -180,53 +197,144 @@ impl ThreadView {
                     .children(self.render_activity_status_label(cx))
                     .children(discard_draft_button)
                     .children(mode_chip)
-                    .child(self.render_claude_code_send_button(cx)),
+                    .child(self.render_claude_code_send_button(&accent, cx)),
             );
 
-        let prompt_box = v_flex()
+        let model_picker = thread_activity(cx.entity_id(), cx)
+            .and_then(|activity| activity.model_picker().cloned());
+
+        v_flex()
             .id("claude-code-prompt-box")
             .debug_selector(|| "claude-code-prompt-box".into())
+            .relative()
             .w_full()
             .min_w_0()
             .when(editor_expanded, |this| this.h(vh(0.8, window)))
             .rounded(PROMPT_BOX_RADIUS)
             .border_1()
             .border_color(border_color)
+            .shadow(shadows)
             .bg(editor_background)
+            .block_mouse_except_scroll()
+            .on_action(cx.listener(Self::handle_message_editor_move_up))
+            .on_action(cx.listener(Self::expand_message_editor))
             .child(
                 div()
                     .w_full()
                     .min_w_0()
                     .when(editor_expanded, |this| this.flex_1().min_h_0())
-                    .px_3()
-                    .pt_2p5()
-                    .pb_1()
+                    .px_3p5()
+                    .py_2p5()
                     .child(self.message_editor.clone()),
             )
-            .child(footer);
+            .child(footer)
+            .when_some(model_picker, |this, picker| {
+                this.child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .right_0()
+                        .bottom_full()
+                        .mb_1()
+                        .child(picker),
+                )
+            })
+            .into_any_element()
+    }
 
-        h_flex()
-            .w_full()
-            .flex_none()
+    /// The Claude Code style lays the transcript over the whole editor and floats the
+    /// prompt box (with Zed's plan, edits and queue rows above it) over its bottom,
+    /// centered and at most 680px wide. The transcript fades out behind and beside the
+    /// box and keeps its last entry clear of it.
+    pub(in crate::conversation_view::thread_view) fn render_ui_style_conversation(
+        &mut self,
+        conversation: AnyElement,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if !crate::ui_styles::claude_code_style_enabled(cx) {
+            return conversation;
+        }
+        let activity_bar = self.render_claude_code_activity_bar(window, cx);
+        let prompt_box =
+            (!self.is_subagent()).then(|| self.render_claude_code_message_editor(window, cx));
+        let editor_background = cx.theme().colors().editor_background;
+        let floating_height =
+            thread_activity(cx.entity_id(), cx).map(|activity| activity.floating_prompt_height());
+
+        let floating = h_flex()
+            .absolute()
+            .left_0()
+            .right_0()
+            .bottom_0()
             .justify_center()
             .px_3()
             .pt_1()
             .pb_3()
-            .bg(editor_background)
-            .on_action(cx.listener(Self::handle_message_editor_move_up))
-            .on_action(cx.listener(Self::expand_message_editor))
+            .child(
+                v_flex()
+                    .w_full()
+                    .max_w(PROMPT_BOX_MAX_WIDTH)
+                    .min_w_0()
+                    .gap_1()
+                    .children(activity_bar)
+                    .children(prompt_box),
+            )
+            .when_some(floating_height, |this, floating_height| {
+                this.child(
+                    canvas(
+                        move |bounds, window, _| {
+                            let height = bounds.size.height;
+                            if floating_height.get() != height {
+                                floating_height.set(height);
+                                window.refresh();
+                            }
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .inset_0(),
+                )
+            });
+
+        div()
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .size_full()
+            .child(conversation)
             .child(
                 div()
-                    .when_some(max_content_width, |this, max_width| {
-                        this.flex_basis(max_width)
-                    })
-                    .when(max_content_width.is_none(), |this| this.w_full())
-                    .min_w_0()
-                    .flex_shrink_1()
-                    .flex_grow_0()
-                    .child(prompt_box),
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .bottom_0()
+                    .h(TRANSCRIPT_FADE_HEIGHT)
+                    .bg(linear_gradient(
+                        180.,
+                        linear_color_stop(editor_background.opacity(0.), 0.),
+                        linear_color_stop(editor_background, 1.),
+                    )),
             )
+            .child(floating)
             .into_any_element()
+    }
+
+    /// The prompt starts at one line and grows with its content, like Claude Code's.
+    fn sync_claude_code_editor_mode(&mut self, cx: &mut Context<Self>) {
+        if self.editor_expanded {
+            return;
+        }
+        let mode = EditorMode::AutoHeight {
+            min_lines: 1,
+            max_lines: Some(MAX_INPUT_LINES),
+        };
+        let is_current = self.message_editor.read(cx).editor().read(cx).mode() == &mode;
+        if !is_current {
+            self.message_editor.update(cx, |message_editor, cx| {
+                message_editor.set_mode(mode, cx);
+            });
+        }
     }
 
     /// Zed's activity bar (pending permissions, the plan, edited files and the
@@ -272,7 +380,6 @@ impl ThreadView {
 
         // Mirrors `render_activity_bar`, which keeps ACP edit controls enabled.
         let pending_edits = false;
-        let max_content_width = AgentSettings::get_global(cx).max_content_width;
         let colors = cx.theme().colors();
 
         let activity_box = v_flex()
@@ -285,6 +392,7 @@ impl ThreadView {
             .border_1()
             .border_color(colors.border)
             .bg(self.activity_bar_bg(cx))
+            .block_mouse_except_scroll()
             .when_some(awaiting_permission, |this, element| this.child(element))
             .when(
                 has_awaiting_permission && (has_plan || has_changed_buffers || has_queue),
@@ -329,27 +437,7 @@ impl ThreadView {
                 })
             });
 
-        Some(
-            h_flex()
-                .w_full()
-                .flex_none()
-                .justify_center()
-                .px_3()
-                .pt_1()
-                .bg(colors.editor_background)
-                .child(
-                    div()
-                        .when_some(max_content_width, |this, max_width| {
-                            this.flex_basis(max_width)
-                        })
-                        .when(max_content_width.is_none(), |this| this.w_full())
-                        .min_w_0()
-                        .flex_shrink_1()
-                        .flex_grow_0()
-                        .child(activity_box),
-                )
-                .into_any_element(),
-        )
+        Some(activity_box.into_any_element())
     }
 
     fn claude_code_config_options(&self, cx: &App) -> Option<ConfigOptionsHandle> {
@@ -361,40 +449,64 @@ impl ThreadView {
         })
     }
 
-    /// Claude Code shows "Queue another message…" while a turn runs. The idle
-    /// placeholder isn't documented, so a short neutral one is used. Zed's own
-    /// placeholder is remembered so switching styles back restores it.
+    /// Claude Code shows "Queue another message…" while a turn runs and names the
+    /// focus shortcut otherwise. Zed's own placeholder is remembered so switching
+    /// styles back restores it.
     fn sync_claude_code_placeholder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let is_running = matches!(
             self.thread.read(cx).status(),
             ThreadStatus::Generating | ThreadStatus::Unconfirmed
         );
         let placeholder = if is_running {
-            QUEUE_PLACEHOLDER.to_string()
+            QUEUE_PLACEHOLDER
         } else {
-            idle_placeholder(&self.agent_display_name)
+            idle_placeholder()
         };
         let editor = self.message_editor.read(cx).editor().clone();
         let current = editor.update(cx, |editor, cx| editor.placeholder_text(cx));
-        if current.as_deref() == Some(placeholder.as_str()) {
+        if current.as_deref() == Some(placeholder) {
             return;
         }
         if let Some(current) = current.filter(|current| !is_claude_code_placeholder(current)) {
             remember_zed_placeholder(cx.entity_id(), current, cx);
         }
         self.message_editor.update(cx, |message_editor, cx| {
-            message_editor.set_placeholder_text(&placeholder, window, cx);
+            message_editor.set_placeholder_text(placeholder, window, cx);
         });
     }
 
+    /// The extension's command button: a slash in a small outlined square.
     fn render_claude_code_slash_button(&self, cx: &Context<Self>) -> impl IntoElement {
-        IconButton::new("claude-code-slash-commands", IconName::Slash)
-            .icon_size(IconSize::Small)
-            .icon_color(Color::Muted)
+        let colors = cx.theme().colors();
+        div()
+            .id("claude-code-slash-commands")
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .size(px(24.))
+            .rounded(px(5.))
+            .cursor_pointer()
+            .hover(|style| style.bg(colors.ghost_element_hover))
             .tooltip(Tooltip::text("Commands"))
             .on_click(cx.listener(|this, _, window, cx| {
                 this.open_claude_code_slash_menu(window, cx);
             }))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(px(15.))
+                    .rounded(px(3.))
+                    .border_1()
+                    .border_color(colors.icon_muted)
+                    .child(
+                        Icon::new(IconName::Slash)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+            )
     }
 
     /// Types a `/` where a slash command can start and opens the completions,
@@ -434,33 +546,121 @@ impl ThreadView {
         .detach();
     }
 
+    /// The model pill: the model, its effort level muted, and "· Ultracode" when on.
+    /// It opens Claude Code's model picker above the prompt box.
     fn render_claude_code_model_chip(
         &self,
         config_options: &ConfigOptionsHandle,
+        cx: &Context<Self>,
     ) -> Option<impl IntoElement> {
         let options = config_options.options();
-        let label = model_chip_label(&options)?;
-        let is_read_only = config_options.config_options.is_read_only();
-        let trigger = Button::new("claude-code-model-chip", label)
-            .label_size(LabelSize::Small)
-            .color(Color::Muted)
-            .disabled(is_read_only);
+        let parts = model_chip_parts(&options)?;
+        let is_read_only = config_options.is_read_only();
         let config_options = config_options.clone();
         Some(
-            PopoverMenu::new("claude-code-model-menu")
-                .trigger_with_tooltip(trigger, Tooltip::text("Switch model"))
-                .anchor(gpui::Anchor::BottomLeft)
-                .offset(gpui::Point {
-                    x: px(0.0),
-                    y: px(-2.0),
-                })
-                .menu(move |window, cx| {
-                    let config_options = config_options.clone();
-                    Some(ContextMenu::build(window, cx, move |menu, _, cx| {
-                        build_model_menu(menu, &config_options, documentation_aside_side(cx))
+            render_pill("claude-code-model-chip", cx)
+                .tooltip(Tooltip::text("Switch model"))
+                .when(!is_read_only, |this| {
+                    this.on_click(cx.listener(move |this, _, window, cx| {
+                        this.toggle_claude_code_model_picker(config_options.clone(), window, cx);
                     }))
+                })
+                .when_some(parts.model, |this, model| {
+                    this.child(Label::new(model).size(LabelSize::Small))
+                })
+                .when_some(parts.effort, |this, effort| {
+                    this.child(
+                        Label::new(effort)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                })
+                .when(parts.ultracode, |this| {
+                    this.child(
+                        Label::new("· Ultracode")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
                 }),
         )
+    }
+
+    fn toggle_claude_code_model_picker(
+        &mut self,
+        config_options: ConfigOptionsHandle,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let thread_view_id = cx.entity_id();
+        let activity = thread_activity(thread_view_id, cx);
+        // The click that dismissed the picker also lands here; don't reopen it.
+        let just_dismissed = activity
+            .and_then(|activity| activity.model_picker_dismissed_at())
+            .is_some_and(|dismissed_at| dismissed_at.elapsed().as_millis() < 300);
+        if activity.is_some_and(|activity| activity.model_picker().is_some()) || just_dismissed {
+            set_model_picker(thread_view_id, None, cx);
+            cx.notify();
+            return;
+        }
+        let picker = cx.new(|cx| ClaudeCodeModelPicker::new(config_options, cx));
+        cx.subscribe_in(
+            &picker,
+            window,
+            move |this, _, _: &gpui::DismissEvent, window, cx| {
+                set_model_picker(thread_view_id, None, cx);
+                let editor_focus = this.message_editor.focus_handle(cx);
+                window.focus(&editor_focus, cx);
+                cx.notify();
+            },
+        )
+        .detach();
+        window.focus(&picker.focus_handle(cx), cx);
+        set_model_picker(thread_view_id, Some(picker.into()), cx);
+        cx.notify();
+    }
+
+    /// "● N agents": shown once the session has subagents, counting the ones still
+    /// working, with a green dot while any works. Opens the agent map.
+    fn render_claude_code_agents_chip(&self, cx: &Context<Self>) -> Option<impl IntoElement> {
+        let agents = agent_summaries(
+            self.thread.read(cx),
+            thread_activity(cx.entity_id(), cx),
+            Instant::now(),
+            cx,
+        );
+        if agents.is_empty() {
+            return None;
+        }
+        let dot = agents_dot_state(&agents);
+        Some(
+            render_pill("claude-code-agents-chip", cx)
+                .gap_1()
+                .tooltip(Tooltip::text(agents_chip_tooltip(dot)))
+                .on_click(
+                    cx.listener(|this, _, window, cx| this.open_claude_code_agent_map(window, cx)),
+                )
+                .child(StatusDot::new(dot).size(px(6.)))
+                .child(
+                    Label::new(agent_count_label(live_agent_count(&agents))).size(LabelSize::Small),
+                ),
+        )
+    }
+
+    fn open_claude_code_agent_map(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let model_name = self
+            .claude_code_config_options(cx)
+            .and_then(|config_options| {
+                model_chip_parts(&config_options.options()).and_then(|parts| parts.model)
+            });
+        let thread = self.thread.clone();
+        let thread_view_id = cx.entity_id();
+        // The workspace may be updating this view; open the modal once it is done.
+        window.defer(cx, move |window, cx| {
+            open_agent_map(&workspace, thread, thread_view_id, model_name, window, cx);
+        });
     }
 
     fn render_claude_code_mode_chip(
@@ -517,7 +717,11 @@ impl ThreadView {
         )
     }
 
-    fn render_claude_code_send_button(&self, cx: &Context<Self>) -> AnyElement {
+    fn render_claude_code_send_button(
+        &self,
+        accent: &PromptAccent,
+        cx: &Context<Self>,
+    ) -> AnyElement {
         let message_editor = self.message_editor.read(cx);
         let is_editor_empty = message_editor.is_empty(cx);
         let status = self.thread.read(cx).status();
@@ -545,16 +749,25 @@ impl ThreadView {
                 .into_any_element();
         }
 
+        // The extension's send button: filled with the mode's accent, dimmed while
+        // there is nothing to send.
         let is_disabled = is_editor_empty && !is_generating;
-        IconButton::new("claude-code-send", IconName::ArrowUp)
-            .icon_size(IconSize::Small)
-            .style(ButtonStyle::Filled)
-            .map(|this| {
-                if is_disabled {
-                    this.disabled(true).icon_color(Color::Muted)
-                } else {
-                    this.icon_color(Color::Accent)
-                }
+        div()
+            .id("claude-code-send")
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .size(px(24.))
+            .rounded(px(5.))
+            .bg(accent.button_background)
+            .when(is_disabled, |this| this.opacity(0.4))
+            .when(!is_disabled, |this| {
+                this.cursor_pointer()
+                    .hover(|style| style.opacity(0.9))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.send(window, cx);
+                    }))
             })
             .tooltip(move |_window, cx| {
                 let label = if is_generating {
@@ -564,137 +777,13 @@ impl ThreadView {
                 };
                 Tooltip::for_action(label, &Chat, cx)
             })
-            .on_click(cx.listener(|this, _, window, cx| {
-                this.send(window, cx);
-            }))
+            .child(
+                Icon::new(IconName::ArrowUp)
+                    .size(IconSize::Small)
+                    .color(Color::Custom(accent.button_foreground)),
+            )
             .into_any_element()
     }
-}
-
-/// The model chip's menu: the models, then the Effort levels, then the
-/// model-related switches (Fast mode, Ultracode), like Claude Code's model
-/// picker. Remaining options without a known place get their own section so
-/// nothing the adapter offers becomes unreachable.
-fn build_model_menu(
-    mut menu: ContextMenu,
-    config_options: &ConfigOptionsHandle,
-    aside_side: DocumentationSide,
-) -> ContextMenu {
-    let options = config_options.options();
-    let is_read_only = config_options.config_options.is_read_only();
-    let mut sections = 0;
-
-    let model = first_select_option(&options, &acp_v2::SessionConfigOptionCategory::Model);
-    let effort = first_select_option(&options, &acp_v2::SessionConfigOptionCategory::ThoughtLevel);
-
-    for (option, title) in [(model, "Model"), (effort, "Effort")] {
-        let Some(option) = option else {
-            continue;
-        };
-        let acp_v2::SessionConfigKind::Select(select) = &option.kind else {
-            continue;
-        };
-        if sections > 0 {
-            menu = menu.separator();
-        }
-        sections += 1;
-        menu = menu.header(title);
-        let is_effort = title == "Effort";
-        for entry in select_entries(select) {
-            let is_selected = entry.value == select.current_value;
-            let label = if is_effort {
-                effort_display_name(&entry)
-            } else {
-                SharedString::from(entry.name.clone())
-            };
-            let config_options = config_options.clone();
-            let config_id = option.config_id.clone();
-            let value = entry.value.clone();
-            menu = menu.item(
-                ContextMenuEntry::new(label)
-                    .toggleable(IconPosition::End, is_selected)
-                    .disabled(is_read_only)
-                    .when_some(entry.description.clone(), |item, description| {
-                        item.documentation_aside(aside_side, move |_| {
-                            Label::new(description.clone()).into_any_element()
-                        })
-                    })
-                    .handler(move |_, cx| {
-                        config_options.set(
-                            config_id.clone(),
-                            acp_v2::SessionConfigOptionValue::id(value.clone()),
-                            cx,
-                        );
-                    }),
-            );
-        }
-    }
-
-    let switches = options
-        .iter()
-        .filter(|option| {
-            matches!(
-                option.category,
-                Some(acp_v2::SessionConfigOptionCategory::ModelConfig)
-                    | Some(acp_v2::SessionConfigOptionCategory::ThoughtLevel)
-            )
-        })
-        .filter_map(|option| Some((option, toggle_option_state(option)?)))
-        .collect::<Vec<_>>();
-    if !switches.is_empty() {
-        if sections > 0 {
-            menu = menu.separator();
-        }
-        sections += 1;
-        for (option, enabled) in switches {
-            let config_options = config_options.clone();
-            let toggled = option.clone();
-            menu = menu.item(
-                ContextMenuEntry::new(option.name.clone())
-                    .toggleable(IconPosition::End, enabled)
-                    .disabled(is_read_only)
-                    .handler(move |_, cx| {
-                        if let Some(value) = toggled_option_value(&toggled, !enabled) {
-                            config_options.set(toggled.config_id.clone(), value, cx);
-                        }
-                    }),
-            );
-        }
-    }
-
-    for option in options
-        .iter()
-        .filter(|option| option.category.is_none() && toggle_option_state(option).is_none())
-    {
-        let acp_v2::SessionConfigKind::Select(select) = &option.kind else {
-            continue;
-        };
-        if sections > 0 {
-            menu = menu.separator();
-        }
-        sections += 1;
-        menu = menu.header(option.name.clone());
-        for entry in select_entries(select) {
-            let is_selected = entry.value == select.current_value;
-            let config_options = config_options.clone();
-            let config_id = option.config_id.clone();
-            let value = entry.value.clone();
-            menu = menu.item(
-                ContextMenuEntry::new(entry.name.clone())
-                    .toggleable(IconPosition::End, is_selected)
-                    .disabled(is_read_only)
-                    .handler(move |_, cx| {
-                        config_options.set(
-                            config_id.clone(),
-                            acp_v2::SessionConfigOptionValue::id(value.clone()),
-                            cx,
-                        );
-                    }),
-            );
-        }
-    }
-
-    menu
 }
 
 fn build_mode_menu(
@@ -740,4 +829,20 @@ fn build_mode_menu(
         );
     }
     menu
+}
+
+/// A footer pill, like the extension's model and agent pills.
+fn render_pill(id: &'static str, cx: &App) -> Stateful<Div> {
+    let colors = cx.theme().colors();
+    h_flex()
+        .id(id)
+        .debug_selector(move || id.to_string())
+        .flex_none()
+        .gap_1()
+        .h(px(20.))
+        .px_2()
+        .rounded_full()
+        .bg(colors.text.opacity(0.1))
+        .cursor_pointer()
+        .hover(|style| style.bg(colors.text.opacity(0.15)))
 }
