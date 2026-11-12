@@ -64,6 +64,14 @@ Defaults come from `unwrap_or_default()` in `WorkbenchSettings::from_settings`, 
   `status_bar.line_endings_button: true`, `minimap.thumb: "hover"` (VS Code's
   `showSlider: "mouseover"`), `minimap.max_width_columns: 120` (VS Code's
   `maxColumn`) and `minimap.line_height: { "custom": 1.0 }` (see Minimap).
+- It also sets, with restore, `minimap.display_in: "all_editors"` (VS Code draws
+  a minimap in every editor group) and VS Code's editor line height,
+  `buffer_line_height: { "custom": 1.5 }` on macOS and `1.35` elsewhere
+  (`editor.lineHeight` 0 means the font size times `GOLDEN_LINE_HEIGHT_RATIO`
+  in `src/vs/editor/common/config/fontInfo.ts`). VS Code rounds the result to
+  whole pixels (14px times 1.35 is 19px); Zed doesn't (18.9px). The settings
+  writer converts the `f32` through `f64`, so on Linux and Windows the file
+  reads `1.350000023841858`, which parses back to 1.35.
 - The preset also turns on `workbench.command_center`, `layout_controls` and
   `status_bar`, and turns off `title_bar.show_project_items` / `show_branch_name`
   (VS Code shows neither in its title bar). All of them are in the snapshot.
@@ -77,6 +85,10 @@ Defaults come from `unwrap_or_default()` in `WorkbenchSettings::from_settings`, 
     still useful with the activity bar off.
   - `tab_bar.show_nav_history_buttons`: the command center has back and
     forward buttons. The other tab bar buttons stay.
+  - `global_lsp_settings.button`: Zed's language server button on the left of
+    the status bar. The workbench's language status item (`{ }`) stands in for
+    it. Zed still draws the button while the project has untrusted worktrees,
+    as a restricted mode warning.
 - A snapshot taken before a key was added to the preset doesn't have that key,
   so restoring removes it from the settings file.
 
@@ -129,9 +141,9 @@ Defaults come from `unwrap_or_default()` in `WorkbenchSettings::from_settings`, 
 - Sync: `cloud-upload` publishes a branch without upstream (`git::Push`).
   Otherwise the sync icon shows `behind↓ ahead↑` and pulls when behind, pushes
   when ahead, and fetches otherwise. Zed has no combined pull and push action.
-- Right, drawn left to right: git blame, cursor position, indentation,
-  encoding, line ending, language status, language, toolchain, edit
-  prediction, bell. Zed's vim mode, pending keystroke and image info items stay
+- Right, drawn left to right: current line blame, cursor position,
+  indentation, encoding, line ending, language status, language, toolchain,
+  edit prediction, bell. Zed's vim mode, pending keystroke and image info items stay
   left of them.
 - Cursor position (`CursorPositionItem`) replaces Zed's item, which leaves a
   placeholder like the diagnostics indicator. It uses VS Code's formats:
@@ -156,11 +168,31 @@ Defaults come from `unwrap_or_default()` in `WorkbenchSettings::from_settings`, 
   servers, with the progress title when busy, and Restart / Stop Language
   Servers. VS Code fills its hover from extension status items, so the content
   differs. Server health and failed starts aren't shown (the LSP store doesn't
-  keep them); Zed's own language server button still has them.
-- Zed's git blame item moves from the left side to the right side, left of
-  the cursor position. It only has text with
-  `git.inline_blame.location: "status_bar"`, which also removes the inline
-  blame, so the preset leaves the location alone.
+  keep them); Zed's own language server button, which the preset hides, has
+  them.
+- Current line blame (`CurrentLineBlameItem`) is GitLens's status bar blame:
+  the `git-commit` codicon and `Author, 18 months ago` for the newest cursor's
+  line, with GitLens's relative dates (`fromNow` in `packages/utils/src/date.ts`:
+  one unit only, months up to 728 days, `yesterday` / `last week` / `last
+  month` / `last year` for one unit). It reads the editor's own `GitBlame`
+  (`blame_for_rows` at the cursor), so it shows next to Zed's inline blame and
+  never runs git itself. It also shows on empty lines and ignores the inline
+  blame delay, as GitLens does (`Editor::active_git_blame_entry` does
+  neither). The tooltip is the commit summary; a click runs
+  `editor::OpenGitBlameCommit` (Zed's commit view). It is hidden when the
+  line has no blame: no repository, untracked files, uncommitted lines, and
+  editors that never turned on inline blame or the blame gutter (with
+  `git.inline_blame.enabled: false`, Zed loads no blame).
+- Differences from GitLens: no `You` for the user's own commits (Zed's blame
+  doesn't know the git user), nothing on uncommitted lines (GitLens shows
+  `You, now` and Uncommitted changes), a plain summary tooltip instead of
+  GitLens's hover (avatar, date, full message, commands), the commit view
+  instead of GitLens's Show Commit quick pick, English only, and no pull
+  request suffix.
+- Zed's git blame item (`GitBlameStatus`) is hidden while the setting is on,
+  leaving a placeholder like the diagnostics indicator. It only has text with
+  `git.inline_blame.location: "status_bar"`, where it would repeat the current
+  line blame. The preset leaves the location alone, so inline blame stays.
 - The bell is added with `StatusBar::add_rightmost_item`, so it is the last
   item even when the right and bottom dock buttons are shown.
 - The threads sidebar toggle, which the status bar draws before every left item
