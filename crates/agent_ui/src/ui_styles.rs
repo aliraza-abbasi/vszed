@@ -1,4 +1,5 @@
 pub(crate) mod claude_code;
+mod preset;
 pub(crate) mod thread_item;
 
 use gpui::{App, TextStyle};
@@ -44,5 +45,6 @@ pub(crate) fn message_editor_text_style(zed_style: TextStyle, cx: &App) -> TextS
 
 pub(crate) fn init(cx: &mut App) {
     claude_code::init(cx);
+    preset::init(cx);
     thread_item::init(cx);
 }
