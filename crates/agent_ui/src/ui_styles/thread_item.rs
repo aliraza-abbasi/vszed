@@ -229,6 +229,11 @@ impl AgentThreadItem {
         })
     }
 
+    /// A turn ended while the tab was hidden and it hasn't been shown since.
+    pub(crate) fn finished_while_hidden(&self) -> bool {
+        self.finished_while_hidden
+    }
+
     pub(crate) fn is_waiting_for_permission(&self, cx: &App) -> bool {
         self.conversation_view
             .read(cx)
