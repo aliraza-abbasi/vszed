@@ -28,6 +28,9 @@ const ADVANCE_DELAY: Duration = Duration::from_millis(300);
 const SIDE_BY_SIDE_PREVIEW_WIDTH: Pixels = px(552.);
 const MARKER_SIZE: Pixels = px(16.);
 const TAB_MAX_WIDTH: Pixels = px(120.);
+/// The "Other" answer grows with Shift+Enter newlines up to this many lines,
+/// then scrolls.
+const OTHER_MAX_LINES: usize = 6;
 
 /// A question's option or "Other", as a card or timeline row draws it.
 struct OptionRowContent {
@@ -353,6 +356,21 @@ impl ThreadView {
                             .border_color(colors.border)
                             .bg(colors.editor_background)
                             .text_sm()
+                            // The extension's field keeps Escape to itself, and
+                            // Tab moves focus out of it like a browser textarea.
+                            .on_action(|_: &editor::actions::Cancel, _, _| {})
+                            .capture_action(cx.listener(
+                                |this, _: &editor::actions::Tab, window, cx| {
+                                    cx.stop_propagation();
+                                    this.focus_claude_code_question_card(window, cx);
+                                },
+                            ))
+                            .capture_action(cx.listener(
+                                |this, _: &editor::actions::Backtab, window, cx| {
+                                    cx.stop_propagation();
+                                    this.focus_claude_code_question_card(window, cx);
+                                },
+                            ))
                             .child(editor),
                     )
                 })
@@ -517,9 +535,9 @@ impl ThreadView {
                 }
             }))
             .on_action(cx.listener(|this, _: &menu::Cancel, window, cx| {
-                if this.claude_code_other_editor_focused(window, cx) {
-                    this.focus_claude_code_question_card(window, cx);
-                } else {
+                // Escape while typing an "Other" answer does nothing, as in the
+                // extension, rather than cancelling the questions.
+                if !this.claude_code_other_editor_focused(window, cx) {
                     this.cancel_claude_code_questions(window, cx);
                 }
             }))
@@ -701,8 +719,15 @@ impl ThreadView {
         let highlighted_row = card.highlighted_row;
         let all_answered = card.all_answered();
         if self.claude_code_other_editor_focused(window, cx) {
-            self.show_claude_code_question(active_question + 1, false, window, cx);
-            self.focus_claude_code_question_card(window, cx);
+            // Like the extension, Enter in "Other" moves on to the next question
+            // and does nothing on the last one rather than submitting.
+            let question_count = self
+                .claude_code_question_form(cx)
+                .map_or(0, |form| form.questions.len());
+            if active_question + 1 < question_count {
+                self.show_claude_code_question(active_question + 1, false, window, cx);
+                self.focus_claude_code_question_card(window, cx);
+            }
         } else if all_answered {
             self.submit_claude_code_questions(window, cx);
         } else {
@@ -741,7 +766,10 @@ impl ThreadView {
                     Some(editor) => editor,
                     None => {
                         let editor = cx.new(|cx| {
-                            let mut editor = Editor::single_line(window, cx);
+                            // Multi-line so Shift+Enter adds a newline, as in the
+                            // extension; plain Enter isn't bound in auto-height
+                            // editors, so it still reaches the card's Confirm.
+                            let mut editor = Editor::auto_height(1, OTHER_MAX_LINES, window, cx);
                             editor.set_placeholder_text(OTHER_PLACEHOLDER, window, cx);
                             editor
                         });
