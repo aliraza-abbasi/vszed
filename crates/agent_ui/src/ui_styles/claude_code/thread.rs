@@ -478,7 +478,8 @@ impl ThreadView {
                             div()
                                 .id(("claude-code-user-message-box", entry_ix))
                                 .w_full()
-                                .p(px(10.))
+                                .px(px(6.))
+                                .py(px(4.))
                                 .rounded(px(6.))
                                 .border_1()
                                 .border_color(border_color)
@@ -571,6 +572,10 @@ impl ThreadView {
                                 cx,
                             );
                         })
+                        // Highlights only carry font and colour, so the size and line
+                        // height have to be set on the container.
+                        .text_size(text_style.font_size)
+                        .line_height(text_style.line_height)
                         .child(StyledText::new(text).with_default_highlights(&text_style, [])),
                 )
                 .when(overflows && !is_expanded, |this| {
