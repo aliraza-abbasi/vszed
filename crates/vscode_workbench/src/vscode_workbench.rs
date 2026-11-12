@@ -3,6 +3,7 @@
 mod activity_bar;
 mod command_center;
 mod dock_header;
+mod editor_status;
 mod layout_controls;
 mod preset;
 mod status_items;
@@ -11,6 +12,7 @@ mod workbench_settings;
 pub use activity_bar::ActivityBar;
 pub use command_center::CommandCenter;
 pub use dock_header::DockHeader;
+pub use editor_status::{CursorPositionItem, IndentationItem, LanguageStatusItem};
 pub use layout_controls::{LayoutControls, ToggleActivityBar};
 pub use preset::{RestorePreviousLayout, UseVsCodeLayout};
 pub use status_items::{GitBranchItem, NotificationBell, ProblemsItem, RemoteIndicator};
@@ -62,6 +64,7 @@ enum Codicon {
     Extensions,
     Files,
     GitBranch,
+    Json,
     Layout,
     LayoutPanel,
     LayoutPanelOff,
@@ -70,6 +73,7 @@ enum Codicon {
     LayoutSidebarRight,
     LayoutSidebarRightOff,
     LiveShare,
+    Loading,
     Remote,
     Search,
     SettingsGear,
@@ -98,6 +102,7 @@ impl Codicon {
             Self::Extensions => "icons/codicons/extensions.svg",
             Self::Files => "icons/codicons/files.svg",
             Self::GitBranch => "icons/codicons/git-branch.svg",
+            Self::Json => "icons/codicons/json.svg",
             Self::Layout => "icons/codicons/layout.svg",
             Self::LayoutPanel => "icons/codicons/layout-panel.svg",
             Self::LayoutPanelOff => "icons/codicons/layout-panel-off.svg",
@@ -106,6 +111,7 @@ impl Codicon {
             Self::LayoutSidebarRight => "icons/codicons/layout-sidebar-right.svg",
             Self::LayoutSidebarRightOff => "icons/codicons/layout-sidebar-right-off.svg",
             Self::LiveShare => "icons/codicons/live-share.svg",
+            Self::Loading => "icons/codicons/loading.svg",
             Self::Remote => "icons/codicons/remote.svg",
             Self::Search => "icons/codicons/search.svg",
             Self::SettingsGear => "icons/codicons/settings-gear.svg",
