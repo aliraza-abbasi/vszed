@@ -10,6 +10,8 @@ upstream files. Check them first when a rebase conflicts.
 | `crates/workspace/src/dock.rs` | `Dock::panels()` iterator | +5 |
 | `crates/workspace/src/dock.rs` | `header: Option<AnyView>` field, `set_header` / `header`. While set, the panel wrapper in `Dock::render` becomes a flex column with the header above the active panel. Unset, the render tree is unchanged | +15 |
 | `crates/workspace/src/notifications.rs` | `Workspace::has_notifications()`, for the status bar bell | +4 |
+| `crates/workspace/src/status_bar.rs` | `StatusBar::add_rightmost_item`, which inserts at the front of `right_items` (drawn last, because right items are drawn in reverse). `insert_item_after` can never reach that slot | +18 |
+| `crates/workspace/src/status_bar.rs` | `show_sidebar_toggle` field (default `true`) with `set_show_sidebar_toggle` / `show_sidebar_toggle`. `render` ANDs it into `SidebarStatus::show_toggle`, so the threads sidebar toggle is drawn exactly as before unless a caller turns it off | +14 -1 |
 | `crates/title_bar/src/title_bar.rs` | `center_item` / `trailing_item` fields with setters and getters, plus a `workspace()` getter so `observe_new::<TitleBar>` can reach the workspace. The center item is pushed after the left items inside an absolutely positioned, full width `h_flex` that centers it over the title bar; the trailing item is the first child of the right side group. The children `ArrayVec` grows from 5 to 6. Unset, the render tree is unchanged | +41 -1 |
 | `crates/settings_content/src/workbench.rs` | New file: `WorkbenchSettingsContent` (`activity_bar`, `dock_headers`, `command_center`, `layout_controls`, `status_bar`), `ActivityBarSettingsContent` | +43 (new) |
 | `crates/settings_content/src/settings_content.rs` | `mod workbench`, re-export, `workbench` field, `flattened_deserialize!` entry | +6 -1 |
@@ -55,6 +57,18 @@ Defaults come from `unwrap_or_default()` in `WorkbenchSettings::from_settings`, 
 - The preset also turns on `workbench.command_center`, `layout_controls` and
   `status_bar`, and turns off `title_bar.show_project_items` / `show_branch_name`
   (VS Code shows neither in its title bar). All of them are in the snapshot.
+- It also turns off, with restore:
+  - `title_bar.show_sign_in` / `show_user_menu`: VS Code keeps accounts in the
+    activity bar, whose Accounts and Manage menus cover the user menu (see
+    below). `title_bar.show_user_picture` is left alone; it only changes the
+    user menu's trigger, which is hidden.
+  - `search.button`: Search is in the activity bar. This is a preset setting
+    rather than a `workbench.status_bar` item removal because the button is
+    still useful with the activity bar off.
+  - `tab_bar.show_nav_history_buttons`: the command center has back and
+    forward buttons. The other tab bar buttons stay.
+- A snapshot taken before a key was added to the preset doesn't have that key,
+  so restoring removes it from the settings file.
 
 ### Title bar
 
@@ -66,18 +80,28 @@ Defaults come from `unwrap_or_default()` in `WorkbenchSettings::from_settings`, 
   (`Workspace::go_back` / `go_forward`), because Zed's navigation history is per
   pane rather than global like VS Code's. They are disabled when that pane has no
   history.
-- The search box is 38% of the title bar wide (at most 600px) and opens
-  `file_finder::Toggle`. Its chevron menu has Go to File, Show and Run Commands,
-  Go to Symbol in Workspace and Go to Line/Column; the menu dispatches from the
-  active editor so Go to Line reaches it.
+- The search box is 38% of the title bar wide (at most 600px). Like plain VS
+  Code's, it has no dropdown: a click anywhere on it opens `file_finder::Toggle`.
 - Layout controls: Customize Layout (Visibility: Activity Bar, Primary Side Bar,
-  Secondary Side Bar, Panel; Bottom Panel Alignment: Contained, Full, Left
-  Aligned, Right Aligned; Use VS Code Layout; Restore Previous Layout, disabled
-  without a snapshot), then Toggle Primary Side Bar, Toggle Panel and Toggle
+  Secondary Side Bar, Panel, and Threads Sidebar while AI is enabled; Bottom
+  Panel Alignment: Contained, Full, Left Aligned, Right Aligned; Use VS Code
+  Layout; Restore Previous Layout, disabled without a snapshot), then Toggle
+  Primary Side Bar, Toggle Panel and Toggle
   Secondary Side Bar. The toggles call `Workspace::toggle_dock` directly, so they
   work while the activity bar hides the status bar's dock buttons. Their icons
   switch to the `-off` codicons while the dock is closed.
 - New action: `workbench: toggle activity bar`.
+
+### Activity bar menus
+
+- Accounts has the account part of Zed's title bar user menu: signed out, Sign
+  In (failures are shown in the workspace, like the title bar button) or a
+  disabled Signing In… entry; signed in, the username, Manage Account (the
+  account page), the organization switcher and Sign Out.
+- Manage has the rest: Command Palette, Settings, Keymap, Themes…, Icon
+  Themes…, Extensions, Use VS Code Layout, Panel Layout (Classic / Agentic,
+  while AI is enabled), and Check for Updates, which becomes Restart to Update
+  once an update is downloaded.
 
 ### Status bar
 
@@ -97,10 +121,15 @@ Defaults come from `unwrap_or_default()` in `WorkbenchSettings::from_settings`, 
   when ahead, and fetches otherwise. Zed has no combined pull and push action.
 - Right, drawn left to right: cursor position, encoding, line ending, language,
   toolchain, edit prediction, bell. Zed has no indentation item.
-- The status bar can't insert an item at its very end, so the bell goes right
-  before the right and bottom dock buttons (which the activity bar hides). Finding
-  that slot needs the number of left items, which the status bar doesn't expose; a
-  temporary probe item appended to each side reveals it.
+- The bell is added with `StatusBar::add_rightmost_item`, so it is the last
+  item even when the right and bottom dock buttons are shown.
+- The threads sidebar toggle, which the status bar draws before every left item
+  while AI is enabled, is hidden (`set_show_sidebar_toggle(false)`) so the remote
+  indicator starts the status bar as in VS Code. No setting hides it: moving the
+  sidebar to the right (`agent.threads_sidebar.position`) would put the toggle
+  after the bell and move the sidebar too, and `agent.enabled: false` turns off
+  AI. The sidebar stays reachable from Customize Layout, its keybinding
+  (`multi_workspace: toggle workspace sidebar`) and the agent panel's menu.
 - Zed has no notification center. The bell shows `bell-dot` while notifications
   are shown and clears them all on click (`Workspace::clear_all_notifications`).
 
