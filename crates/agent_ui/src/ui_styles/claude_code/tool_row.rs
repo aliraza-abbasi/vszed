@@ -4,22 +4,28 @@ use gpui::{
     AnyElement, App, ClickEvent, ElementId, FontWeight, Hsla, SharedString, Window, hsla,
     linear_color_stop, linear_gradient, px,
 };
-use ui::prelude::*;
+use ui::{CopyButton, Tooltip, prelude::*};
 
 use super::{StepStatus, TIMELINE_GUTTER, TimelineDot, display_lines, timeline_row};
 
 const IO_LABEL_WIDTH: Pixels = px(36.);
-const COLLAPSED_OUTPUT_LINES: usize = 3;
-const CLAMPED_OUTPUT_MAX_HEIGHT: Pixels = px(64.);
-/// Caps how much output an expanded row lays out; the full output stays
-/// available to the agent and in the thread's markdown export.
-const MAX_EXPANDED_OUTPUT_LINES: usize = 500;
+/// Caps how much input a row lays out.
+const MAX_INPUT_LINES: usize = 500;
+/// Claude Code clips OUT to 60px, fading out its last 10px.
+const OUTPUT_MAX_HEIGHT: Pixels = px(60.);
+const OUTPUT_FADE_HEIGHT: Pixels = px(10.);
+/// More lines than fit in `OUTPUT_MAX_HEIGHT` at any font size Zed allows.
+const MAX_PREVIEW_LINES: usize = 8;
+/// OUT lines don't wrap, so laying out more than a screen's width of one is
+/// wasted work.
+const MAX_PREVIEW_CHARS: usize = 400;
 
 type ClickHandler = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
 
 /// A compact tool call step: a status dot, the tool name in bold followed by
-/// a muted description, and an optional bordered IN/OUT block whose output is
-/// clamped to a few lines until expanded.
+/// a muted description, and an optional bordered IN/OUT block. Like Claude
+/// Code, OUT shows the first lines unwrapped and clipped; clicking it can open
+/// the full output.
 ///
 /// It only takes plain data so it can render tool calls from any agent.
 #[derive(IntoElement)]
@@ -31,9 +37,9 @@ pub(crate) struct ToolRow {
     header_suffix: Option<AnyElement>,
     on_header_click: Option<ClickHandler>,
     input: Option<SharedString>,
+    copy_input: bool,
     output: Option<SharedString>,
-    output_expanded: bool,
-    on_toggle_output: Option<ClickHandler>,
+    on_open_output: Option<ClickHandler>,
     body: Option<AnyElement>,
     footer: Vec<AnyElement>,
 }
@@ -52,9 +58,9 @@ impl ToolRow {
             header_suffix: None,
             on_header_click: None,
             input: None,
+            copy_input: false,
             output: None,
-            output_expanded: false,
-            on_toggle_output: None,
+            on_open_output: None,
             body: None,
             footer: Vec::new(),
         }
@@ -83,21 +89,23 @@ impl ToolRow {
         self
     }
 
+    /// Shows a copy button on the IN row while it is hovered, as Claude Code
+    /// does for Bash commands.
+    pub(crate) fn copy_input(mut self, copy_input: bool) -> Self {
+        self.copy_input = copy_input;
+        self
+    }
+
     pub(crate) fn output(mut self, output: Option<SharedString>) -> Self {
         self.output = output;
         self
     }
 
-    pub(crate) fn output_expanded(mut self, expanded: bool) -> Self {
-        self.output_expanded = expanded;
-        self
-    }
-
-    pub(crate) fn on_toggle_output(
+    pub(crate) fn on_open_output(
         mut self,
         handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     ) -> Self {
-        self.on_toggle_output = Some(Rc::new(handler));
+        self.on_open_output = Some(Rc::new(handler));
         self
     }
 
@@ -138,24 +146,31 @@ fn io_text(lines: Vec<SharedString>, cx: &App) -> impl IntoElement {
         }))
 }
 
-/// The lines of tool input or output that a row shows.
-pub(crate) fn visible_io_lines(text: &str, clamped: bool, max_lines: usize) -> Vec<SharedString> {
+/// The lines of tool input that a row shows.
+pub(crate) fn visible_io_lines(text: &str, max_lines: usize) -> Vec<SharedString> {
     let lines = display_lines(text);
     let line_count = lines.len();
-    let limit = if clamped {
-        COLLAPSED_OUTPUT_LINES
-    } else {
-        max_lines
-    };
     let mut visible = lines
         .into_iter()
-        .take(limit)
+        .take(max_lines)
         .map(SharedString::from)
         .collect::<Vec<_>>();
-    if !clamped && line_count > limit {
-        visible.push(format!("… {} more lines", line_count - limit).into());
+    if line_count > max_lines {
+        visible.push(format!("… {} more lines", line_count - max_lines).into());
     }
     visible
+}
+
+/// The lines OUT lays out before clipping, each cut to what can be visible.
+pub(crate) fn output_preview_lines(output: &str) -> Vec<SharedString> {
+    display_lines(output)
+        .into_iter()
+        .take(MAX_PREVIEW_LINES)
+        .map(|line| match line.char_indices().nth(MAX_PREVIEW_CHARS) {
+            Some((byte_index, _)) => line[..byte_index].to_string().into(),
+            None => line.into(),
+        })
+        .collect()
 }
 
 fn output_background(cx: &App) -> Hsla {
@@ -190,52 +205,58 @@ impl RenderOnce for ToolRow {
                     .on_click(move |event, window, cx| handler(event, window, cx))
             });
 
-        let output_line_count = self
-            .output
-            .as_ref()
-            .map(|output| display_lines(output).len())
-            .unwrap_or(0);
-        let is_collapsible = output_line_count > COLLAPSED_OUTPUT_LINES;
-        let is_clamped = is_collapsible && !self.output_expanded;
         let output_background = output_background(cx);
-
+        let output_selector = format!("{}-output", self.id);
+        let input_hover_group = SharedString::from(format!("{}-input", self.id));
         let output_row = self.output.map(|output| {
-            let visible_output = visible_io_lines(&output, is_clamped, MAX_EXPANDED_OUTPUT_LINES);
-
+            let lines = output_preview_lines(&output);
+            let may_overflow = lines.len() > 3;
             h_flex()
                 .id("output")
+                .debug_selector(move || output_selector)
                 .relative()
                 .items_start()
+                .max_h(OUTPUT_MAX_HEIGHT)
+                .overflow_hidden()
                 .px_2p5()
                 .py_1p5()
                 .bg(output_background)
                 .child(io_label("OUT"))
-                .child(io_text(visible_output, cx))
-                .when(is_clamped, |this| {
-                    // Long lines wrap, so clamping by line count alone can still overflow.
-                    this.max_h(CLAMPED_OUTPUT_MAX_HEIGHT)
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
                         .overflow_hidden()
-                        .child(
-                            div()
-                                .absolute()
-                                .left_0()
-                                .right_0()
-                                .bottom_0()
-                                .h(px(18.))
-                                .bg(linear_gradient(
-                                    180.,
-                                    linear_color_stop(output_background.opacity(0.), 0.),
-                                    linear_color_stop(output_background, 1.),
-                                )),
-                        )
-                })
-                .when(is_collapsible, |this| {
-                    this.cursor_pointer().when_some(
-                        self.on_toggle_output.clone(),
-                        |this, handler| {
-                            this.on_click(move |event, window, cx| handler(event, window, cx))
-                        },
+                        .font_buffer(cx)
+                        .text_xs()
+                        .text_color(cx.theme().colors().text)
+                        .children(lines.into_iter().map(|line| {
+                            // An empty row would collapse to zero height.
+                            let line = if line.is_empty() { " ".into() } else { line };
+                            div().whitespace_nowrap().child(line)
+                        })),
+                )
+                .when(may_overflow, |this| {
+                    this.child(
+                        div()
+                            .absolute()
+                            .left_0()
+                            .right_0()
+                            .bottom_0()
+                            .h(OUTPUT_FADE_HEIGHT)
+                            .bg(linear_gradient(
+                                180.,
+                                linear_color_stop(output_background.opacity(0.), 0.),
+                                linear_color_stop(output_background, 1.),
+                            )),
                     )
+                })
+                .when_some(self.on_open_output.clone(), |this, handler| {
+                    let hover_background = cx.theme().colors().element_hover;
+                    this.cursor_pointer()
+                        .hover(move |style| style.bg(hover_background))
+                        .tooltip(Tooltip::text("Open the full text in an editor tab"))
+                        .on_click(move |event, window, cx| handler(event, window, cx))
                 })
         });
 
@@ -262,20 +283,31 @@ impl RenderOnce for ToolRow {
                             .border_color(border_color)
                             .bg(cx.theme().colors().editor_background)
                             .when_some(self.input, |this, input| {
+                                let hover_group = input_hover_group;
+                                let copy_button = self.copy_input.then(|| {
+                                    div().absolute().top_1().right_1().child(
+                                        CopyButton::new(
+                                            SharedString::from(format!("{hover_group}-copy")),
+                                            input.clone(),
+                                        )
+                                        .icon_size(IconSize::Small)
+                                        .tooltip_label("Copy")
+                                        .visible_on_hover(hover_group.clone()),
+                                    )
+                                });
                                 this.child(
                                     h_flex()
+                                        .group(hover_group.clone())
+                                        .relative()
                                         .items_start()
                                         .px_2p5()
                                         .py_1p5()
                                         .child(io_label("IN"))
                                         .child(io_text(
-                                            visible_io_lines(
-                                                &input,
-                                                false,
-                                                MAX_EXPANDED_OUTPUT_LINES,
-                                            ),
+                                            visible_io_lines(&input, MAX_INPUT_LINES),
                                             cx,
-                                        )),
+                                        ))
+                                        .children(copy_button),
                                 )
                             })
                             .when_some(output_row, |this, output_row| {
@@ -304,29 +336,21 @@ mod tests {
     }
 
     #[test]
-    fn test_multi_line_output_rows_start_at_left_edge() {
-        let output = "On branch vszed-main\r\nYour branch is up to date with 'origin/vszed-main'.\r\n\r\nnothing to commit, working tree clean\r\n";
+    fn test_output_preview_lines_are_cut_not_wrapped() {
+        let output = "    Finished `release` profile\r\n\r\n[exited with code 0]\r\n";
         assert_eq!(
-            as_strings(visible_io_lines(output, true, MAX_EXPANDED_OUTPUT_LINES)),
-            vec![
-                "On branch vszed-main",
-                "Your branch is up to date with 'origin/vszed-main'.",
-                "",
-            ]
+            as_strings(output_preview_lines(output)),
+            vec!["    Finished `release` profile", "", "[exited with code 0]"]
         );
-        assert_eq!(
-            as_strings(visible_io_lines(output, false, MAX_EXPANDED_OUTPUT_LINES)),
-            vec![
-                "On branch vszed-main",
-                "Your branch is up to date with 'origin/vszed-main'.",
-                "",
-                "nothing to commit, working tree clean",
-            ]
-        );
-        assert_eq!(
-            as_strings(visible_io_lines("a\nb\nc\nd", false, 2)),
-            vec!["a", "b", "… 2 more lines"]
-        );
+        let long_output = (0..20)
+            .map(|index| index.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(output_preview_lines(&long_output).len(), MAX_PREVIEW_LINES);
+        let long_line = "é".repeat(MAX_PREVIEW_CHARS + 10);
+        let lines = output_preview_lines(&long_line);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].chars().count(), MAX_PREVIEW_CHARS);
     }
 
     #[test]
@@ -334,10 +358,13 @@ mod tests {
         assert_eq!(
             as_strings(visible_io_lines(
                 "git status &&\n\tgit log -1",
-                false,
-                MAX_EXPANDED_OUTPUT_LINES
+                MAX_INPUT_LINES
             )),
             vec!["git status &&", "    git log -1"]
+        );
+        assert_eq!(
+            as_strings(visible_io_lines("a\nb\nc\nd", 2)),
+            vec!["a", "b", "… 2 more lines"]
         );
     }
 }

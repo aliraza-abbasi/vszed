@@ -14,10 +14,13 @@ use acp_thread::{
 use agent_client_protocol::v2::schema as acp_v2;
 use chrono::{DateTime, Local};
 use collections::HashMap;
+use editor::Editor;
 use gpui::{
-    Animation, AnimationExt as _, App, Context, ElementId, EntityId, FocusHandle, Focusable as _,
-    Global, Hsla, Pixels, TextStyle, pulsating_between, px,
+    Animation, AnimationExt as _, App, Context, ElementId, Entity, EntityId, FocusHandle,
+    Focusable as _, Global, Hsla, Pixels, Subscription, TextStyle, WeakEntity, pulsating_between,
+    px,
 };
+use language::Buffer;
 use settings::{AgentUiStyle, Settings as _, SettingsStore};
 use theme_settings::ThemeSettings;
 use ui::prelude::*;
@@ -198,7 +201,15 @@ pub(crate) struct ThreadActivity {
     zed_placeholder: Option<String>,
     last_activity_at: Option<Instant>,
     thoughts: HashMap<(usize, usize), ThoughtTiming>,
+    /// The thought that is still the last thing in the thread. It ends when
+    /// anything else arrives after it.
+    open_thought: Option<(usize, usize)>,
+    /// Claude Code opens or closes every thought summary of a conversation at
+    /// once, starting closed.
+    thoughts_expanded: bool,
     user_messages_sent_at: HashMap<usize, DateTime<Local>>,
+    /// Editor tabs showing the full output of a tool call, by tool call id.
+    output_tabs: HashMap<acp_v2::ToolCallId, ToolOutputTab>,
     /// Focused while the permission card replaces the prompt box, so the
     /// card's number keys and Esc reach it.
     permission_focus: Option<FocusHandle>,
@@ -213,6 +224,20 @@ struct ThoughtTiming {
     last_updated_at: Instant,
 }
 
+/// A read-only editor tab with a tool call's full output, kept in sync while
+/// the tool call streams.
+pub(crate) struct ToolOutputTab {
+    pub editor: WeakEntity<Editor>,
+    pub buffer: WeakEntity<Buffer>,
+    pub _subscriptions: Vec<Subscription>,
+}
+
+impl ToolOutputTab {
+    fn live_parts(&self) -> Option<(Entity<Editor>, Entity<Buffer>)> {
+        Some((self.editor.upgrade()?, self.buffer.upgrade()?))
+    }
+}
+
 impl ThreadActivity {
     pub(crate) fn thought_duration(&self, entry_ix: usize, chunk_ix: usize) -> Option<Duration> {
         self.thoughts.get(&(entry_ix, chunk_ix)).map(|timing| {
@@ -224,6 +249,17 @@ impl ThreadActivity {
 
     pub(crate) fn user_message_sent_at(&self, entry_ix: usize) -> Option<DateTime<Local>> {
         self.user_messages_sent_at.get(&entry_ix).copied()
+    }
+
+    pub(crate) fn thoughts_expanded(&self) -> bool {
+        self.thoughts_expanded
+    }
+
+    pub(crate) fn output_tab(
+        &self,
+        tool_call_id: &acp_v2::ToolCallId,
+    ) -> Option<(Entity<Editor>, Entity<Buffer>)> {
+        self.output_tabs.get(tool_call_id)?.live_parts()
     }
 
     pub(crate) fn permission_focus(&self) -> Option<&FocusHandle> {
@@ -253,15 +289,36 @@ impl ThreadActivity {
                     self.user_messages_sent_at.insert(entry_ix, wall_clock);
                 }
                 self.record_streaming_thought(thread, entry_ix, now);
+                self.finish_open_thought(thread, now);
                 self.last_activity_at = Some(now);
             }
             AcpThreadEvent::EntryUpdated(entry_ix) => {
                 self.record_streaming_thought(thread, *entry_ix, now);
+                self.finish_open_thought(thread, now);
                 self.last_activity_at = Some(now);
             }
             AcpThreadEvent::EntriesRemoved(range) => self.remove_entries(range.clone()),
+            AcpThreadEvent::Stopped { .. } | AcpThreadEvent::Error => {
+                self.open_thought = None;
+            }
             _ => {}
         }
+    }
+
+    /// A thought ends when the next step starts, which is also when Claude
+    /// Code's thinking block stops. Zed reveals streamed text gradually, so the
+    /// thought's own updates can trail behind it.
+    fn finish_open_thought(&mut self, thread: &AcpThread, now: Instant) {
+        let Some(open_thought) = self.open_thought else {
+            return;
+        };
+        if trailing_thought(thread) == Some(open_thought) {
+            return;
+        }
+        if let Some(timing) = self.thoughts.get_mut(&open_thought) {
+            timing.last_updated_at = now;
+        }
+        self.open_thought = None;
     }
 
     /// A thought is timed from the previous activity in the thread (the model
@@ -289,6 +346,9 @@ impl ThreadActivity {
                 started_at,
                 last_updated_at: now,
             });
+        if trailing_thought(thread) == Some((entry_ix, chunk_ix)) {
+            self.open_thought = Some((entry_ix, chunk_ix));
+        }
     }
 
     fn remove_entries(&mut self, removed: Range<usize>) {
@@ -308,12 +368,29 @@ impl ThreadActivity {
                 Some(((shift(entry_ix)?, chunk_ix), timing))
             })
             .collect();
+        self.open_thought = self
+            .open_thought
+            .and_then(|(entry_ix, chunk_ix)| Some((shift(entry_ix)?, chunk_ix)));
         self.user_messages_sent_at = self
             .user_messages_sent_at
             .drain()
             .filter_map(|(entry_ix, sent_at)| Some((shift(entry_ix)?, sent_at)))
             .collect();
     }
+}
+
+/// The thought at the very end of the thread, if the thread ends with one.
+fn trailing_thought(thread: &AcpThread) -> Option<(usize, usize)> {
+    let entry_ix = thread.entries().len().checked_sub(1)?;
+    let Some(AgentThreadEntry::AssistantMessage(message)) = thread.entries().get(entry_ix) else {
+        return None;
+    };
+    let chunk_ix = message.chunks.len().checked_sub(1)?;
+    matches!(
+        message.chunks.get(chunk_ix),
+        Some(AssistantMessageChunk::Thought { .. })
+    )
+    .then_some((entry_ix, chunk_ix))
 }
 
 #[derive(Default)]
@@ -327,6 +404,39 @@ pub(crate) fn thread_activity(thread_view_id: EntityId, cx: &App) -> Option<&Thr
     cx.try_global::<ClaudeCodeActivity>()?
         .threads
         .get(&thread_view_id)
+}
+
+fn thread_activity_mut(thread_view_id: EntityId, cx: &mut App) -> Option<&mut ThreadActivity> {
+    cx.default_global::<ClaudeCodeActivity>()
+        .threads
+        .get_mut(&thread_view_id)
+}
+
+pub(crate) fn toggle_thoughts_expanded(thread_view_id: EntityId, cx: &mut App) {
+    if let Some(activity) = thread_activity_mut(thread_view_id, cx) {
+        activity.thoughts_expanded = !activity.thoughts_expanded;
+    }
+}
+
+pub(crate) fn set_output_tab(
+    thread_view_id: EntityId,
+    tool_call_id: acp_v2::ToolCallId,
+    tab: ToolOutputTab,
+    cx: &mut App,
+) {
+    if let Some(activity) = thread_activity_mut(thread_view_id, cx) {
+        activity.output_tabs.insert(tool_call_id, tab);
+    }
+}
+
+pub(crate) fn remove_output_tab(
+    thread_view_id: EntityId,
+    tool_call_id: &acp_v2::ToolCallId,
+    cx: &mut App,
+) {
+    if let Some(activity) = thread_activity_mut(thread_view_id, cx) {
+        activity.output_tabs.remove(tool_call_id);
+    }
 }
 
 pub(crate) fn set_permission_selection(
@@ -502,17 +612,30 @@ pub(crate) fn is_plan_approval(options: &[acp_v2::PermissionOption]) -> bool {
         .any(|option| option.option_id.0.starts_with(EXIT_PLAN_OPTION_PREFIX))
 }
 
+/// The labels of the Claude Code extension's thinking block: it rounds to
+/// whole seconds (so "Thought for 0s" happens), and says "Thinking" for a
+/// finished thought it has no duration for.
 pub(crate) fn thought_label(duration: Option<Duration>, is_streaming: bool) -> SharedString {
     if is_streaming {
-        return "Thinking…".into();
+        return "Thinking...".into();
     }
     match duration {
         Some(duration) => {
             let seconds = (duration.as_millis() + 500) / 1000;
-            format!("Thought for {}s", seconds.max(1)).into()
+            format!("Thought for {seconds}s").into()
         }
-        None => "Thought".into(),
+        None => "Thinking".into(),
     }
+}
+
+/// Whether a thought carries summary text. claude-agent-acp only sends a
+/// thought when Claude streams thinking text, which it does when the user
+/// turned on `showThinkingSummaries`; other agents may send empty ones.
+pub(crate) fn thought_has_summary(block: &acp_thread::MessageContent) -> bool {
+    block.source_blocks().iter().any(|source| match source {
+        acp_v2::ContentBlock::Text(text) => !text.text.trim().is_empty(),
+        _ => false,
+    })
 }
 
 pub(crate) fn format_timestamp(time: DateTime<Local>) -> SharedString {
@@ -731,6 +854,19 @@ pub(crate) fn tool_output_text(
         }
     }
     (!sections.is_empty()).then(|| sections.join("\n").into())
+}
+
+/// The title Claude Code gives a tool output tab, such as "Bash tool output".
+pub(crate) fn tool_output_title(tool_call: &ToolCall, cx: &App) -> SharedString {
+    let label = tool_call.label.read(cx).source().to_string();
+    let summary = summarize_tool_call(tool_call, &label);
+    format!("{} tool output", summary.name).into()
+}
+
+/// Claude Code only offers to open output or input in a tab when it is long:
+/// more than 250 characters or more than 3 lines.
+pub(crate) fn is_long_tool_text(text: &str) -> bool {
+    text.chars().nth(250).is_some() || text.split('\n').nth(3).is_some()
 }
 
 fn line_stats(old_text: &str, new_text: &str) -> (usize, usize) {
@@ -1137,10 +1273,18 @@ mod tests {
 
     #[test]
     fn test_thought_label() {
-        assert_eq!(thought_label(None, true).as_ref(), "Thinking…");
-        assert_eq!(thought_label(None, false).as_ref(), "Thought");
+        assert_eq!(thought_label(None, true).as_ref(), "Thinking...");
+        assert_eq!(
+            thought_label(Some(Duration::from_secs(3)), true).as_ref(),
+            "Thinking..."
+        );
+        assert_eq!(thought_label(None, false).as_ref(), "Thinking");
         assert_eq!(
             thought_label(Some(Duration::from_millis(200)), false).as_ref(),
+            "Thought for 0s"
+        );
+        assert_eq!(
+            thought_label(Some(Duration::from_millis(500)), false).as_ref(),
             "Thought for 1s"
         );
         assert_eq!(
