@@ -22673,6 +22673,7 @@ dependencies = [
  "tracing",
  "ui",
  "ui_prompt",
+ "upstream_release_notifier",
  "url",
  "urlencoding",
  "util",

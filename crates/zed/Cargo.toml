@@ -219,6 +219,7 @@ toolchain_selector.workspace = true
 tracing.workspace = true
 ui.workspace = true
 ui_prompt.workspace = true
+upstream_release_notifier.workspace = true
 url.workspace = true
 urlencoding.workspace = true
 util.workspace = true
