@@ -4,16 +4,17 @@ pub(crate) mod usage;
 
 pub(crate) use tool_row::ToolRow;
 
+use std::collections::BTreeMap;
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
 use acp_thread::{
-    AcpThread, AcpThreadEvent, AgentThreadEntry, AssistantMessageChunk, PermissionRequestId,
-    ToolCall, ToolCallContent, ToolCallStatus,
+    AcpThread, AcpThreadEvent, AgentThreadEntry, AssistantMessageChunk, MentionUri,
+    PermissionRequestId, ToolCall, ToolCallContent, ToolCallStatus,
 };
 use agent_client_protocol::v2::schema as acp_v2;
-use chrono::{DateTime, Local};
-use collections::HashMap;
+use chrono::{DateTime, Datelike as _, Local};
+use collections::{HashMap, HashSet};
 use editor::Editor;
 use gpui::{
     Animation, AnimationExt as _, App, Context, ElementId, Entity, EntityId, FocusHandle,
@@ -21,9 +22,11 @@ use gpui::{
     px,
 };
 use language::Buffer;
+use markdown::{MarkdownFont, MarkdownStyle};
 use settings::{AgentUiStyle, Settings as _, SettingsStore};
 use theme_settings::ThemeSettings;
 use ui::prelude::*;
+use util::{ResultExt as _, paths::PathStyle};
 
 use super::AgentUiStyleSettings;
 use crate::conversation_view::ThreadView;
@@ -207,7 +210,15 @@ pub(crate) struct ThreadActivity {
     /// Claude Code opens or closes every thought summary of a conversation at
     /// once, starting closed.
     thoughts_expanded: bool,
-    user_messages_sent_at: HashMap<usize, DateTime<Local>>,
+    /// When each user message and each run of assistant text first appeared,
+    /// by entry and chunk (user messages use chunk 0). Messages replayed from
+    /// a loaded session have no time: the adapter sends none.
+    message_times: BTreeMap<(usize, usize), DateTime<Local>>,
+    /// Long user messages the user expanded with "Show more".
+    expanded_user_messages: HashSet<usize>,
+    /// User messages whose text is taller than the collapsed box, as measured
+    /// in the last frame.
+    overflowing_user_messages: HashSet<usize>,
     /// Editor tabs showing the full output of a tool call, by tool call id.
     output_tabs: HashMap<acp_v2::ToolCallId, ToolOutputTab>,
     /// Focused while the permission card replaces the prompt box, so the
@@ -247,8 +258,28 @@ impl ThreadActivity {
         })
     }
 
-    pub(crate) fn user_message_sent_at(&self, entry_ix: usize) -> Option<DateTime<Local>> {
-        self.user_messages_sent_at.get(&entry_ix).copied()
+    pub(crate) fn message_time(&self, key: (usize, usize)) -> Option<DateTime<Local>> {
+        self.message_times.get(&key).copied()
+    }
+
+    /// Whether the message at `key` is the first with a time on its day, which
+    /// Claude Code marks with a date line (also above the first message).
+    pub(crate) fn starts_new_day(&self, key: (usize, usize)) -> bool {
+        let Some(time) = self.message_times.get(&key) else {
+            return false;
+        };
+        self.message_times
+            .range(..key)
+            .next_back()
+            .is_none_or(|(_, previous)| previous.date_naive() != time.date_naive())
+    }
+
+    pub(crate) fn is_user_message_expanded(&self, entry_ix: usize) -> bool {
+        self.expanded_user_messages.contains(&entry_ix)
+    }
+
+    pub(crate) fn user_message_overflows(&self, entry_ix: usize) -> bool {
+        self.overflowing_user_messages.contains(&entry_ix)
     }
 
     pub(crate) fn thoughts_expanded(&self) -> bool {
@@ -286,13 +317,15 @@ impl ThreadActivity {
                     return;
                 };
                 if let Some(AgentThreadEntry::UserMessage(_)) = thread.entries().get(entry_ix) {
-                    self.user_messages_sent_at.insert(entry_ix, wall_clock);
+                    self.message_times.insert((entry_ix, 0), wall_clock);
                 }
+                self.record_assistant_text(thread, entry_ix, wall_clock);
                 self.record_streaming_thought(thread, entry_ix, now);
                 self.finish_open_thought(thread, now);
                 self.last_activity_at = Some(now);
             }
             AcpThreadEvent::EntryUpdated(entry_ix) => {
+                self.record_assistant_text(thread, *entry_ix, wall_clock);
                 self.record_streaming_thought(thread, *entry_ix, now);
                 self.finish_open_thought(thread, now);
                 self.last_activity_at = Some(now);
@@ -302,6 +335,29 @@ impl ThreadActivity {
                 self.open_thought = None;
             }
             _ => {}
+        }
+    }
+
+    fn record_assistant_text(
+        &mut self,
+        thread: &AcpThread,
+        entry_ix: usize,
+        wall_clock: DateTime<Local>,
+    ) {
+        let Some(AgentThreadEntry::AssistantMessage(message)) = thread.entries().get(entry_ix)
+        else {
+            return;
+        };
+        let Some(chunk_ix) = message.chunks.len().checked_sub(1) else {
+            return;
+        };
+        if matches!(
+            message.chunks.get(chunk_ix),
+            Some(AssistantMessageChunk::Message { .. })
+        ) {
+            self.message_times
+                .entry((entry_ix, chunk_ix))
+                .or_insert(wall_clock);
         }
     }
 
@@ -371,10 +427,19 @@ impl ThreadActivity {
         self.open_thought = self
             .open_thought
             .and_then(|(entry_ix, chunk_ix)| Some((shift(entry_ix)?, chunk_ix)));
-        self.user_messages_sent_at = self
-            .user_messages_sent_at
+        self.message_times = std::mem::take(&mut self.message_times)
+            .into_iter()
+            .filter_map(|((entry_ix, chunk_ix), time)| Some(((shift(entry_ix)?, chunk_ix), time)))
+            .collect();
+        self.expanded_user_messages = self
+            .expanded_user_messages
             .drain()
-            .filter_map(|(entry_ix, sent_at)| Some((shift(entry_ix)?, sent_at)))
+            .filter_map(shift)
+            .collect();
+        self.overflowing_user_messages = self
+            .overflowing_user_messages
+            .drain()
+            .filter_map(shift)
             .collect();
     }
 }
@@ -415,6 +480,40 @@ fn thread_activity_mut(thread_view_id: EntityId, cx: &mut App) -> Option<&mut Th
 pub(crate) fn toggle_thoughts_expanded(thread_view_id: EntityId, cx: &mut App) {
     if let Some(activity) = thread_activity_mut(thread_view_id, cx) {
         activity.thoughts_expanded = !activity.thoughts_expanded;
+    }
+}
+
+pub(crate) fn toggle_user_message_expanded(
+    thread_view_id: EntityId,
+    entry_ix: usize,
+    cx: &mut App,
+) {
+    if let Some(activity) = thread_activity_mut(thread_view_id, cx)
+        && !activity.expanded_user_messages.remove(&entry_ix)
+    {
+        activity.expanded_user_messages.insert(entry_ix);
+    }
+}
+
+/// Records whether a user message's text is taller than its collapsed box,
+/// and re-renders the thread view when that changes, because it is only
+/// known once the text has been laid out.
+pub(crate) fn set_user_message_overflows(
+    thread_view_id: EntityId,
+    entry_ix: usize,
+    overflows: bool,
+    cx: &mut App,
+) {
+    let Some(activity) = thread_activity_mut(thread_view_id, cx) else {
+        return;
+    };
+    let changed = if overflows {
+        activity.overflowing_user_messages.insert(entry_ix)
+    } else {
+        activity.overflowing_user_messages.remove(&entry_ix)
+    };
+    if changed {
+        cx.notify(thread_view_id);
     }
 }
 
@@ -640,6 +739,97 @@ pub(crate) fn thought_has_summary(block: &acp_thread::MessageContent) -> bool {
 
 pub(crate) fn format_timestamp(time: DateTime<Local>) -> SharedString {
     time.format("%-I:%M %p").to_string().into()
+}
+
+/// The date line's label, such as "Sun, Nov 8"; the year is added for
+/// another year, as Claude Code does.
+pub(crate) fn format_day(time: DateTime<Local>, now: DateTime<Local>) -> SharedString {
+    if time.year() == now.year() {
+        time.format("%a, %b %-d").to_string().into()
+    } else {
+        time.format("%a, %b %-d, %Y").to_string().into()
+    }
+}
+
+/// The name of an image attachment chip. Pasted images have no file name,
+/// so they get the one VS Code gives a pasted image, such as "image.png".
+pub(crate) fn attachment_name(
+    uri: Option<&str>,
+    mime_type: &str,
+    path_style: PathStyle,
+) -> SharedString {
+    let mention = uri.and_then(|uri| MentionUri::parse(uri, path_style).log_err());
+    match mention {
+        Some(MentionUri::File { abs_path }) => {
+            if let Some(file_name) = abs_path.file_name() {
+                return file_name.to_string_lossy().into_owned().into();
+            }
+        }
+        Some(MentionUri::PastedImage { name }) if name != DEFAULT_PASTED_IMAGE_NAME => {
+            return name.into();
+        }
+        _ => {}
+    }
+    let extension = match mime_type {
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/svg+xml" => "svg",
+        "image/bmp" => "bmp",
+        "image/tiff" => "tiff",
+        _ => "png",
+    };
+    format!("image.{extension}").into()
+}
+
+/// Zed's name for every pasted image.
+const DEFAULT_PASTED_IMAGE_NAME: &str = "Image";
+
+/// The text of a sent message as Claude Code shows it: what the user typed,
+/// with mentions as "@name" and images left to the attachment chips.
+pub(crate) fn sent_message_text(blocks: &[acp_v2::ContentBlock], path_style: PathStyle) -> String {
+    let mention_name = |uri: &str, fallback: &str| {
+        MentionUri::parse(uri, path_style)
+            .map(|mention| mention.name())
+            .unwrap_or_else(|_| fallback.to_string())
+    };
+    let mut text = String::new();
+    for block in blocks {
+        match block {
+            acp_v2::ContentBlock::Text(content) => text.push_str(&content.text),
+            acp_v2::ContentBlock::ResourceLink(link) => {
+                text.push('@');
+                text.push_str(&mention_name(&link.uri, &link.name));
+            }
+            acp_v2::ContentBlock::Resource(acp_v2::EmbeddedResource {
+                resource: acp_v2::EmbeddedResourceResource::TextResourceContents(resource),
+                ..
+            }) => {
+                text.push('@');
+                text.push_str(&mention_name(&resource.uri, &resource.uri));
+            }
+            _ => {}
+        }
+    }
+    text.trim().to_string()
+}
+
+/// VS Code draws Claude Code's transcript at its 13px workbench size, which
+/// Zed's labels reach at 14/16 of the UI font size.
+const TRANSCRIPT_FONT_RATIO: f32 = 14. / 16.;
+
+/// The agent markdown style, scaled to the size of the transcript's labels.
+pub(crate) fn transcript_markdown_style(window: &Window, cx: &App) -> MarkdownStyle {
+    let mut style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
+    let settings = ThemeSettings::get_global(cx);
+    let text_size = settings.agent_ui_font_size(cx) * TRANSCRIPT_FONT_RATIO;
+    let code_size = settings.agent_buffer_font_size(cx) * TRANSCRIPT_FONT_RATIO;
+    style.base_text_style.font_size = text_size.into();
+    // `MarkdownStyle::themed` derives the line height from the code size.
+    style.base_text_style.line_height = (code_size * 1.75).into();
+    style.code_block.text.font_size = Some(code_size.into());
+    style.inline_code.font_size = Some(code_size.into());
+    style
 }
 
 pub(crate) fn claude_code_tool_name(meta: Option<&acp_v2::Meta>) -> Option<SharedString> {
@@ -1215,6 +1405,7 @@ impl Render for ClaudeCodeSpinner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Timelike as _;
 
     fn permission_option(
         id: &'static str,
@@ -1295,6 +1486,85 @@ mod tests {
             thought_label(Some(Duration::from_millis(8_600)), false).as_ref(),
             "Thought for 9s"
         );
+    }
+
+    #[test]
+    fn test_attachment_names() {
+        let path_style = PathStyle::local();
+        assert_eq!(
+            attachment_name(None, "image/png", path_style).as_ref(),
+            "image.png"
+        );
+        let pasted = MentionUri::PastedImage {
+            name: DEFAULT_PASTED_IMAGE_NAME.to_string(),
+        };
+        assert_eq!(
+            attachment_name(Some(&pasted.to_uri().to_string()), "image/jpeg", path_style).as_ref(),
+            "image.jpg"
+        );
+        let file = MentionUri::File {
+            abs_path: std::path::PathBuf::from(if cfg!(windows) {
+                "C:\\shots\\screen.png"
+            } else {
+                "/shots/screen.png"
+            }),
+        };
+        assert_eq!(
+            attachment_name(Some(&file.to_uri().to_string()), "image/png", path_style).as_ref(),
+            "screen.png"
+        );
+    }
+
+    #[test]
+    fn test_sent_message_text() {
+        let path_style = PathStyle::local();
+        let file = MentionUri::File {
+            abs_path: std::path::PathBuf::from(if cfg!(windows) {
+                "C:\\repo\\main.rs"
+            } else {
+                "/repo/main.rs"
+            }),
+        };
+        let blocks = vec![
+            acp_v2::ContentBlock::Image(acp_v2::ImageContent::new("", "image/png")),
+            acp_v2::ContentBlock::Text(acp_v2::TextContent::new("look at ")),
+            acp_v2::ContentBlock::ResourceLink(acp_v2::ResourceLink::new(
+                "main.rs",
+                file.to_uri().to_string(),
+            )),
+            acp_v2::ContentBlock::Text(acp_v2::TextContent::new(" and fix it\n")),
+        ];
+        assert_eq!(
+            sent_message_text(&blocks, path_style),
+            "look at @main.rs and fix it"
+        );
+    }
+
+    #[test]
+    fn test_day_lines() {
+        let morning = Local::now()
+            .with_hour(9)
+            .and_then(|time| time.with_minute(0))
+            .expect("valid time");
+        let next_day = morning + chrono::Duration::days(1);
+        let mut activity = ThreadActivity::default();
+        activity.message_times.insert((0, 0), morning);
+        activity
+            .message_times
+            .insert((1, 2), morning + chrono::Duration::minutes(5));
+        activity.message_times.insert((3, 0), next_day);
+        assert!(activity.starts_new_day((0, 0)), "the first message");
+        assert!(!activity.starts_new_day((1, 2)));
+        assert!(activity.starts_new_day((3, 0)));
+        assert!(!activity.starts_new_day((4, 0)), "no time, no line");
+
+        let now = morning;
+        assert_eq!(
+            format_day(morning, now).as_ref(),
+            morning.format("%a, %b %-d").to_string()
+        );
+        let last_year = morning - chrono::Duration::days(400);
+        assert!(format_day(last_year, now).ends_with(&last_year.year().to_string()));
     }
 
     #[test]
@@ -1517,9 +1787,7 @@ mod tests {
                     last_updated_at: now + Duration::from_secs(entry_ix as u64),
                 },
             );
-            activity
-                .user_messages_sent_at
-                .insert(entry_ix, Local::now());
+            activity.message_times.insert((entry_ix, 0), Local::now());
         }
         activity.remove_entries(2..4);
         assert_eq!(
@@ -1531,7 +1799,7 @@ mod tests {
             Some(Duration::from_secs(5))
         );
         assert_eq!(activity.thought_duration(5, 0), None);
-        assert!(activity.user_message_sent_at(3).is_some());
-        assert!(activity.user_message_sent_at(5).is_none());
+        assert!(activity.message_time((3, 0)).is_some());
+        assert!(activity.message_time((5, 0)).is_none());
     }
 }
