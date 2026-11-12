@@ -248,6 +248,35 @@ struct ClientContext {
     accepts_subagent_updates: bool,
 }
 
+/// A notification that an agent sent with one of its own `_`-prefixed extension methods,
+/// such as claude-agent-acp's `_claude/sdkMessage`, for UI that knows that agent.
+#[derive(Clone, Debug)]
+pub struct AgentExtNotification {
+    pub session_id: Option<acp_v2::SessionId>,
+    pub method: SharedString,
+    pub params: Arc<serde_json::Value>,
+}
+
+/// Rebroadcasts the extension notifications of every agent connection.
+pub struct AgentExtNotifications;
+
+impl gpui::EventEmitter<AgentExtNotification> for AgentExtNotifications {}
+
+struct GlobalAgentExtNotifications(Entity<AgentExtNotifications>);
+
+impl gpui::Global for GlobalAgentExtNotifications {}
+
+impl AgentExtNotifications {
+    pub fn global(cx: &mut App) -> Entity<Self> {
+        if let Some(global) = cx.try_global::<GlobalAgentExtNotifications>() {
+            return global.0.clone();
+        }
+        let notifications = cx.new(|_| Self);
+        cx.set_global(GlobalAgentExtNotifications(notifications.clone()));
+        notifications
+    }
+}
+
 fn dispatch_queue_closed_error() -> agent_client_protocol::Error {
     agent_client_protocol::Error::internal_error().data("ACP foreground dispatch queue closed")
 }
