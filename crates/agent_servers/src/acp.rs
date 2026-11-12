@@ -290,10 +290,19 @@ fn claude_session_options() -> Option<serde_json::Value> {
     claude_session_options_for_settings(&settings)
 }
 
+/// The only Claude Code setting vszed reads. The settings file can also hold `env`
+/// values such as API keys, so nothing else is deserialized.
+#[derive(serde::Deserialize)]
+struct ClaudeCodeThinkingSettings {
+    #[serde(rename = "showThinkingSummaries")]
+    show_thinking_summaries: Option<bool>,
+}
+
 fn claude_session_options_for_settings(settings: &[u8]) -> Option<serde_json::Value> {
-    let settings = serde_json::from_slice::<serde_json::Value>(settings).ok()?;
-    let show_summaries = settings.get("showThinkingSummaries")?.as_bool()?;
-    show_summaries.then(|| serde_json::json!({ "extraArgs": { "thinking-display": "summarized" } }))
+    let settings = serde_json::from_slice::<ClaudeCodeThinkingSettings>(settings).ok()?;
+    settings
+        .show_thinking_summaries?
+        .then(|| serde_json::json!({ "extraArgs": { "thinking-display": "summarized" } }))
 }
 
 fn dispatch_queue_closed_error() -> agent_client_protocol::Error {
