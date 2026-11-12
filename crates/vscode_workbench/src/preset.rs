@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{num::NonZeroU32, sync::Arc};
 
 use anyhow::{Context as _, Result};
 use db::kvp::KeyValueStore;
@@ -8,10 +8,11 @@ use futures::channel::oneshot;
 use gpui::{App, AsyncApp, Context, Entity, Task, WeakEntity, Window, actions};
 use serde::{Deserialize, Serialize};
 use settings::{
-    BaseKeymapContent, BottomDockLayout, DockPosition, DockSide, EncodingDisplayOptions,
-    FontFamilyName, FontSize, IconThemeName, IconThemeSelection, MinimapThumb, SettingsContent,
-    SettingsStore, ShowDiagnostics, ShowMinimap, TerminalDockPosition, ThemeAppearanceMode,
-    ThemeName, ThemeSelection, update_settings_file_with_completion,
+    BaseKeymapContent, BottomDockLayout, BufferLineHeight, DockPosition, DockSide,
+    EncodingDisplayOptions, FontFamilyName, FontSize, IconThemeName, IconThemeSelection,
+    MinimapThumb, SettingsContent, SettingsStore, ShowDiagnostics, ShowMinimap,
+    TerminalDockPosition, ThemeAppearanceMode, ThemeName, ThemeSelection,
+    update_settings_file_with_completion,
 };
 use util::ResultExt as _;
 use workspace::{Toast, Workspace, notifications::NotificationId};
@@ -33,6 +34,8 @@ const DARK_THEME: &str = "Dark 2026 (VS Code)";
 const LIGHT_THEME: &str = "Light 2026 (VS Code)";
 const ICON_THEME_EXTENSION_ID: &str = "seti-icons";
 const ICON_THEME: &str = "Seti Icon Theme";
+/// VS Code's `editor.minimap.maxColumn` default.
+const MINIMAP_MAX_COLUMNS: u32 = 120;
 
 pub(crate) fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
@@ -298,6 +301,8 @@ struct LayoutSnapshot {
     tab_diagnostics: Option<ShowDiagnostics>,
     minimap: Option<ShowMinimap>,
     minimap_thumb: Option<MinimapThumb>,
+    minimap_max_width_columns: Option<NonZeroU32>,
+    minimap_line_height: Option<BufferLineHeight>,
     status_bar_encoding_button: Option<EncodingDisplayOptions>,
     status_bar_line_endings_button: Option<bool>,
     breadcrumbs: Option<bool>,
@@ -352,6 +357,8 @@ impl LayoutSnapshot {
             tab_diagnostics: tabs.and_then(|tabs| tabs.show_diagnostics),
             minimap: minimap.and_then(|minimap| minimap.show),
             minimap_thumb: minimap.and_then(|minimap| minimap.thumb),
+            minimap_max_width_columns: minimap.and_then(|minimap| minimap.max_width_columns),
+            minimap_line_height: minimap.and_then(|minimap| minimap.line_height),
             status_bar_encoding_button: status_bar
                 .and_then(|status_bar| status_bar.active_encoding_button),
             status_bar_line_endings_button: status_bar
@@ -420,6 +427,8 @@ impl LayoutSnapshot {
         update_nested(&mut content.editor.minimap, |minimap| {
             minimap.show = self.minimap;
             minimap.thumb = self.minimap_thumb;
+            minimap.max_width_columns = self.minimap_max_width_columns;
+            minimap.line_height = self.minimap_line_height;
         });
         update_nested(&mut content.status_bar, |status_bar| {
             status_bar.active_encoding_button = self.status_bar_encoding_button;
@@ -468,6 +477,14 @@ impl LayoutSnapshot {
         self.minimap = Some(ShowMinimap::Always);
         // VS Code's `editor.minimap.showSlider` default.
         self.minimap_thumb = Some(MinimapThumb::Hover);
+        // Zed's minimap is 15% of the text width, capped at this many columns.
+        // The default cap of 80 is reached by most editors, so the minimap
+        // barely shrinks in a split. VS Code's 120 keeps it proportional.
+        self.minimap_max_width_columns = NonZeroU32::new(MINIMAP_MAX_COLUMNS);
+        // VS Code draws 2px minimap lines (`editor.minimap.scale` 1). Zed's
+        // minimap font is 2px, but its lines inherit the buffer line height and
+        // round to 3px, which makes the slider half again as tall as VS Code's.
+        self.minimap_line_height = Some(BufferLineHeight::Custom(1.0));
         // VS Code always shows the encoding and line ending of the active file.
         self.status_bar_encoding_button = Some(EncodingDisplayOptions::Enabled);
         self.status_bar_line_endings_button = Some(true);
@@ -607,6 +624,8 @@ mod tests {
         assert_eq!(applied["tabs"]["show_diagnostics"], json!("errors"));
         assert_eq!(applied["minimap"]["show"], json!("always"));
         assert_eq!(applied["minimap"]["thumb"], json!("hover"));
+        assert_eq!(applied["minimap"]["max_width_columns"], json!(120));
+        assert_eq!(applied["minimap"]["line_height"], json!({ "custom": 1.0 }));
         assert_eq!(
             applied["status_bar"]["active_encoding_button"],
             json!("enabled")
