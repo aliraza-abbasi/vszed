@@ -90,22 +90,13 @@ impl ThreadView {
         let (border_color, shadows) = if is_focused {
             (
                 accent.ring,
-                vec![
-                    BoxShadow {
-                        color: accent.ring.opacity(0.12),
-                        offset: point(px(0.), px(0.)),
-                        blur_radius: px(0.),
-                        spread_radius: px(3.),
-                        inset: false,
-                    },
-                    BoxShadow {
-                        color: accent.ring.opacity(0.2),
-                        offset: point(px(0.), px(1.)),
-                        blur_radius: px(2.),
-                        spread_radius: px(0.),
-                        inset: false,
-                    },
-                ],
+                vec![BoxShadow {
+                    color: accent.ring.opacity(0.2),
+                    offset: point(px(0.), px(1.)),
+                    blur_radius: px(2.),
+                    spread_radius: px(0.),
+                    inset: false,
+                }],
             )
         } else {
             (
