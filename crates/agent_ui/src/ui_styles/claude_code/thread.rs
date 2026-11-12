@@ -1060,6 +1060,44 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_claude_code_activity_bar_matches_prompt_box(cx: &mut TestAppContext) {
+        let connection = StubAgentConnection::new();
+        let (thread_view, cx) = setup_thread_view(connection.clone(), cx).await;
+        let session_id =
+            thread_view.read_with(cx, |view, cx| view.thread.read(cx).session_id().clone());
+        cx.update(|_window, cx| {
+            connection.send_update(
+                session_id,
+                acp_v1::SessionUpdate::Plan(acp_v1::Plan::new(vec![acp_v1::PlanEntry::new(
+                    "Do the thing",
+                    acp_v1::PlanEntryPriority::Medium,
+                    acp_v1::PlanEntryStatus::Pending,
+                )])),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("plan_summary").is_some());
+        assert!(cx.debug_bounds("claude-code-activity-bar").is_none());
+
+        set_ui_style("claude_code", cx);
+        let activity_bar = cx
+            .debug_bounds("claude-code-activity-bar")
+            .expect("activity bar in the Claude Code style");
+        let plan_summary = cx.debug_bounds("plan_summary").expect("plan summary");
+        let prompt_box = cx
+            .debug_bounds("claude-code-prompt-box")
+            .expect("prompt box");
+        assert!(
+            plan_summary.top() >= activity_bar.top()
+                && plan_summary.bottom() <= activity_bar.bottom()
+        );
+        assert_eq!(activity_bar.left(), prompt_box.left());
+        assert_eq!(activity_bar.right(), prompt_box.right());
+        assert!(activity_bar.bottom() <= prompt_box.top());
+    }
+
+    #[gpui::test]
     async fn test_switching_ui_style_rerenders_thread(cx: &mut TestAppContext) {
         let connection = StubAgentConnection::new();
         connection.set_next_prompt_updates(vec![acp_v1::SessionUpdate::ToolCall(bash_tool_call())]);
