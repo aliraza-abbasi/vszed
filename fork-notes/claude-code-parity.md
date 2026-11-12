@@ -32,7 +32,9 @@ There is no Thinking toggle option: per the docs Thinking lives in the `/` menu,
 
 **Session modes** (`src/session-mode.ts`): `default` "Manual", `acceptEdits` "Accept edits", `plan` "Plan", `auto` "Auto" (unless disabled by settings), `bypassPermissions` "Bypass permissions" (only when allowed). The extension calls `acceptEdits` "Edit automatically"; vszed maps the ids to the extension's labels. A new session starts in `auto` when available, else `default`, unless `permissions.defaultMode` says otherwise; a resumed session keeps its transcript's mode.
 
-**Permission options** (`src/permissions/options/*`): ids `allow-once` ("Yes"), `allow-with-updates` (e.g. "Yes, and don't ask again for `git status` commands", "Yes, allow all edits during this session"), `allow-skill-exact` / `allow-skill-prefix`, `reject` ("No"). Plan approval (ExitPlanMode): `exit-plan-clear-auto` / `-clear-bypass` / `-clear-accept-edits` ("Yes, clear context (N% used) and use auto mode" etc., only with a plan and a fresh-context turn), `exit-plan-auto` "Yes, and use auto mode", `exit-plan-bypass` "Yes, and bypass permissions", `exit-plan-accept-edits` "Yes, auto-accept edits" (when neither auto nor bypass is available), `exit-plan-default` "Yes, manually approve edits", and `reject` "No, keep planning". Render the names verbatim (B4).
+**Permission options** (`src/permissions/options/*`): ids `allow-once` ("Yes"), `allow-with-updates` (e.g. "Yes, and don't ask again for `git status` commands", "Yes, allow all edits during this session"), `allow-skill-exact` / `allow-skill-prefix`, `reject` ("No"). Plan approval (ExitPlanMode): `exit-plan-clear-auto` / `-clear-bypass` / `-clear-accept-edits` ("Yes, clear context (N% used) and use auto mode" etc., only with a plan and a fresh-context turn), `exit-plan-auto` "Yes, and use auto mode", `exit-plan-bypass` "Yes, and bypass permissions", `exit-plan-accept-edits` "Yes, auto-accept edits" (when neither auto nor bypass is available), `exit-plan-default` "Yes, manually approve edits", and `reject` "No, keep planning". EnterPlanMode: "Yes, enter plan mode" / "No, start implementing now". Bash and PowerShell: "Yes", the optional `allow-with-updates` choice, "No" (no "Yes, and switch to auto mode" in this version). Render the names verbatim (B4).
+
+**Permission request presentation** (`src/permissions/presentation.ts`): over ACP v2 the request `title` is the tool call's title (the command itself for Bash/PowerShell), or "Ready to code?" for ExitPlanMode, and `description` is "Reason: ..." when the SDK gives a decision reason. ACP v1 requests carry no title. The plan travels as the ExitPlanMode tool call's display text (a plan file path only for JetBrains AIR clients). `defaultToNo` (preselect "No") is only sent in the JetBrains AIR `_meta`. After approval the adapter publishes the plan as an ACP `plan_update` of type `markdown` with plan id `plan-mode` (`planModeUpdate`), which Zed shows as the "Plan <heading>" row above the prompt.
 
 **`session/list`**: honors `cwd` exactly (`listSessions({ dir: cwd, includeWorktrees: false })`, absolute paths only), so another git worktree of the same repository is a different project, as in `claude --resume`. Pages hold `SESSION_LIST_PAGE_SIZE` sessions with an `offset:N` cursor. Each session carries `cwd`, `title` (the transcript summary) and `updatedAt`. The v1 core hides archived sessions; the v2 core does not filter them. Rename and archive exist only as v1 extension methods (`_session/rename`, `_session/archive`, `_session/unarchive`), which Zed does not call.
 
@@ -45,7 +47,7 @@ There is no Thinking toggle option: per the docs Thinking lives in the `/` menu,
 | Spark icon in the activity bar opens the sessions list | yes | "Claude Code" panel in the left dock (B6, `agent::ToggleClaudeCodeSessions`), present only in the Claude Code style; the Track A activity bar picks it up | done |
 | `✻ Claude Code` status bar item, bottom right | yes | status item (B6) | todo |
 | Spark icon in the editor toolbar, top right, when a file is open | yes | pane tab-bar button | todo |
-| Default location: editor tab (`preferredLocation: panel`), or right sidebar | yes | `agent.thread_location: editor` / `panel`; the style does not switch it yet (the preset action is still todo) | partial |
+| Default location: editor tab (`preferredLocation: panel`), or right sidebar | yes | `agent.thread_location: editor` / `panel`. `agent: use Claude Code style` sets `agent.ui_style: claude_code` and `agent.thread_location: editor` (remembering the previous values); `agent: restore previous ui style` puts them back | done |
 | Multiple conversations as separate tabs | yes | one `AgentThreadItem` per session (B5); tabs restore after restart from the saved session id | done |
 | Tab status dot: blue = permission pending, orange = finished while hidden | yes | dot on the tab's agent icon (B5) | done |
 | Clicking a session that is already open focuses its tab | yes | B5/B6: tabs are matched by session id or Zed thread id | done |
@@ -75,6 +77,9 @@ Closing a thread tab while a turn runs asks for confirmation when closed with `p
 | Option+K / Alt+K inserts an @-mention for the current selection | yes | action + keybinding | todo |
 | Selection and open file shared automatically, shown in the footer (selected line count, file name); settings `attachSelection`, `attachOpenFile` | yes | add context mention automatically on send | todo |
 | Paste images; Shift+drag files in | yes | `MessageEditor` inside the prompt box (images supported); `+` opens Zed's add-context menu | done |
+| Prompt and sent messages in the UI font | screenshot | `MessageEditor` text style swapped to the UI font family and agent UI font size in this style | done |
+| `+` attachment menu contents | the docs only mention an "attachment menu" with Chrome browser tools; its entries are undocumented | Zed's menu kept as is (Files & Directories, Symbols, Threads, Image, Selection, Branch Diff) | gap (undocumented) |
+| Approved plan above the prompt | not documented | the adapter's `plan-mode` markdown plan in Zed's "Plan <heading>" row; the activity bar (plan, edited files, queue) is drawn with the prompt box's width, radius and colors, behavior unchanged | done (look only) |
 | `/` button and typed `/` open the slash menu (Switch model, Output styles, Hooks, Permissions, Memory, Status, Thinking, ...) | yes | `/` button types a `/` (with a leading space after text) and opens the completions: ACP `available_commands` + Zed's local items. Extension-only entries (Switch model, Thinking, ...) are not added | partial |
 | Model name button at the bottom; shows effort level, e.g. "Opus 5.5 Extra high", and "· Ultracode" when on | yes | model chip from the `model` + `effort` options; `xhigh` shows as "Extra high"; the `default` model shows the model it resolves to | done |
 | Model menu: model list, Effort row, Fast mode and Ultracode switches | yes | model chip popover (checkmark toggles rather than switches) | done |
@@ -95,6 +100,8 @@ User messages render as plain UI-font text in the bordered box (the read-only me
 | Behavior | Extension | vszed mapping | Status |
 |---|---|---|---|
 | Timestamps on messages (`showMessageTimestamps`, default on) | yes | B2 (always on; no setting yet) | done |
+| Hover a response: **Copy response** | yes | copy button revealed on hover under each finished turn; Zed's scroll-to-prompt, scroll-to-top, feedback and turn stats are not shown in this style | done |
+| Hover a response: **Bookmark response**, Bookmarks panel | yes | | gap (not in ACP) |
 | Scroll to bottom on send (`scrollToBottomOnSend`) | yes | B2 | todo |
 | Timeline: dot per step, bold tool name + description, IN/OUT blocks, "Thought for Ns" | screenshot | B2; tool names from the adapter (see above); IN/OUT laid out one row per line | done |
 | Thinking summaries only when `showThinkingSummaries` is on | yes | B2 | todo |
@@ -106,12 +113,15 @@ User messages render as plain UI-font text in the bordered box (the read-only me
 
 | Behavior | Extension | vszed mapping | Status |
 |---|---|---|---|
-| Manual mode edits: side-by-side diff of original vs proposed in the editor, then accept / reject / tell Claude what to do instead; editing the proposed side is reported to Claude | yes | B4 + B7 (diff tab driven by the pending tool call) | todo |
-| Option labels end with where approval is saved ("this session", "all projects") | yes | render ACP permission option names verbatim | todo |
-| Bash prompt: "Yes, and switch to auto mode" | yes | from adapter options | todo |
-| Plan approval: "Yes, and use auto mode" (or "Yes, auto-accept edits"), "Yes, manually approve edits", "No, keep planning" | yes | B4 | todo |
-| Plan opens as a full Markdown document with inline comments before Claude starts | yes | open plan as a markdown editor tab | todo |
-| Left/Right arrows change a permission prompt's destination | yes (unconfirmed) | B4 | todo |
+| Permission prompt in the prompt box's place: bold title, numbered options, highlighted option (docs screenshot) | yes | B4 card: replaces the prompt box while a request is pending and takes focus from the prompt; `1`-`9` pick an option, Up/Down move the highlight, Enter picks it, Esc picks the adapter's "No" (`reject`). Title is the adapter's request title (ACP v2) or the tool call title (ACP v1); the extension's own wording ("Make this edit to utils.py?") is not sent by the adapter | done |
+| "Tell Claude what to do instead" field in the prompt | yes | | gap (ACP permission outcomes carry no text; reject, then send a message) |
+| "No" preselected for risky requests | not documented | | gap (`defaultToNo` only reaches JetBrains AIR clients) |
+| Manual mode edits: side-by-side diff of original vs proposed in the editor, then accept / reject / tell Claude what to do instead; editing the proposed side is reported to Claude | yes | B4 card done; B7 (diff tab driven by the pending tool call) | todo |
+| Option labels end with where approval is saved ("this session", "all projects") | yes | ACP permission option names rendered verbatim (B4) | done |
+| Bash prompt: "Yes, and switch to auto mode" | yes | | gap (claude-agent-acp 0.106.0 offers no such option) |
+| Plan approval: "Yes, and use auto mode" (or "Yes, auto-accept edits"), "Yes, manually approve edits", "No, keep planning" | yes | B4 card with the adapter's option names and the plan markdown above them | done |
+| Plan opens as a full Markdown document with inline comments before Claude starts | yes | the card shows the plan inline; a markdown editor tab is still to do, and inline comments have no ACP channel | todo / gap |
+| Left/Right arrows change a permission prompt's destination | yes | | gap (ACP options are fixed choices; the destination is not exposed) |
 
 ## Edits, diffs, checkpoints
 
