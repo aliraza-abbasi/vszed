@@ -20,7 +20,7 @@ use crate::ui_styles::claude_code::{
     remember_zed_placeholder, select_entries, toggle_option_state, toggled_option_value,
 };
 
-const PROMPT_BOX_RADIUS: Pixels = px(8.);
+pub(super) const PROMPT_BOX_RADIUS: Pixels = px(8.);
 
 /// What the chips need to read and change the session's config options.
 #[derive(Clone)]
@@ -64,6 +64,34 @@ impl ThreadView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         self.sync_claude_code_placeholder(window, cx);
+
+        // Like Claude Code, a pending permission prompt replaces the prompt box.
+        // Focus follows it: the card while it is up, the editor once it's answered.
+        let permission_focus = thread_activity(cx.entity_id(), cx)
+            .and_then(|activity| activity.permission_focus())
+            .cloned();
+        if let Some(permission_focus) = permission_focus {
+            if let Some(prompt) = self.claude_code_permission_prompt(cx) {
+                if self.message_editor.focus_handle(cx).is_focused(window) {
+                    let permission_focus = permission_focus.clone();
+                    cx.defer_in(window, move |_, window, cx| {
+                        window.focus(&permission_focus, cx);
+                    });
+                }
+                return self.render_claude_code_permission_card(
+                    prompt,
+                    &permission_focus,
+                    window,
+                    cx,
+                );
+            }
+            if permission_focus.is_focused(window) {
+                let editor_focus = self.message_editor.focus_handle(cx);
+                cx.defer_in(window, move |_, window, cx| {
+                    window.focus(&editor_focus, cx);
+                });
+            }
+        }
 
         let editor_background = cx.theme().colors().editor_background;
         let border_color = if self
@@ -218,18 +246,23 @@ impl ThreadView {
         let has_changed_buffers = !changed_buffers.is_empty();
         let has_queue = self.has_queued_messages();
 
-        let awaiting_permission = self
-            .render_main_agent_awaiting_permission(window, cx)
-            .or_else(|| self.render_subagents_awaiting_permission(cx));
-        let awaiting_permission = match (self.render_generic_permissions(cx), awaiting_permission) {
-            (Some(generic), Some(legacy)) => Some(
-                v_flex()
-                    .child(generic)
-                    .child(Divider::horizontal().color(DividerColor::Border))
-                    .child(legacy)
-                    .into_any(),
-            ),
-            (generic, legacy) => generic.or(legacy),
+        // The permission card in the prompt box's place answers these requests.
+        let awaiting_permission = if self.claude_code_permission_prompt(cx).is_some() {
+            None
+        } else {
+            let awaiting_permission = self
+                .render_main_agent_awaiting_permission(window, cx)
+                .or_else(|| self.render_subagents_awaiting_permission(cx));
+            match (self.render_generic_permissions(cx), awaiting_permission) {
+                (Some(generic), Some(legacy)) => Some(
+                    v_flex()
+                        .child(generic)
+                        .child(Divider::horizontal().color(DividerColor::Border))
+                        .child(legacy)
+                        .into_any(),
+                ),
+                (generic, legacy) => generic.or(legacy),
+            }
         };
         let has_awaiting_permission = awaiting_permission.is_some();
 

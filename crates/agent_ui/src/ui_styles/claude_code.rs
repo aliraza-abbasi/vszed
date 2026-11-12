@@ -7,15 +7,15 @@ use std::ops::Range;
 use std::time::{Duration, Instant};
 
 use acp_thread::{
-    AcpThread, AcpThreadEvent, AgentThreadEntry, AssistantMessageChunk, ToolCall, ToolCallContent,
-    ToolCallStatus,
+    AcpThread, AcpThreadEvent, AgentThreadEntry, AssistantMessageChunk, PermissionRequestId,
+    ToolCall, ToolCallContent, ToolCallStatus,
 };
 use agent_client_protocol::v2::schema as acp_v2;
 use chrono::{DateTime, Local};
 use collections::HashMap;
 use gpui::{
-    Animation, AnimationExt as _, App, Context, ElementId, EntityId, Global, Hsla, Pixels,
-    TextStyle, pulsating_between, px,
+    Animation, AnimationExt as _, App, Context, ElementId, EntityId, FocusHandle, Focusable as _,
+    Global, Hsla, Pixels, TextStyle, pulsating_between, px,
 };
 use settings::{AgentUiStyle, Settings as _, SettingsStore};
 use theme_settings::ThemeSettings;
@@ -31,6 +31,9 @@ const TIMELINE_DOT_SIZE: Pixels = px(7.);
 /// The `_meta` namespace claude-agent-acp uses for Claude Code specific data.
 const CLAUDE_CODE_META_KEY: &str = "claudeCode";
 const CLAUDE_CODE_TOOL_NAME_KEY: &str = "toolName";
+/// claude-agent-acp's plan approval option ids all start with this
+/// (`src/permissions/options/shared.ts`).
+const EXIT_PLAN_OPTION_PREFIX: &str = "exit-plan-";
 /// claude-agent-acp's config option id for Ultracode (`src/session-config-ids.ts`).
 const ULTRACODE_CONFIG_ID: &str = "ultracode";
 /// The built-in tools claude-agent-acp reports by name (`src/tool-calls/reporters`).
@@ -195,6 +198,12 @@ pub(crate) struct ThreadActivity {
     last_activity_at: Option<Instant>,
     thoughts: HashMap<(usize, usize), ThoughtTiming>,
     user_messages_sent_at: HashMap<usize, DateTime<Local>>,
+    /// Focused while the permission card replaces the prompt box, so the
+    /// card's number keys and Esc reach it.
+    permission_focus: Option<FocusHandle>,
+    /// The highlighted option of the permission card, for the request it was
+    /// chosen on.
+    permission_selection: Option<(PermissionRequestId, usize)>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -214,6 +223,17 @@ impl ThreadActivity {
 
     pub(crate) fn user_message_sent_at(&self, entry_ix: usize) -> Option<DateTime<Local>> {
         self.user_messages_sent_at.get(&entry_ix).copied()
+    }
+
+    pub(crate) fn permission_focus(&self) -> Option<&FocusHandle> {
+        self.permission_focus.as_ref()
+    }
+
+    pub(crate) fn permission_selection(&self, request_id: PermissionRequestId) -> usize {
+        match self.permission_selection {
+            Some((selected_request_id, index)) if selected_request_id == request_id => index,
+            _ => 0,
+        }
     }
 
     fn record_event(
@@ -308,6 +328,21 @@ pub(crate) fn thread_activity(thread_view_id: EntityId, cx: &App) -> Option<&Thr
         .get(&thread_view_id)
 }
 
+pub(crate) fn set_permission_selection(
+    thread_view_id: EntityId,
+    request_id: PermissionRequestId,
+    index: usize,
+    cx: &mut App,
+) {
+    if let Some(activity) = cx
+        .default_global::<ClaudeCodeActivity>()
+        .threads
+        .get_mut(&thread_view_id)
+    {
+        activity.permission_selection = Some((request_id, index));
+    }
+}
+
 pub(crate) fn init(cx: &mut App) {
     cx.observe_new(|thread_view: &mut ThreadView, window, cx| {
         track_thread_view(thread_view, window, cx);
@@ -326,9 +361,13 @@ fn track_thread_view(
     cx: &mut Context<ThreadView>,
 ) {
     let thread_view_id = cx.entity_id();
+    let activity = ThreadActivity {
+        permission_focus: Some(cx.focus_handle()),
+        ..ThreadActivity::default()
+    };
     cx.default_global::<ClaudeCodeActivity>()
         .threads
-        .insert(thread_view_id, ThreadActivity::default());
+        .insert(thread_view_id, activity);
 
     let thread_subscription = cx.subscribe(&thread_view.thread, move |_, thread, event, cx| {
         let now = Instant::now();
@@ -357,6 +396,14 @@ fn track_thread_view(
             && let Some(window) = window
         {
             restore_zed_placeholder(thread_view, window, cx);
+            // Zed's style has no permission card, so focus must not stay on it.
+            let permission_card_focused = thread_activity(thread_view_id, cx)
+                .and_then(|activity| activity.permission_focus())
+                .is_some_and(|focus| focus.is_focused(window));
+            if permission_card_focused {
+                let editor_focus = thread_view.message_editor.focus_handle(cx);
+                window.focus(&editor_focus, cx);
+            }
         }
         cx.notify();
     };
@@ -416,6 +463,41 @@ pub(crate) fn ui_font_text_style(cx: &App) -> TextStyle {
         line_height: relative(1.5),
         ..Default::default()
     }
+}
+
+/// The option a number key picks in a permission card: `1` is the first.
+pub(crate) fn permission_option_for_key(key: &str, option_count: usize) -> Option<usize> {
+    let [digit @ b'1'..=b'9'] = key.as_bytes() else {
+        return None;
+    };
+    let index = usize::from(digit - b'1');
+    (index < option_count).then_some(index)
+}
+
+/// The option Esc picks in a permission card: the adapter's "No" choice.
+pub(crate) fn reject_option_index(options: &[acp_v2::PermissionOption]) -> Option<usize> {
+    options
+        .iter()
+        .position(|option| option.kind == acp_v2::PermissionOptionKind::RejectOnce)
+        .or_else(|| {
+            options
+                .iter()
+                .position(|option| option.kind == acp_v2::PermissionOptionKind::RejectAlways)
+        })
+}
+
+pub(crate) fn is_allow_option(option: &acp_v2::PermissionOption) -> bool {
+    matches!(
+        option.kind,
+        acp_v2::PermissionOptionKind::AllowOnce | acp_v2::PermissionOptionKind::AllowAlways
+    )
+}
+
+/// Whether a permission request is claude-agent-acp's ExitPlanMode approval.
+pub(crate) fn is_plan_approval(options: &[acp_v2::PermissionOption]) -> bool {
+    options
+        .iter()
+        .any(|option| option.option_id.0.starts_with(EXIT_PLAN_OPTION_PREFIX))
 }
 
 pub(crate) fn thought_label(duration: Option<Duration>, is_streaming: bool) -> SharedString {
@@ -995,6 +1077,61 @@ impl Render for ClaudeCodeSpinner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn permission_option(
+        id: &'static str,
+        name: &'static str,
+        kind: acp_v2::PermissionOptionKind,
+    ) -> acp_v2::PermissionOption {
+        acp_v2::PermissionOption::new(acp_v2::PermissionOptionId::new(id), name, kind)
+    }
+
+    #[test]
+    fn test_permission_option_keys() {
+        assert_eq!(permission_option_for_key("1", 3), Some(0));
+        assert_eq!(permission_option_for_key("3", 3), Some(2));
+        assert_eq!(permission_option_for_key("4", 3), None);
+        assert_eq!(permission_option_for_key("0", 3), None);
+        assert_eq!(permission_option_for_key("a", 3), None);
+        assert_eq!(permission_option_for_key("10", 12), None);
+        assert_eq!(permission_option_for_key("escape", 3), None);
+
+        // claude-agent-acp v0.106.0, `buildExitPlanModePermissionOptions` with auto available.
+        let plan_options = [
+            permission_option(
+                "exit-plan-auto",
+                "Yes, and use auto mode",
+                acp_v2::PermissionOptionKind::AllowAlways,
+            ),
+            permission_option(
+                "exit-plan-default",
+                "Yes, manually approve edits",
+                acp_v2::PermissionOptionKind::AllowOnce,
+            ),
+            permission_option(
+                "reject",
+                "No, keep planning",
+                acp_v2::PermissionOptionKind::RejectOnce,
+            ),
+        ];
+        assert!(is_plan_approval(&plan_options));
+        assert_eq!(reject_option_index(&plan_options), Some(2));
+
+        let bash_options = [
+            permission_option("allow-once", "Yes", acp_v2::PermissionOptionKind::AllowOnce),
+            permission_option(
+                "allow-with-updates",
+                "Yes, and don't ask again for `git status` commands",
+                acp_v2::PermissionOptionKind::AllowAlways,
+            ),
+            permission_option("reject", "No", acp_v2::PermissionOptionKind::RejectOnce),
+        ];
+        assert!(!is_plan_approval(&bash_options));
+        assert_eq!(reject_option_index(&bash_options), Some(2));
+        assert!(is_allow_option(&bash_options[1]));
+        assert!(!is_allow_option(&bash_options[2]));
+        assert_eq!(reject_option_index(&bash_options[..2]), None);
+    }
 
     #[test]
     fn test_thought_label() {
