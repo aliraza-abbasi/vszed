@@ -1,17 +1,18 @@
 use std::sync::Arc;
 
 use client::{SignIn, SignOut, UserStore};
-use gpui::{Action, Anchor, ClickEvent, Empty, Entity, Subscription, WeakEntity, svg};
+use gpui::{Action, Anchor, ClickEvent, Entity, Subscription, WeakEntity, svg};
 use settings::{Settings, SettingsStore};
 use ui::{ButtonLike, ContextMenu, CountBadge, PopoverMenu, Tooltip, prelude::*};
 use workspace::{
-    DeploySearch, HideStatusItem, ItemHandle, StatusItemView, Workspace,
+    DeploySearch, Workspace,
     dock::{Dock, PanelButtons, PanelHandle},
 };
 
 use crate::{
     Codicon, DEBUG_PANEL_KEY, GIT_PANEL_KEY, PROJECT_PANEL_KEY, UseVsCodeLayout, WorkbenchSettings,
     is_active_panel, panel_icon_path, reveal_panel,
+    status_items::{hide_status_items, restore_status_items},
 };
 
 const ACTIVITY_BAR_WIDTH: Pixels = px(48.);
@@ -46,66 +47,11 @@ fn apply_activity_bar_visibility(
     if visible {
         let activity_bar = cx.new(|cx| ActivityBar::new(workspace, cx));
         workspace.set_leading_item(Some(activity_bar.into()), cx);
-        hide_panel_buttons(workspace, window, cx);
+        hide_status_items::<PanelButtons>(workspace, window, cx);
     } else {
         workspace.set_leading_item(None, cx);
-        restore_panel_buttons(workspace, window, cx);
+        restore_status_items::<PanelButtons>(workspace, window, cx);
     }
-}
-
-/// Holds a dock's panel buttons while the activity bar replaces them. The status
-/// bar can only insert an item after an existing one, so keeping a placeholder in
-/// the buttons' slot is what lets them return to their original position.
-struct HiddenPanelButtons {
-    panel_buttons: Entity<PanelButtons>,
-}
-
-impl Render for HiddenPanelButtons {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        Empty
-    }
-}
-
-impl StatusItemView for HiddenPanelButtons {
-    fn set_active_pane_item(
-        &mut self,
-        _active_pane_item: Option<&dyn ItemHandle>,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) {
-    }
-
-    fn hide_setting(&self, _cx: &App) -> Option<HideStatusItem> {
-        None
-    }
-}
-
-fn hide_panel_buttons(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
-    workspace.status_bar().update(cx, |status_bar, cx| {
-        while let Some(position) = status_bar.position_of_item::<PanelButtons>()
-            && let Some(panel_buttons) = status_bar.item_of_type::<PanelButtons>()
-        {
-            let placeholder = cx.new(|_| HiddenPanelButtons { panel_buttons });
-            status_bar.insert_item_after(position, placeholder, window, cx);
-            status_bar.remove_item_at(position, cx);
-        }
-    });
-}
-
-fn restore_panel_buttons(
-    workspace: &mut Workspace,
-    window: &mut Window,
-    cx: &mut Context<Workspace>,
-) {
-    workspace.status_bar().update(cx, |status_bar, cx| {
-        while let Some(position) = status_bar.position_of_item::<HiddenPanelButtons>()
-            && let Some(placeholder) = status_bar.item_of_type::<HiddenPanelButtons>()
-        {
-            let panel_buttons = placeholder.read(cx).panel_buttons.clone();
-            status_bar.insert_item_after(position, panel_buttons, window, cx);
-            status_bar.remove_item_at(position, cx);
-        }
-    });
 }
 
 enum ActivityBarEntry {
@@ -459,9 +405,13 @@ fn render_manage_menu(cx: &App) -> impl IntoElement {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{EntityId, TestAppContext, VisualTestContext};
-    use workspace::dock::{DockPosition, Panel as _};
+    use gpui::{Empty, EntityId, TestAppContext, VisualTestContext};
+    use workspace::{
+        HideStatusItem, ItemHandle, StatusItemView,
+        dock::{DockPosition, Panel as _},
+    };
 
+    use crate::status_items::StatusItemPlaceholder;
     use crate::test_support::{
         AgentTestPanel, DebugTestPanel, ExplorerTestPanel, OutlineTestPanel,
         SourceControlTestPanel, TerminalTestPanel, init_test, open_workspace,
@@ -567,7 +517,7 @@ mod tests {
             let status_bar = workspace.status_bar().read(cx);
             assert!(status_bar.item_of_type::<PanelButtons>().is_none());
             assert_eq!(
-                status_bar.position_of_item::<HiddenPanelButtons>(),
+                status_bar.position_of_item::<StatusItemPlaceholder<PanelButtons>>(),
                 initial_buttons_position
             );
             assert_eq!(
@@ -580,7 +530,11 @@ mod tests {
         assert!(installed_activity_bar(&workspace, cx).is_none());
         workspace.read_with(cx, |workspace, cx| {
             let status_bar = workspace.status_bar().read(cx);
-            assert!(status_bar.item_of_type::<HiddenPanelButtons>().is_none());
+            assert!(
+                status_bar
+                    .item_of_type::<StatusItemPlaceholder<PanelButtons>>()
+                    .is_none()
+            );
             assert_eq!(
                 status_bar.position_of_item::<PanelButtons>(),
                 initial_buttons_position
