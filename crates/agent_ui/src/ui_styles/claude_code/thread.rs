@@ -10,12 +10,14 @@ mod claude_code_prompt_box;
 
 use super::*;
 use crate::ui_styles::claude_code::{
-    ClaudeCodeSpinnerElement, StepStatus, TIMELINE_GUTTER, TimelineDot, ToolRow, edit_line_stats,
-    format_timestamp, summarize_tool_call, thought_label, thread_activity, timeline_row,
-    tool_output_text, ui_font_text_style,
+    ClaudeCodeSpinnerElement, StepStatus, TIMELINE_GUTTER, TimelineDot, ToolOutputTab, ToolRow,
+    edit_line_stats, format_timestamp, is_long_tool_text, remove_output_tab, set_output_tab,
+    summarize_tool_call, thought_has_summary, thought_label, thread_activity, timeline_row,
+    toggle_thoughts_expanded, tool_output_text, tool_output_title, ui_font_text_style,
 };
 use claude_code_permission_card::claude_code_card_handles;
 use editor::{EditorElement, EditorStyle};
+use workspace::SplitDirection;
 
 impl ThreadView {
     pub(super) fn render_claude_code_entries(&mut self, cx: &mut Context<Self>) -> List {
@@ -420,20 +422,20 @@ impl ThreadView {
                         .into_any_element()
                     })
                 }
+                // A thought without text still shows its label, as Claude Code
+                // shows "Thought for Ns" when thinking summaries are off.
                 AssistantMessageChunk::Thought { block, .. } => {
-                    block.visible_content(cx).then(|| {
-                        let is_streaming = is_streaming_entry && Some(chunk_ix) == last_chunk_ix;
-                        let duration = activity
-                            .and_then(|activity| activity.thought_duration(entry_ix, chunk_ix));
-                        self.render_claude_code_thought(
-                            entry_ix,
-                            chunk_ix,
-                            block,
-                            thought_label(duration, is_streaming),
-                            window,
-                            cx,
-                        )
-                    })
+                    let is_streaming = is_streaming_entry && Some(chunk_ix) == last_chunk_ix;
+                    let duration =
+                        activity.and_then(|activity| activity.thought_duration(entry_ix, chunk_ix));
+                    Some(self.render_claude_code_thought(
+                        entry_ix,
+                        chunk_ix,
+                        block,
+                        thought_label(duration, is_streaming),
+                        window,
+                        cx,
+                    ))
                 }
             })
             .collect::<Vec<_>>();
@@ -452,6 +454,10 @@ impl ThreadView {
         )
     }
 
+    /// "Thought for Ns", with a chevron only when the thought has summary
+    /// text. Clicking one opens or closes every summary in the conversation,
+    /// as in Claude Code, shown in muted text beside a guide line that drops
+    /// from the step's dot.
     fn render_claude_code_thought(
         &self,
         entry_ix: usize,
@@ -461,50 +467,67 @@ impl ThreadView {
         window: &Window,
         cx: &Context<Self>,
     ) -> AnyElement {
-        let key = (entry_ix, chunk_ix);
-        let entry_view_state = self.entry_view_state.read(cx);
-        let (is_open, is_constrained) = entry_view_state.thinking_block_state(key, cx);
-        let scroll_handle = entry_view_state
-            .entry(entry_ix)
-            .and_then(|entry| entry.scroll_handle_for_assistant_message_chunk(chunk_ix));
-        if entry_view_state.is_auto_expanded_thinking_block(key)
-            && let Some(scroll_handle) = scroll_handle.as_ref()
-        {
-            scroll_handle.scroll_to_bottom();
-        }
+        let has_summary = thought_has_summary(block);
+        let is_open = has_summary
+            && thread_activity(cx.entity_id(), cx)
+                .is_some_and(|activity| activity.thoughts_expanded());
+
+        let header = h_flex()
+            .gap_1()
+            .child(Label::new(label).color(Color::Muted))
+            .when(has_summary, |this| {
+                this.child(
+                    Icon::new(if is_open {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    })
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+                )
+            });
 
         v_flex()
             .id(("claude-code-thought", chunk_ix))
             .w_full()
-            .gap_1()
             .child(
                 div()
                     .id(("claude-code-thought-header", chunk_ix))
                     .debug_selector(move || format!("claude-code-thought-{entry_ix}-{chunk_ix}"))
-                    .cursor_pointer()
                     .child(timeline_row(
                         TimelineDot::new(("claude-code-thought-dot", chunk_ix), StepStatus::Muted),
-                        Label::new(label).color(Color::Muted),
+                        header,
                         window,
                     ))
-                    .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
-                        this.toggle_thinking_block_expansion(key, window, cx);
-                    })),
+                    .when(has_summary, |this| {
+                        this.cursor_pointer().on_click(cx.listener(
+                            move |this, _event: &ClickEvent, window, cx| {
+                                toggle_thoughts_expanded(cx.entity_id(), cx);
+                                this.refresh_thread_search(window, cx);
+                                cx.notify();
+                            },
+                        ))
+                    }),
             )
             .when(is_open, |this| {
+                let mut style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
+                style.base_text_style.color = Color::Muted.color(cx);
+                let guide_offset = (TIMELINE_GUTTER - px(1.)) / 2.;
                 this.child(
-                    div().pl(TIMELINE_GUTTER).child(
-                        div()
-                            .id(("claude-code-thought-content", chunk_ix))
-                            .when(is_constrained, |this| this.max_h_64())
-                            .when_some(scroll_handle, |this, scroll_handle| {
-                                this.track_scroll(&scroll_handle)
-                            })
-                            .overflow_hidden()
-                            .child(
-                                self.render_message_content(entry_ix, chunk_ix, block, window, cx),
-                            ),
-                    ),
+                    v_flex()
+                        .id(("claude-code-thought-summary", chunk_ix))
+                        .debug_selector(move || {
+                            format!("claude-code-thought-summary-{entry_ix}-{chunk_ix}")
+                        })
+                        .ml(guide_offset)
+                        .pl(guide_offset)
+                        .py_1()
+                        .gap_2()
+                        .border_l_1()
+                        .border_color(cx.theme().colors().border_variant)
+                        .children(block.markdowns().map(|markdown| {
+                            self.render_markdown(markdown.clone(), style.clone(), cx)
+                        })),
                 )
             })
             .into_any_element()
@@ -636,15 +659,20 @@ impl ThreadView {
                 }
             }
         } else {
+            let output = tool_output_text(tool_call, summary.description.as_deref(), cx);
+            let output_is_long = output.as_deref().is_some_and(is_long_tool_text);
             row = row
                 .input(summary.input)
-                .output(tool_output_text(
-                    tool_call,
-                    summary.description.as_deref(),
-                    cx,
-                ))
-                .output_expanded(is_expanded)
-                .on_toggle_output(toggle_expansion());
+                .copy_input(matches!(tool_call.kind(), acp_v2::ToolKind::Execute))
+                .output(output);
+            if output_is_long {
+                let tool_call_id = tool_call.id.clone();
+                row = row.on_open_output(cx.listener(
+                    move |this, _event: &ClickEvent, window, cx| {
+                        this.open_claude_code_tool_output(tool_call_id.clone(), window, cx);
+                    },
+                ));
+            }
 
             let images = tool_call
                 .content()
@@ -711,6 +739,184 @@ impl ThreadView {
             .py_1()
             .text_ui(cx)
             .child(row)
+    }
+
+    /// Claude Code opens a long tool output in a read-only editor tab, which
+    /// lands beside the conversation because the conversation's editor group
+    /// is locked. Here the tab also follows the output while the tool call
+    /// streams, and clicking OUT again focuses it while it is open.
+    fn open_claude_code_tool_output(
+        &mut self,
+        tool_call_id: acp_v2::ToolCallId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let thread_view_id = cx.entity_id();
+        if let Some((editor, _)) = thread_activity(thread_view_id, cx)
+            .and_then(|activity| activity.output_tab(&tool_call_id))
+        {
+            let activated = workspace.update(cx, |workspace, cx| {
+                workspace.activate_item(&editor, true, true, window, cx)
+            });
+            if activated {
+                return;
+            }
+        }
+        let Some(project) = self.project.upgrade() else {
+            return;
+        };
+        let Some((title, output)) =
+            self.thread
+                .read(cx)
+                .tool_call(&tool_call_id)
+                .map(|(_, tool_call)| {
+                    (
+                        tool_output_title(tool_call, cx),
+                        Self::full_tool_output(tool_call, cx),
+                    )
+                })
+        else {
+            return;
+        };
+        let create_buffer =
+            project.update(cx, |project, cx| project.create_buffer(None, false, cx));
+        cx.spawn_in(window, async move |this, cx| {
+            let buffer = create_buffer.await?;
+            this.update_in(cx, |this, window, cx| {
+                this.show_claude_code_tool_output(
+                    tool_call_id,
+                    title,
+                    output,
+                    buffer,
+                    project,
+                    workspace,
+                    window,
+                    cx,
+                );
+            })
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn show_claude_code_tool_output(
+        &mut self,
+        tool_call_id: acp_v2::ToolCallId,
+        title: SharedString,
+        output: String,
+        buffer: Entity<language::Buffer>,
+        project: Entity<Project>,
+        workspace: Entity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        buffer.update(cx, |buffer, cx| {
+            buffer.set_text(output, cx);
+            buffer.set_capability(language::Capability::ReadOnly, cx);
+        });
+        let multibuffer =
+            cx.new(|cx| MultiBuffer::singleton(buffer.clone(), cx).with_title(title.to_string()));
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::for_multibuffer(multibuffer, Some(project), window, cx);
+            editor.set_read_only(true);
+            editor.set_breadcrumb_header(title.to_string());
+            editor.disable_mouse_wheel_zoom();
+            editor
+        });
+
+        let mut subscriptions = vec![cx.subscribe(&self.thread, {
+            let tool_call_id = tool_call_id.clone();
+            move |this, thread, event, cx| {
+                if let AcpThreadEvent::EntryUpdated(entry_ix) = event
+                    && let Some(AgentThreadEntry::ToolCall(tool_call)) =
+                        thread.read(cx).entries().get(*entry_ix)
+                    && tool_call.id == tool_call_id
+                {
+                    this.refresh_claude_code_tool_output(&tool_call_id, cx);
+                }
+            }
+        })];
+        // Display terminals (Bash over claude-agent-acp) grow without
+        // touching the thread entry.
+        let terminals = self
+            .thread
+            .read(cx)
+            .tool_call(&tool_call_id)
+            .map(|(_, tool_call)| tool_call.terminals().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for terminal in terminals {
+            let tool_call_id = tool_call_id.clone();
+            subscriptions.push(cx.observe(&terminal, move |this, _terminal, cx| {
+                this.refresh_claude_code_tool_output(&tool_call_id, cx);
+            }));
+        }
+        set_output_tab(
+            cx.entity_id(),
+            tool_call_id,
+            ToolOutputTab {
+                editor: editor.downgrade(),
+                buffer: buffer.downgrade(),
+                _subscriptions: subscriptions,
+            },
+            cx,
+        );
+
+        workspace.update(cx, |workspace, cx| {
+            let pane = match workspace.find_pane_in_direction(SplitDirection::Right, cx) {
+                Some(pane) => pane,
+                None => {
+                    let active_pane = workspace.active_pane().clone();
+                    workspace.split_pane(active_pane, SplitDirection::Right, window, cx)
+                }
+            };
+            workspace.add_item(pane, Box::new(editor), None, true, true, window, cx);
+        });
+    }
+
+    fn refresh_claude_code_tool_output(
+        &mut self,
+        tool_call_id: &acp_v2::ToolCallId,
+        cx: &mut Context<Self>,
+    ) {
+        let thread_view_id = cx.entity_id();
+        let Some((_, buffer)) = thread_activity(thread_view_id, cx)
+            .and_then(|activity| activity.output_tab(tool_call_id))
+        else {
+            remove_output_tab(thread_view_id, tool_call_id, cx);
+            return;
+        };
+        let Some(output) = self
+            .thread
+            .read(cx)
+            .tool_call(tool_call_id)
+            .map(|(_, tool_call)| Self::full_tool_output(tool_call, cx))
+        else {
+            return;
+        };
+        buffer.update(cx, |buffer, cx| {
+            let current = buffer.text();
+            if current == output {
+                return;
+            }
+            match output.strip_prefix(current.as_str()) {
+                Some(appended) => {
+                    buffer.append(appended.to_string(), cx);
+                }
+                None => {
+                    buffer.set_text(output, cx);
+                }
+            }
+        });
+    }
+
+    fn full_tool_output(tool_call: &ToolCall, cx: &App) -> String {
+        let label = tool_call.label.read(cx).source().to_string();
+        let summary = summarize_tool_call(tool_call, &label);
+        tool_output_text(tool_call, summary.description.as_deref(), cx)
+            .map(|output| output.to_string())
+            .unwrap_or_default()
     }
 
     /// Agents report absolute paths; Claude Code shows them relative to the workspace.
@@ -1025,6 +1231,148 @@ mod tests {
             assert!(activity.user_message_sent_at(0).is_some());
             assert!(activity.thought_duration(1, 0).is_some());
         });
+    }
+
+    #[gpui::test]
+    async fn test_claude_code_thought_rows(cx: &mut TestAppContext) {
+        let thought = |text: &str| {
+            acp_v1::SessionUpdate::AgentThoughtChunk(acp_v1::ContentChunk::new(text.into()))
+        };
+        let message = |text: &str| {
+            acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(text.into()))
+        };
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![
+            thought("Weighing what the user means."),
+            message("Happy to."),
+            thought(""),
+            message("Done."),
+            thought("A second summary."),
+        ]);
+        let (thread_view, cx) = setup_thread_view(connection, cx).await;
+        set_ui_style("claude_code", cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        thread
+            .update(cx, |thread, cx| thread.send_raw("think", cx))
+            .await
+            .expect("prompt should succeed");
+        cx.run_until_parked();
+
+        let summaries_shown = |cx: &mut VisualTestContext| {
+            [
+                cx.debug_bounds("claude-code-thought-summary-1-0").is_some(),
+                cx.debug_bounds("claude-code-thought-summary-1-2").is_some(),
+                cx.debug_bounds("claude-code-thought-summary-1-4").is_some(),
+            ]
+        };
+        let click = |selector: &'static str, cx: &mut VisualTestContext| {
+            let bounds = cx.debug_bounds(selector).expect("thought header");
+            cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+            cx.run_until_parked();
+        };
+
+        assert_eq!(summaries_shown(cx), [false; 3], "summaries start closed");
+        click("claude-code-thought-1-2", cx);
+        assert_eq!(
+            summaries_shown(cx),
+            [false; 3],
+            "a thought without text doesn't open"
+        );
+        click("claude-code-thought-1-0", cx);
+        assert_eq!(
+            summaries_shown(cx),
+            [true, false, true],
+            "one click opens every summary"
+        );
+        click("claude-code-thought-1-4", cx);
+        assert_eq!(summaries_shown(cx), [false; 3]);
+    }
+
+    #[gpui::test]
+    async fn test_claude_code_tool_output_tab(cx: &mut TestAppContext) {
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![acp_v1::SessionUpdate::ToolCall(bash_tool_call())]);
+        let (thread_view, cx) = setup_thread_view(connection.clone(), cx).await;
+        set_ui_style("claude_code", cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Run a command", cx))
+            .await
+            .expect("prompt should succeed");
+        cx.run_until_parked();
+        let workspace = thread_view
+            .read_with(cx, |view, _| view.workspace.upgrade())
+            .expect("workspace");
+
+        let click_output = |cx: &mut VisualTestContext| {
+            let bounds = cx
+                .debug_bounds("claude-code-tool-1-output")
+                .expect("OUT row");
+            cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+            cx.run_until_parked();
+        };
+        let output_editors = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, cx| {
+                workspace
+                    .panes()
+                    .iter()
+                    .flat_map(|pane| pane.read(cx).items().collect::<Vec<_>>())
+                    .filter_map(|item| item.downcast::<Editor>())
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        click_output(cx);
+        let editors = output_editors(cx);
+        assert_eq!(editors.len(), 1);
+        let editor = editors[0].clone();
+        assert_eq!(
+            workspace.read_with(cx, |workspace, _| workspace.panes().len()),
+            2
+        );
+        editor.read_with(cx, |editor, cx| {
+            assert_eq!(editor.text(cx), "origin\nagent_ui\ngpui\nzed");
+            assert!(editor.read_only(cx));
+            assert_eq!(editor.buffer().read(cx).title(cx), "Bash tool output");
+        });
+
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+        cx.update(|_window, cx| {
+            connection.send_update(
+                session_id,
+                acp_v1::SessionUpdate::ToolCallUpdate(acp_v1::ToolCallUpdate::new(
+                    "bash-1",
+                    acp_v1::ToolCallUpdateFields::new().content(vec![
+                        "```console\norigin\nagent_ui\ngpui\nzed\nworkspace\n```".into(),
+                    ]),
+                )),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            editor.read_with(cx, |editor, cx| editor.text(cx)),
+            "origin\nagent_ui\ngpui\nzed\nworkspace",
+            "the tab follows the output"
+        );
+
+        thread_view.update_in(cx, |view, window, cx| {
+            let editor_focus = view.message_editor.focus_handle(cx);
+            window.focus(&editor_focus, cx);
+        });
+        cx.run_until_parked();
+        click_output(cx);
+        let editors = output_editors(cx);
+        assert_eq!(editors.len(), 1, "clicking again reuses the open tab");
+        assert_eq!(editors[0].entity_id(), editor.entity_id());
+        assert_eq!(
+            workspace.read_with(cx, |workspace, _| workspace.panes().len()),
+            2
+        );
+        let active_item_id = workspace.read_with(cx, |workspace, cx| {
+            workspace.active_item(cx).map(|item| item.item_id())
+        });
+        assert_eq!(active_item_id, Some(editor.entity_id()));
     }
 
     #[gpui::test]
