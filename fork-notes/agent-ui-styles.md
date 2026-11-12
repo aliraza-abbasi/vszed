@@ -28,6 +28,9 @@ upstream files. Use this list when resolving rebase conflicts and when folding i
 | `crates/agent_servers/src/acp/v1.rs` (`claude_session_meta`, imports) | adds those options as `_meta.claudeCode.options` next to `emitRawSDKMessages` | 10 changed |
 | `crates/agent_servers/src/acp/v2.rs` (`claude_session_meta` ~196, resume request ~1068, `new_session` ~1352, imports) | `_meta.claudeCode.options` on `session/new` and `session/resume` of `claude-acp` sessions; claude-agent-acp merges `extraArgs` into the SDK's, so Claude Code gets `--thinking-display summarized` as from the extension | +21 |
 | `crates/agent_servers/src/acp/v1.rs` (test `v2_terminal_sdk_snapshots_chunks_and_metadata`, ~4852) | test expectation follows the line-ending fix above: the snapshot's last chunk `"\nZ"` now reads `"new\n¢\nZ"` instead of `"new\n¢\n Z"`. Own commit (`test(agent_servers): expect normalized line endings in the display terminal snapshot`); goes with the terminal fix if that is upstreamed | 2 changed, +1 comment |
+| `crates/feature_flags/src/flags.rs` (`AcpBetaFeatureFlag`) | `enabled_for_all` returns `true` unless `feature_flags` is built with `test-support`, so vszed release builds (non-staff users, where overrides are ignored) get ACP v2 negotiation, draft `session/options`, the v1 subagent capability and prompt-response token usage like the debug builds the Claude Code style was tested in. `enabled_for_all` beats settings overrides, so test builds keep upstream's resolution (debug builds count as staff) and tests can still turn the beta off. Own commit (`feat(feature_flags): enable the ACP beta in all builds`); vszed-only, not an upstream candidate | +5 |
+| `crates/feature_flags/Cargo.toml` | an empty `test-support` feature for the above | +3 |
+| `crates/agent_servers/Cargo.toml` (`[dev-dependencies]`) | `feature_flags` with `test-support`, because its tests (`set_acp_beta(false)`: v1 fallback, v1 subagent capability, initial config options) run with the beta off | +1 |
 
 Notes:
 - The resolved settings are `ui_styles::AgentUiStyleSettings` (a separate `RegisterSetting`),
@@ -53,7 +56,14 @@ Notes:
 - Preset: `ui_styles/preset.rs` registers `agent::UseClaudeCodeStyle` and
   `agent::RestorePreviousUiStyle` on every workspace. The user's previous `agent.ui_style` and
   `agent.thread_location` are kept in the KV store under `agent_ui_style_previous_settings`
-  until restored.
+  until restored. The preset also sets `agent_servers.claude-acp.env.CLAUDE_CODE_ENTRYPOINT`
+  to `cli` (creating a `registry` entry when there is none, keeping other keys and any value
+  the user set): the Claude Agent SDK labels claude-agent-acp's sessions `sdk-ts` when the
+  variable is unset, and the extension's session list and `claude --resume` hide SDK sessions.
+  The snapshot records the previous value (`claude_code_entrypoint`) and whether the entry
+  existed; restoring removes the variable only when it was unset and still reads `cli`, then
+  an entry the preset created if nothing else is left in it. Snapshots taken before this read
+  as "unset".
 - Per-thread timeline state (user message send times, thought durations) is kept in a
   `ClaudeCodeActivity` global keyed by `ThreadView` entity id, populated through
   `cx.observe_new::<ThreadView>` in `ui_styles::claude_code::init`. On fold-in this becomes a
@@ -102,6 +112,19 @@ Notes:
 - Prompt footer: `+` is the extension's menu (`render_claude_code_add_menu` in `prompt_box.rs`) on Zed's `add_context_menu_handle`. "Upload from computer" hands the picked paths to `MessageEditor::paste_item` as `ClipboardEntry::ExternalPaths`, the paste path for files. "Add context" types `@` at the end (after a space when needed) and opens completions: Zed's mention menu only opens for an `@` that starts a word, which is why Zed's own "Files & Directories" entry left a dead "@file" when the cursor touched a word (48.png). The context ring (`ContextRing` in `claude_code.rs`) follows `/`.
 - File tool rows: `render_claude_code_file_tool_row` (`thread.rs`) draws Claude Code's Read, Edit, Write and Skill rows from the tool call's `raw_input`, which claude-agent-acp sends to every client but JetBrains AIR. Edit diffs are `ui_styles/claude_code/edit_diff.rs`, another `#[path]` child of `thread.rs` (it uses `thread_view`'s `highlight_code_runs`). Their layout (`DiffLayout` in `ThreadActivity`) comes from the width measured while painting; overflow is measured per tool call like long user messages. A file's language is loaded through the project's registry when missing, and the view re-renders once.
 - Mention chips: `ui_styles/claude_code/mention_chip.rs`, declared from `ui/mention_crease.rs`, so the chip can read `MentionCrease`'s private fields and call its `open_mention_uri`. It applies to every mention crease while the style is on (the inline assistant's too).
+- Question card (AskUserQuestion): `ui_styles/claude_code/questions.rs` (model: the adapter's
+  form schema, answers, the CLI's result texts, card state) and `question_card.rs` (a
+  `#[path]` child of `thread.rs`, so no hook line). It finds the pending AskUserQuestion
+  elicitation through `Conversation::elicitation_requests` (this thread's session first, then
+  its subagents'), which `thread_view`'s descendants can read without widening visibility, and
+  answers it through `ThreadView::respond_to_elicitation` (own session) or
+  `Conversation::respond_to_elicitation` (a subagent's), Zed's own answer path. It takes the
+  prompt box's place after the permission card and shares its focus handle. Esc and × answer
+  `cancel` and then run `ThreadView::cancel_generation`, because the extension's card denies
+  with `interrupt`. `render_claude_code_entries` hides Zed's inline form only for elicitations
+  the card asks; other forms (MCP servers, the refusal fallback, URLs) keep Zed's form. Card
+  state, what the user answered or declined (`question_outcomes`, by tool call id) and
+  collapsed rows live in `ThreadActivity`.
 - Status bar item: `ClaudeCodeStatusItem` (`claude_code.rs`), added to and removed from every
   workspace's status bar by a settings observer, like the sessions panel. Clicking it runs
   `thread_item::focus_or_open_thread_tab`.
