@@ -17,6 +17,7 @@ upstream files. Use this list when resolving rebase conflicts and when folding i
 | `crates/agent_ui/src/config_options.rs` (~33, ~1016) | `pub(crate)` on `ConfigOptionsView::{config_options, agent_server, fs}` and `set_config_option_and_default`, so the model and mode chips can read and set the adapter's options | 4 changed |
 | `crates/agent_ui/src/agent_panel.rs` (imports, `NewThread` handler ~366, `open_thread` ~1680, `new_thread` ~1770, `load_agent_thread` ~4530) | route thread opens to editor tabs when `agent.thread_location` is `editor` (`ui_styles::thread_item::route_to_thread_tab`); `load_agent_thread` only routes user-initiated opens (`focus`), so the panel's startup restore stays in the panel | +20 |
 | `assets/keymaps/default-{macos,linux,windows}.json` (end) | `Workspace` block: `cmd-escape` / `ctrl-escape` → `agent::ToggleThreadTabFocus`, `cmd-shift-escape` / `ctrl-shift-escape` → `agent::NewThreadTab`. Both actions call `cx.propagate()` unless thread tabs or the Claude Code style are on, so the stock `menu::Cancel` binding still gets the keystroke | +10 each |
+| `crates/acp_thread/src/acp_thread.rs` (`usage_meta` field, `update_usage` ~6299, `usage_meta()` getter ~4989) | generic hook, no Claude parsing: keeps the latest value of each `_meta` key from `usage_update` (ACP v1 and v2), merged per key because claude-agent-acp sends `_claude/rateLimit` only when it changes but `_claude/model` on every update. Read by the Account & usage section. Own commit (`feat(acp_thread): keep the latest usage update _meta on the thread`); upstream candidate | +15 (+58 test) |
 | `crates/acp_thread/src/terminal.rs` (display terminals) | bug fix, not a style hook: agent display terminal output with bare LF line endings (claude-agent-acp over ACP v2) gets CRLF before it reaches the emulator, so lines no longer "staircase". Upstream candidate on its own | +45 |
 
 Notes:
@@ -58,3 +59,9 @@ Notes:
   workspace by a settings observer, so stock Zed never sees it. Rename and archive create a Zed
   `ThreadMetadataStore` row for the session when there is none yet (the same row opening the
   session would create), so those sessions then also appear in Zed's own thread history.
+- Account & usage: `ui_styles/claude_code/usage.rs`, drawn at the top of the sessions panel
+  (the panel's sections are ACCOUNT & USAGE and SESSION MANAGER). `usage::init` observes every
+  `ThreadView`, reads `AcpThread::usage_meta()["_claude/rateLimit"]` on `TokenUsageUpdated`, and
+  keeps one reading per limit type per open thread view in a `ClaudeUsageStore` global (dropped
+  when the view is released). The panel shows the newest reading of each type across its
+  project's thread views. Nothing reads `~/.claude.json`, credentials or the Keychain.
