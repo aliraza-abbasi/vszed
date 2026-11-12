@@ -284,13 +284,10 @@ impl Render for ClaudeCodeModelPicker {
                 .rounded_sm()
                 .cursor_pointer()
                 .when_some(background, |this, background| this.bg(background))
-                .on_mouse_move(cx.listener({
-                    let item = item.clone();
-                    move |this, _, _, cx| {
-                        if this.highlighted.as_ref() != Some(&item) {
-                            this.highlighted = Some(item.clone());
-                            cx.notify();
-                        }
+                .on_mouse_move(cx.listener(move |this, _, _, cx| {
+                    if this.highlighted.as_ref() != Some(&item) {
+                        this.highlighted = Some(item.clone());
+                        cx.notify();
                     }
                 }))
                 .on_click(cx.listener(move |this, _, _, cx| {
