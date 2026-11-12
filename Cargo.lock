@@ -19752,7 +19752,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "auto_update",
+ "call",
  "client",
+ "command_palette_hooks",
  "db",
  "extension_host",
  "fs",
@@ -19767,6 +19769,7 @@ dependencies = [
  "strum 0.28.0",
  "theme",
  "theme_settings",
+ "title_bar",
  "ui",
  "util",
  "workspace",

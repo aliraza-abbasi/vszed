@@ -4,6 +4,8 @@ use settings::{RegisterSetting, Settings, SettingsContent};
 pub struct WorkbenchSettings {
     pub activity_bar: ActivityBarSettings,
     pub dock_headers: bool,
+    pub command_center: bool,
+    pub layout_controls: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -26,6 +28,12 @@ impl Settings for WorkbenchSettings {
             },
             dock_headers: workbench
                 .and_then(|workbench| workbench.dock_headers)
+                .unwrap_or_default(),
+            command_center: workbench
+                .and_then(|workbench| workbench.command_center)
+                .unwrap_or_default(),
+            layout_controls: workbench
+                .and_then(|workbench| workbench.layout_controls)
                 .unwrap_or_default(),
         }
     }
