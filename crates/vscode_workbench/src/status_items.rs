@@ -20,7 +20,9 @@ use workspace::{
 
 use crate::{
     Codicon, WorkbenchSettings,
-    editor_status::{CursorPositionItem, IndentationItem, LanguageStatusItem},
+    editor_status::{
+        CurrentLineBlameItem, CursorPositionItem, IndentationItem, LanguageStatusItem,
+    },
 };
 
 const MAX_BRANCH_NAME_LENGTH: usize = 40;
@@ -103,9 +105,9 @@ fn apply_status_bar_items(
             }
         });
         // Right side items are drawn in reverse order, so an item inserted after
-        // another one shows up to its left. This gives VS Code's order: blame,
-        // cursor position, indentation, encoding, line ending, language status,
-        // language.
+        // another one shows up to its left. This gives VS Code's order (with
+        // GitLens): blame, cursor position, indentation, encoding, line ending,
+        // language status, language.
         move_status_item_after::<ActiveBufferEncoding, LineEndingIndicator>(workspace, window, cx);
         move_status_item_after::<ActiveBufferLanguage, ActiveToolchain>(workspace, window, cx);
         let language_status = cx.new(|cx| LanguageStatusItem::new(workspace, cx));
@@ -115,7 +117,16 @@ fn apply_status_bar_items(
         hide_status_items::<CursorPosition>(workspace, window, cx);
         let cursor_position = cx.new(|_| CursorPositionItem::new());
         insert_status_item_after::<IndentationItem, _>(workspace, cursor_position, window, cx);
-        move_status_item_after::<GitBlameStatus, CursorPositionItem>(workspace, window, cx);
+        // Zed's blame item only has text while inline blame is moved to the status
+        // bar, and would repeat the current line blame then.
+        hide_status_items::<GitBlameStatus>(workspace, window, cx);
+        let current_line_blame = cx.new(|_| CurrentLineBlameItem::new());
+        insert_status_item_after::<CursorPositionItem, _>(
+            workspace,
+            current_line_blame,
+            window,
+            cx,
+        );
         workspace.status_bar().update(cx, |status_bar, cx| {
             status_bar.add_rightmost_item(notification_bell, window, cx);
             // VS Code starts the status bar with the remote indicator. The threads
@@ -133,7 +144,8 @@ fn apply_status_bar_items(
         remove_status_items::<CursorPositionItem>(workspace, cx);
         remove_status_items::<IndentationItem>(workspace, cx);
         remove_status_items::<LanguageStatusItem>(workspace, cx);
-        return_moved_status_item::<GitBlameStatus>(workspace, window, cx);
+        remove_status_items::<CurrentLineBlameItem>(workspace, cx);
+        restore_status_items::<GitBlameStatus>(workspace, window, cx);
         restore_status_items::<CursorPosition>(workspace, window, cx);
         return_moved_status_item::<ActiveBufferLanguage>(workspace, window, cx);
         return_moved_status_item::<ActiveBufferEncoding>(workspace, window, cx);
@@ -672,6 +684,7 @@ mod tests {
         hidden_diagnostics: Option<usize>,
         git_blame: Option<usize>,
         hidden_git_blame: Option<usize>,
+        current_line_blame: Option<usize>,
         other_item: Option<usize>,
         notification_bell: Option<usize>,
         encoding: Option<usize>,
@@ -701,6 +714,7 @@ mod tests {
                 git_blame: status_bar.position_of_item::<GitBlameStatus>(),
                 hidden_git_blame: status_bar
                     .position_of_item::<StatusItemPlaceholder<GitBlameStatus>>(),
+                current_line_blame: status_bar.position_of_item::<CurrentLineBlameItem>(),
                 other_item: status_bar.position_of_item::<OtherStatusItem>(),
                 notification_bell: status_bar.position_of_item::<NotificationBell>(),
                 encoding: status_bar.position_of_item::<ActiveBufferEncoding>(),
@@ -754,6 +768,7 @@ mod tests {
                 hidden_diagnostics: None,
                 git_blame: Some(2),
                 hidden_git_blame: None,
+                current_line_blame: None,
                 other_item: Some(3),
                 notification_bell: None,
                 encoding: Some(6),
@@ -779,8 +794,9 @@ mod tests {
                 problems: Some(3),
                 diagnostics: None,
                 hidden_diagnostics: Some(4),
-                git_blame: Some(19),
+                git_blame: None,
                 hidden_git_blame: Some(5),
+                current_line_blame: Some(19),
                 other_item: Some(6),
                 // The first right side item, so it is drawn last, after the right
                 // and bottom dock buttons (8 and 9).
