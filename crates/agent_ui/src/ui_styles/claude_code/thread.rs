@@ -3223,13 +3223,39 @@ mod tests {
             "1 SQLite",
             "keys typed into the field stay there"
         );
-        // Enter leaves the field of the last question; Enter again submits.
-        cx.simulate_keystrokes("enter");
+
+        // The editor bindings the default keymap gives an auto-height editor.
+        cx.update(|_window, cx| {
+            cx.bind_keys([
+                KeyBinding::new(
+                    "shift-enter",
+                    editor::actions::Newline,
+                    Some("Editor && mode == auto_height"),
+                ),
+                KeyBinding::new("escape", editor::actions::Cancel, Some("Editor")),
+                KeyBinding::new("tab", editor::actions::Tab, Some("Editor")),
+            ]);
+        });
+        // Shift+Enter adds a line; Enter and Escape on the last question
+        // leave the field as it is, like the extension's textarea.
+        cx.simulate_keystrokes("shift-enter");
+        cx.simulate_input("in memory");
+        cx.simulate_keystrokes("enter escape");
+        assert_eq!(
+            other_editor.read_with(cx, |editor, cx| editor.text(cx)),
+            "1 SQLite\nin memory",
+        );
+        let other_focused =
+            cx.update(|window, cx| other_editor.focus_handle(cx).is_focused(window));
+        assert!(other_focused, "Enter and Escape keep focus in the field");
+
+        // Tab moves focus out of the field; Enter then submits.
+        cx.simulate_keystrokes("tab");
         assert!(permission_card_is_focused(&thread_view, cx));
         cx.simulate_keystrokes("enter");
         assert_eq!(
             accepted_content(response.await),
-            json!({ "question_0_custom": "1 SQLite" })
+            json!({ "question_0_custom": "1 SQLite\nin memory" })
         );
         cx.run_until_parked();
 

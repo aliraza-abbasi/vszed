@@ -1044,7 +1044,7 @@ mod tests {
             },
         ];
         let content = response_content(
-            &[single.clone(), multi.clone()],
+            &[single.clone(), multi],
             &fields,
             &[vec![2], vec![2, 0, 3]],
             &["SQLite".into(), String::new()],
