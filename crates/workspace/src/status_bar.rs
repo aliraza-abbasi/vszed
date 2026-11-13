@@ -102,6 +102,7 @@ pub struct StatusBar {
     right_items: Vec<Box<dyn StatusItemViewHandle>>,
     active_pane: Entity<Pane>,
     multi_workspace: Option<WeakEntity<MultiWorkspace>>,
+    show_sidebar_toggle: bool,
     focus_handle: FocusHandle,
     _observe_active_pane: Subscription,
 }
@@ -114,7 +115,8 @@ impl Focusable for StatusBar {
 
 impl Render for StatusBar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let sidebar = SidebarStatus::query(&self.multi_workspace, cx);
+        let mut sidebar = SidebarStatus::query(&self.multi_workspace, cx);
+        sidebar.show_toggle &= self.show_sidebar_toggle;
 
         h_flex()
             .id("status-bar")
@@ -335,6 +337,7 @@ impl StatusBar {
             right_items: Default::default(),
             active_pane: active_pane.clone(),
             multi_workspace,
+            show_sidebar_toggle: true,
             focus_handle: cx.focus_handle(),
             _observe_active_pane: cx.observe_in(active_pane, window, |this, _, window, cx| {
                 this.update_active_pane_item(window, cx)
@@ -351,6 +354,16 @@ impl StatusBar {
     ) {
         self.multi_workspace = Some(multi_workspace);
         cx.notify();
+    }
+
+    /// Whether to draw the threads sidebar toggle while the sidebar is closed.
+    pub fn set_show_sidebar_toggle(&mut self, show: bool, cx: &mut Context<Self>) {
+        self.show_sidebar_toggle = show;
+        cx.notify();
+    }
+
+    pub fn show_sidebar_toggle(&self) -> bool {
+        self.show_sidebar_toggle
     }
 
     pub fn add_left_item<T>(&mut self, item: Entity<T>, window: &mut Window, cx: &mut Context<Self>)
@@ -430,6 +443,24 @@ impl StatusBar {
         item.set_active_pane_item(active_pane_item.as_deref(), window, cx);
 
         self.right_items.push(Box::new(item));
+        cx.notify();
+    }
+
+    /// Adds an item that is drawn at the far right of the status bar, right of
+    /// every existing item. [`Self::add_right_item`] draws new items left of the
+    /// existing right side items instead.
+    pub fn add_rightmost_item<T>(
+        &mut self,
+        item: Entity<T>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) where
+        T: 'static + StatusItemView,
+    {
+        let active_pane_item = self.active_pane.read(cx).active_item();
+        item.set_active_pane_item(active_pane_item.as_deref(), window, cx);
+
+        self.right_items.insert(0, Box::new(item));
         cx.notify();
     }
 

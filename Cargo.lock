@@ -19460,6 +19460,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
+name = "upstream_release_notifier"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "db",
+ "futures 0.3.34",
+ "gpui",
+ "http_client",
+ "log",
+ "project",
+ "release_channel",
+ "semver",
+ "serde",
+ "serde_json",
+ "settings",
+ "ui",
+ "util",
+ "workspace",
+]
+
+[[package]]
 name = "url"
 version = "2.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -19744,6 +19765,48 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b3666211944f2e6ba2c359bc9efc1891157e910b1b11c3900892ea9f18179d2"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "vscode_workbench"
+version = "0.1.0"
+dependencies = [
+ "agent_settings",
+ "anyhow",
+ "auto_update",
+ "call",
+ "client",
+ "command_palette_hooks",
+ "db",
+ "diagnostics",
+ "editor",
+ "encoding_selector",
+ "extension_host",
+ "fs",
+ "futures 0.3.34",
+ "git",
+ "git_ui",
+ "go_to_line",
+ "gpui",
+ "language",
+ "language_selector",
+ "line_ending_selector",
+ "log",
+ "paths",
+ "project",
+ "remote",
+ "serde",
+ "serde_json",
+ "settings",
+ "strum 0.28.0",
+ "theme",
+ "theme_settings",
+ "title_bar",
+ "toolchain_selector",
+ "ui",
+ "util",
+ "workspace",
+ "zed_actions",
 ]
 
 [[package]]
@@ -22652,12 +22715,14 @@ dependencies = [
  "tracing",
  "ui",
  "ui_prompt",
+ "upstream_release_notifier",
  "url",
  "urlencoding",
  "util",
  "uuid",
  "vim",
  "vim_mode_setting",
+ "vscode_workbench",
  "watch",
  "web_search",
  "web_search_providers",

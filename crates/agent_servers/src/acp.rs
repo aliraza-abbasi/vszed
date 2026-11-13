@@ -248,6 +248,63 @@ struct ClientContext {
     accepts_subagent_updates: bool,
 }
 
+/// A notification that an agent sent with one of its own `_`-prefixed extension methods,
+/// such as claude-agent-acp's `_claude/sdkMessage`, for UI that knows that agent.
+#[derive(Clone, Debug)]
+pub struct AgentExtNotification {
+    pub session_id: Option<acp_v2::SessionId>,
+    pub method: SharedString,
+    pub params: Arc<serde_json::Value>,
+}
+
+/// Rebroadcasts the extension notifications of every agent connection.
+pub struct AgentExtNotifications;
+
+impl gpui::EventEmitter<AgentExtNotification> for AgentExtNotifications {}
+
+struct GlobalAgentExtNotifications(Entity<AgentExtNotifications>);
+
+impl gpui::Global for GlobalAgentExtNotifications {}
+
+impl AgentExtNotifications {
+    pub fn global(cx: &mut App) -> Entity<Self> {
+        if let Some(global) = cx.try_global::<GlobalAgentExtNotifications>() {
+            return global.0.clone();
+        }
+        let notifications = cx.new(|_| Self);
+        cx.set_global(GlobalAgentExtNotifications(notifications.clone()));
+        notifications
+    }
+}
+
+/// The `_meta.claudeCode.options` claude-agent-acp passes on to the Claude Agent SDK
+/// for a new or resumed session. Claude Code ignores `showThinkingSummaries` in SDK
+/// sessions, and without summaries recent models stream empty thinking, which the
+/// adapter drops. Like the Claude Code extension, ask for summaries when the user's
+/// Claude Code settings turn them on.
+fn claude_session_options() -> Option<serde_json::Value> {
+    let config_dir = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| util::paths::home_dir().join(".claude"));
+    let settings = std::fs::read(config_dir.join("settings.json")).ok()?;
+    claude_session_options_for_settings(&settings)
+}
+
+/// The only Claude Code setting vszed reads. The settings file can also hold `env`
+/// values such as API keys, so nothing else is deserialized.
+#[derive(serde::Deserialize)]
+struct ClaudeCodeThinkingSettings {
+    #[serde(rename = "showThinkingSummaries")]
+    show_thinking_summaries: Option<bool>,
+}
+
+fn claude_session_options_for_settings(settings: &[u8]) -> Option<serde_json::Value> {
+    let settings = serde_json::from_slice::<ClaudeCodeThinkingSettings>(settings).ok()?;
+    settings
+        .show_thinking_summaries?
+        .then(|| serde_json::json!({ "extraArgs": { "thinking-display": "summarized" } }))
+}
+
 fn dispatch_queue_closed_error() -> agent_client_protocol::Error {
     agent_client_protocol::Error::internal_error().data("ACP foreground dispatch queue closed")
 }
@@ -1179,6 +1236,28 @@ fn set_acp_beta(enabled: bool, cx: &mut App) {
         });
     });
     assert_eq!(cx.has_flag::<AcpBetaFeatureFlag>(), enabled);
+}
+
+#[cfg(test)]
+mod claude_session_options_tests {
+    use super::*;
+
+    #[test]
+    fn claude_session_options_follow_show_thinking_summaries() {
+        assert_eq!(
+            claude_session_options_for_settings(br#"{"showThinkingSummaries": true}"#),
+            Some(serde_json::json!({ "extraArgs": { "thinking-display": "summarized" } }))
+        );
+        assert_eq!(
+            claude_session_options_for_settings(br#"{"showThinkingSummaries": false}"#),
+            None
+        );
+        assert_eq!(
+            claude_session_options_for_settings(br#"{"model": "opus"}"#),
+            None
+        );
+        assert_eq!(claude_session_options_for_settings(b"not json"), None);
+    }
 }
 
 #[cfg(all(test, unix))]

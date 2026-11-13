@@ -1,7 +1,8 @@
 use super::{
-    AcpDebugLog, AcpDebugMessage, AcpSession, ClientContext, ConfigOptions, FlattenAcpResult as _,
-    ForegroundWork, ReadOnlyConfigOptions, UnsupportedVersion, apply_subagent_update,
-    drain_foreground_queue, enqueue_notification, enqueue_request, first_class_terminal_auth_task,
+    AcpDebugLog, AcpDebugMessage, AcpSession, AgentExtNotification, AgentExtNotifications,
+    ClientContext, ConfigOptions, FlattenAcpResult as _, ForegroundWork, ReadOnlyConfigOptions,
+    UnsupportedVersion, apply_subagent_update, claude_session_options, drain_foreground_queue,
+    enqueue_notification, enqueue_request, first_class_terminal_auth_task,
     handle_v2_complete_elicitation, handle_v2_create_elicitation, map_acp_error,
     mcp_configurations_for_project, respond_err, respond_result, runtime, session_thread,
     terminal_auth_task_id, transport, with_v2_client_ingress, work_dirs_from_session_info,
@@ -47,7 +48,7 @@ use acp_thread::{AcpThread, LoadError, TerminalProviderEvent};
 use terminal::TerminalBuilder;
 use terminal::terminal_settings::{AlternateScroll, CursorShape};
 
-use crate::{CURSOR_ID, GEMINI_ID};
+use crate::{CLAUDE_AGENT_ID, CURSOR_ID, GEMINI_ID};
 
 pub const GEMINI_TERMINAL_AUTH_METHOD_ID: &str = "spawn-gemini-cli";
 const PARAMETERIZED_MODEL_PICKER_META_KEY: &str = "parameterizedModelPicker";
@@ -492,6 +493,67 @@ fn client_builder(
             on_notification!(handle_complete_elicitation),
             agent_client_protocol::on_receive_notification!(),
         )
+        .on_receive_notification(
+            {
+                let dispatch_sender = dispatch_sender.clone();
+                async move |message: agent_client_protocol::UntypedMessage,
+                            connection: ConnectionTo<Agent>| {
+                    if !message.method().starts_with('_') {
+                        return Ok(agent_client_protocol::Handled::No {
+                            message: (message, connection),
+                            retry: false,
+                        });
+                    }
+                    enqueue_notification(&dispatch_sender, message, handle_ext_notification);
+                    Ok(agent_client_protocol::Handled::Yes)
+                }
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
+}
+
+fn handle_ext_notification(
+    message: agent_client_protocol::UntypedMessage,
+    cx: &mut AsyncApp,
+    _ctx: &ClientContext,
+) {
+    let (method, params) = message.into_parts();
+    let notification = AgentExtNotification {
+        session_id: params
+            .get("sessionId")
+            .and_then(serde_json::Value::as_str)
+            .map(acp_v2::SessionId::new),
+        method: method.into(),
+        params: Arc::new(params),
+    };
+    cx.update(|cx| {
+        AgentExtNotifications::global(cx).update(cx, |_, cx| cx.emit(notification));
+    });
+}
+
+/// claude-agent-acp forwards these Claude Code SDK messages as `_claude/sdkMessage`
+/// notifications when a session asks for them in `_meta`: background task lifecycles and
+/// each turn's result, whose usage tells the prompt cache lifetime.
+fn claude_session_meta(agent_id: &AgentId) -> Option<acp::Meta> {
+    if agent_id.as_ref() != CLAUDE_AGENT_ID {
+        return None;
+    }
+    let filters = [
+        "task_started",
+        "task_progress",
+        "task_updated",
+        "task_notification",
+        "background_tasks_changed",
+    ]
+    .into_iter()
+    .map(|subtype| serde_json::json!({ "type": "system", "subtype": subtype }))
+    .chain([serde_json::json!({ "type": "result" })])
+    .collect::<Vec<_>>();
+    let mut claude_code = serde_json::json!({ "emitRawSDKMessages": filters });
+    if let Some(options) = claude_session_options() {
+        claude_code["options"] = options;
+    }
+    Some(acp::Meta::from_iter([("claudeCode".into(), claude_code)]))
 }
 
 /// `acp_beta` advertises the unstable subagents and plan operations RFDs, which Zed only
@@ -1345,11 +1407,14 @@ impl AgentConnection for AcpConnection {
         let name = self.id.0.clone();
         let mcp_servers = mcp_servers_for_project(&project, cx);
         let sends_initial_config_options = self.agent_supports_initial_config_options(cx);
+        let session_meta = claude_session_meta(&self.id);
 
         cx.spawn(async move |cx| {
             let (response_sender, response_received) = futures::channel::oneshot::channel();
             let (registered, registration_finished) = futures::channel::oneshot::channel();
-            let mut request = directories.into_new_session_request(mcp_servers);
+            let mut request = directories
+                .into_new_session_request(mcp_servers)
+                .meta(session_meta);
             if sends_initial_config_options {
                 // The default-application pass below still runs, so defaults the agent ignored
                 // here (for example, ones that depend on another option) get another chance.
@@ -1536,6 +1601,7 @@ impl AgentConnection for AcpConnection {
         }
 
         let mcp_servers = mcp_servers_for_project(&project, cx);
+        let session_meta = claude_session_meta(&self.id);
         self.open_or_create_session(
             session_id,
             project,
@@ -1546,7 +1612,9 @@ impl AgentConnection for AcpConnection {
                 Box::pin(async move {
                     let response = ordered_response(
                         &connection,
-                        directories.into_load_session_request(session_id.clone(), mcp_servers),
+                        directories
+                            .into_load_session_request(session_id.clone(), mcp_servers)
+                            .meta(session_meta),
                         applied,
                     )
                     .await?;
@@ -1580,6 +1648,7 @@ impl AgentConnection for AcpConnection {
         }
 
         let mcp_servers = mcp_servers_for_project(&project, cx);
+        let session_meta = claude_session_meta(&self.id);
         self.open_or_create_session(
             session_id,
             project,
@@ -1590,7 +1659,9 @@ impl AgentConnection for AcpConnection {
                 Box::pin(async move {
                     let response = ordered_response(
                         &connection,
-                        directories.into_resume_session_request(session_id.clone(), mcp_servers),
+                        directories
+                            .into_resume_session_request(session_id.clone(), mcp_servers)
+                            .meta(session_meta),
                         applied,
                     )
                     .await?;
@@ -4849,7 +4920,8 @@ mod tests {
         assert_eq!(harness.terminal("terminal-1", cx), terminal);
         terminal.read_with(cx, |terminal, cx| {
             assert_eq!(terminal.inner(), &renderer);
-            assert_eq!(renderer.read(cx).get_content().trim_end(), "new\n¢\n Z");
+            // Agent display terminals turn bare LF into CRLF, so "Z" starts its own line.
+            assert_eq!(renderer.read(cx).get_content().trim_end(), "new\n¢\nZ");
             let display = terminal.display_state().expect("display state");
             assert_eq!(display.command(), Some("wire command"));
             assert_eq!(display.meta, Some(v2_terminal_meta("terminal")));
@@ -4859,7 +4931,7 @@ mod tests {
                 .expect("omitted exit preserves completion");
             assert_eq!(output.ended_at, ended_at);
             assert_eq!(output.exit_status.meta, Some(v2_terminal_meta("exit")));
-            assert_eq!(output.content.trim_end(), "new\n¢\n Z");
+            assert_eq!(output.content.trim_end(), "new\n¢\nZ");
         });
         {
             let received = harness.received.lock().expect("receive mutex");
@@ -5757,6 +5829,20 @@ mod tests {
             .expect("expected client capabilities meta");
 
         assert!(!meta.contains_key(PARAMETERIZED_MODEL_PICKER_META_KEY));
+    }
+
+    #[test]
+    fn claude_sessions_request_task_and_result_sdk_messages() {
+        use serde_json::json;
+
+        assert!(claude_session_meta(&AgentId::new("codex-acp")).is_none());
+        let meta = claude_session_meta(&AgentId::new(CLAUDE_AGENT_ID)).expect("claude meta");
+        let filters = meta["claudeCode"]["emitRawSDKMessages"]
+            .as_array()
+            .expect("filter list");
+        assert!(filters.contains(&json!({"type": "system", "subtype": "task_started"})));
+        assert!(filters.contains(&json!({"type": "system", "subtype": "task_notification"})));
+        assert!(filters.contains(&json!({"type": "result"})));
     }
 
     #[test]

@@ -1,0 +1,3400 @@
+// This file is declared as a child module of `thread_view` (via a `#[path]`
+// attribute) rather than of `ui_styles::claude_code`, so that it can reuse
+// `ThreadView`'s private state and render helpers without widening their
+// visibility upstream.
+
+#[path = "edit_diff.rs"]
+mod claude_code_edit_diff;
+#[path = "permission_card.rs"]
+mod claude_code_permission_card;
+#[path = "prompt_box.rs"]
+mod claude_code_prompt_box;
+#[path = "question_card.rs"]
+mod claude_code_question_card;
+
+use super::*;
+use crate::ui_styles::claude_code::{
+    ASK_USER_QUESTION_TOOL, AgentSummary, ClaudeCodeSpinnerElement, FileLink, StatusDot,
+    StepStatus, TIMELINE_GUTTER, TimelineDot, ToolOutputTab, ToolRow, agent_summaries,
+    ask_user_question_form, attachment_name, display_file_name, edit_line_stats, edit_summary,
+    file_tool_input, format_day, format_timestamp, is_long_tool_text, read_range_suffix,
+    remove_output_tab, reported_claude_code_tool, sent_message_text, set_output_tab,
+    set_user_message_overflows, summarize_tool_call, thought_has_summary, thought_label,
+    thread_activity, timeline_row, toggle_thoughts_expanded, toggle_user_message_expanded,
+    tool_output_text, tool_output_title, transcript_markdown_style, ui_font_text_style,
+    write_summary,
+};
+use chrono::Local;
+use claude_code_permission_card::claude_code_card_handles;
+use gpui::{StyledText, canvas, point};
+use ui::{ContextMenuEntry, DocumentationSide};
+use util::paths::PathStyle;
+use workspace::SplitDirection;
+
+/// Claude Code clamps a sent message to 60px of text, fading the last 50px.
+const USER_MESSAGE_COLLAPSED_HEIGHT: Pixels = px(60.);
+const USER_MESSAGE_FADE_HEIGHT: Pixels = px(50.);
+const WAVE_LENGTH: f32 = 8.;
+const WAVE_AMPLITUDE: f32 = 2.;
+const MAX_WAVE_WIDTH: f32 = 8192.;
+
+/// One side of Claude Code's date line: a thin wave filling the space.
+fn wavy_line(cx: &App) -> AnyElement {
+    let color = cx.theme().colors().border;
+    canvas(
+        |_, _, _| {},
+        move |bounds, _, window, _| {
+            let width = f32::from(bounds.size.width);
+            // Layout can hand an unconstrained canvas an infinite width.
+            if !width.is_finite() || width <= 0. {
+                return;
+            }
+            let half_wave = WAVE_LENGTH / 2.;
+            let half_wave_count = (width.min(MAX_WAVE_WIDTH) / half_wave).ceil() as usize;
+            let middle = bounds.center().y;
+            let mut builder = gpui::PathBuilder::stroke(px(1.));
+            builder.move_to(point(bounds.left(), middle));
+            for index in 0..half_wave_count {
+                let start = index as f32 * half_wave;
+                let direction = if index % 2 == 0 { -1. } else { 1. };
+                builder.curve_to(
+                    point(bounds.left() + px(start + half_wave), middle),
+                    point(
+                        bounds.left() + px(start + half_wave / 2.),
+                        middle + px(direction * WAVE_AMPLITUDE * 2.),
+                    ),
+                );
+            }
+            match builder.build() {
+                Ok(path) => window.paint_path(path, color),
+                Err(error) => log::debug!("failed to build the date line: {error}"),
+            }
+        },
+    )
+    .flex_1()
+    .h(px(WAVE_AMPLITUDE * 4.))
+    .into_any_element()
+}
+
+impl ThreadView {
+    pub(super) fn render_claude_code_entries(&mut self, cx: &mut Context<Self>) -> List {
+        // Claude Code's transcript spans the whole editor width, so Zed's
+        // `max_content_width` doesn't apply.
+        let centered_container = move |content: AnyElement| {
+            h_flex()
+                .w_full()
+                .justify_center()
+                .child(div().w_full().child(content))
+        };
+
+        // The prompt box floats over the bottom of the transcript, so the last entry
+        // scrolls up clear of it.
+        let floating_prompt_height = thread_activity(cx.entity_id(), cx)
+            .map(|activity| activity.floating_prompt_height().get())
+            .unwrap_or_default();
+
+        list(
+            self.list_state.clone(),
+            cx.processor(move |this, index: usize, window, cx| {
+                let entries = this.thread.read(cx).entries();
+                if let Some(entry) = entries.get(index) {
+                    let rendered =
+                        this.render_claude_code_entry(index, entries.len(), entry, window, cx);
+                    centered_container(rendered).into_any_element()
+                } else if this.generating_indicator_in_list {
+                    centered_container(this.render_claude_code_generating(cx)).into_any_element()
+                } else {
+                    Empty.into_any()
+                }
+            }),
+        )
+        .with_sizing_behavior(gpui::ListSizingBehavior::Auto)
+        .flex_grow_1()
+        .pb(floating_prompt_height)
+    }
+
+    fn render_claude_code_entry(
+        &self,
+        entry_ix: usize,
+        total_entries: usize,
+        entry: &AgentThreadEntry,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let is_thread_bottom = entry_ix + 1 == total_entries;
+        let entry_focus_handle = self
+            .entry_view_state
+            .read(cx)
+            .entry(entry_ix)
+            .and_then(|entry| entry.focus_handle(cx));
+        let mut assistant_message_is_blank = false;
+
+        let primary = match entry {
+            AgentThreadEntry::UserMessage(message) => {
+                if message.content.source_blocks().is_empty() {
+                    return Empty.into_any_element();
+                }
+                let Some(user_message) =
+                    self.render_claude_code_user_message(entry_ix, message, window, cx)
+                else {
+                    return Empty.into_any_element();
+                };
+                user_message
+            }
+            AgentThreadEntry::AssistantMessage(message) => {
+                match self.render_claude_code_assistant_message(entry_ix, message, window, cx) {
+                    Some(rows) => rows
+                        .when_some(entry_focus_handle, |this, handle| this.track_focus(&handle))
+                        .into_any_element(),
+                    None => {
+                        assistant_message_is_blank = true;
+                        Empty.into_any()
+                    }
+                }
+            }
+            AgentThreadEntry::ToolCall(tool_call) => {
+                if Self::claude_code_tool_call_is_hidden(tool_call, cx) {
+                    return Empty.into_any_element();
+                }
+                // Merged into the row of the read before it.
+                let entries = self.thread.read(cx).entries();
+                if is_coalescable_read(Some(entry))
+                    && entry_ix
+                        .checked_sub(1)
+                        .is_some_and(|previous| is_coalescable_read(entries.get(previous)))
+                {
+                    return Empty.into_any_element();
+                }
+                // Claude Code's Agent and Task calls report the `think` kind.
+                let background_line = matches!(tool_call.kind(), acp_v2::ToolKind::Think)
+                    .then(|| {
+                        self.render_claude_code_background_agent_line(
+                            |agent| agent.tool_call_id.as_ref() == Some(&tool_call.id),
+                            window,
+                            cx,
+                        )
+                    })
+                    .flatten();
+                v_flex()
+                    .w_full()
+                    .child(
+                        self.render_claude_code_tool_call(entry_ix, tool_call, window, cx)
+                            .when_some(entry_focus_handle, |this, handle| {
+                                this.track_focus(&handle)
+                            }),
+                    )
+                    .children(background_line)
+                    .into_any_element()
+            }
+            AgentThreadEntry::Elicitation(elicitation_id) => {
+                let thread = self.thread.read(cx);
+                match thread.elicitation(elicitation_id) {
+                    // The question card in the prompt box's place asks these.
+                    Some((_, elicitation))
+                        if ask_user_question_form(&elicitation.request).is_some() =>
+                    {
+                        Empty.into_any()
+                    }
+                    Some((_, elicitation)) if should_render_elicitation(elicitation) => self
+                        .render_elicitation(entry_ix, elicitation, window, cx)
+                        .when_some(entry_focus_handle, |this, handle| this.track_focus(&handle))
+                        .into_any_element(),
+                    _ => Empty.into_any(),
+                }
+            }
+            AgentThreadEntry::ContextCompaction(compaction) => {
+                self.render_claude_code_compaction(entry_ix, compaction, window, cx)
+            }
+            AgentThreadEntry::SessionMessage(message) => {
+                let card = acp_subagent_card(self.thread.read(cx), entry_ix, message, cx);
+                let background_line = card.as_ref().and_then(|card| {
+                    let session_id = card.subagent.read(cx).session_id().clone();
+                    self.render_claude_code_background_agent_line(
+                        |agent| agent.session_id.as_ref() == Some(&session_id),
+                        window,
+                        cx,
+                    )
+                });
+                let session_message = match card {
+                    Some(card) => self.render_acp_subagent_card(entry_ix, &card, window, cx),
+                    None => self.render_session_message(entry_ix, message, window, cx),
+                };
+                v_flex()
+                    .w_full()
+                    .child(
+                        session_message.when_some(entry_focus_handle, |this, handle| {
+                            this.track_focus(&handle)
+                        }),
+                    )
+                    .children(background_line)
+                    .into_any_element()
+            }
+        };
+
+        let thread = self.thread.clone();
+        let is_generating = matches!(thread.read(cx).status(), ThreadStatus::Generating);
+        let is_turn_end = Self::entry_is_finalized_turn_end(thread.read(cx).entries(), entry_ix)
+            .unwrap_or(!is_generating);
+
+        let primary = if is_turn_end && !assistant_message_is_blank {
+            let hover_group = SharedString::from(format!("claude-code-turn-{entry_ix}"));
+            v_flex()
+                .w_full()
+                .group(hover_group.clone())
+                .child(primary)
+                .children(self.render_claude_code_turn_controls(
+                    entry_ix,
+                    is_thread_bottom,
+                    hover_group,
+                    cx,
+                ))
+                .into_any_element()
+        } else {
+            primary
+        };
+
+        let primary = if is_thread_bottom {
+            v_flex()
+                .w_full()
+                .child(primary)
+                .when_some(
+                    self.thread_feedback.comments_editor.clone(),
+                    |this, editor| this.child(Self::render_feedback_feedback_editor(editor, cx)),
+                )
+                .into_any_element()
+        } else {
+            primary
+        };
+
+        match self.editing_message {
+            Some(editing_index) if editing_index < entry_ix => {
+                let backdrop = div()
+                    .id(("claude-code-backdrop", entry_ix))
+                    .size_full()
+                    .absolute()
+                    .inset_0()
+                    .bg(cx.theme().colors().panel_background)
+                    .opacity(0.8)
+                    .block_mouse_except_scroll()
+                    .on_click(cx.listener(Self::cancel_editing));
+                div()
+                    .relative()
+                    .child(primary)
+                    .when(!self.is_subagent(), |this| this.child(backdrop))
+                    .into_any_element()
+            }
+            _ => primary,
+        }
+    }
+
+    /// Claude Code shows **Copy response** under a response while it is
+    /// hovered, lined up with the response text. Its other icon, **Bookmark
+    /// response**, is the extension's own feature with nothing behind it in
+    /// ACP. Zed's other turn controls (feedback, scroll to the prompt or to the
+    /// top, turn stats) have no counterpart there.
+    fn render_claude_code_turn_controls(
+        &self,
+        entry_ix: usize,
+        is_thread_bottom: bool,
+        hover_group: SharedString,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        let thread = self.thread.read(cx);
+        let is_generating = matches!(thread.status(), ThreadStatus::Generating);
+        let needs_confirmation =
+            thread.is_waiting_for_confirmation() || self.has_pending_request_elicitation(cx);
+        if is_thread_bottom && (is_generating || needs_confirmation) {
+            return None;
+        }
+        let response_index = Self::agent_message_copy_index(thread.entries(), entry_ix, cx)?;
+        let thread = self.thread.clone();
+        Some(
+            h_flex()
+                .w_full()
+                .pl(px(20.) + TIMELINE_GUTTER)
+                .pr_5()
+                .pb_1()
+                .debug_selector(move || format!("claude-code-turn-controls-{entry_ix}"))
+                .child(
+                    CopyButton::new(("claude-code-copy-response", entry_ix), "")
+                        .icon_size(IconSize::Small)
+                        .tooltip_label("Copy response")
+                        .visible_on_hover(hover_group)
+                        .custom_on_click(move |_, cx| {
+                            let entries = thread.read(cx).entries();
+                            if let Some(text) =
+                                Self::get_agent_message_content(entries, response_index, cx)
+                            {
+                                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                            }
+                        }),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// Claude Code shows a subagent that runs in the background as one status line under
+    /// the call that started it: "Working in the background: … · type /tasks to see its
+    /// transcript".
+    fn render_claude_code_background_agent_line(
+        &self,
+        is_agent: impl Fn(&AgentSummary) -> bool,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        let agent = agent_summaries(
+            self.thread.read(cx),
+            thread_activity(cx.entity_id(), cx),
+            Instant::now(),
+            cx,
+        )
+        .into_iter()
+        .find(|agent| agent.backgrounded && is_agent(agent))?;
+        Some(
+            div()
+                .w_full()
+                .px_5()
+                .pb_1()
+                .text_ui(cx)
+                .debug_selector(|| "claude-code-background-agent".to_string())
+                .child(timeline_row(
+                    StatusDot::new(agent.dot_state()).size(px(7.)),
+                    Label::new(agent.background_line())
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                    window,
+                ))
+                .into_any_element(),
+        )
+    }
+
+    /// A canceled tool call that never produced output only adds noise. A
+    /// question that was interrupted still lists its questions.
+    fn claude_code_tool_call_is_hidden(tool_call: &ToolCall, cx: &App) -> bool {
+        if !matches!(tool_call.status(), ToolCallStatus::Canceled) {
+            return false;
+        }
+        if reported_claude_code_tool(tool_call)
+            .is_some_and(|tool| tool.as_ref() == ASK_USER_QUESTION_TOOL)
+            && tool_call
+                .raw_input
+                .as_ref()
+                .and_then(|input| input.get("questions"))
+                .and_then(|questions| questions.as_array())
+                .is_some_and(|questions| !questions.is_empty())
+        {
+            return false;
+        }
+        !tool_call.content().iter().any(|content| match content {
+            ToolCallContent::ContentBlock { block, .. } => block.visible_content(cx),
+            ToolCallContent::Diff(_)
+            | ToolCallContent::LegacyDiff { .. }
+            | ToolCallContent::Terminal { .. }
+            | ToolCallContent::SessionReference(_) => true,
+            ToolCallContent::DiffPatch { render, .. } => {
+                !render.files.is_empty()
+                    || render
+                        .fallback
+                        .as_ref()
+                        .is_some_and(|markdown| !markdown.read(cx).source().is_empty())
+            }
+            ToolCallContent::Other { markdown, .. } => !markdown.read(cx).source().is_empty(),
+        })
+    }
+
+    fn render_claude_code_user_message(
+        &self,
+        entry_ix: usize,
+        message: &acp_thread::UserMessage,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        let editor = self
+            .entry_view_state
+            .read(cx)
+            .entry(entry_ix)
+            .and_then(|entry| entry.message_editor())
+            .cloned()?;
+
+        let editing = self.editing_message == Some(entry_ix);
+        let editor_focused = editor.focus_handle(cx).is_focused(window);
+        let can_rewind = self
+            .thread
+            .read(cx)
+            .can_rewind_to(message.client_id.as_ref(), cx);
+        let source_is_representable = message
+            .content
+            .source_blocks()
+            .iter()
+            .all(acp_thread::content::can_convert_to_v1);
+        let is_editable = can_rewind && source_is_representable;
+
+        let colors = cx.theme().colors();
+        let focus_border = colors.border_focused;
+        let border_color = if editing && editor_focused {
+            focus_border
+        } else {
+            colors.border_variant
+        };
+
+        let edit_controls = (editor_focused && is_editable).then(|| {
+            let is_loading_contents = self.is_loading_contents;
+            h_flex()
+                .absolute()
+                .top_neg_3p5()
+                .right_3()
+                .gap_1()
+                .rounded_sm()
+                .border_1()
+                .border_color(colors.border)
+                .bg(colors.editor_background)
+                .overflow_hidden()
+                .child(
+                    IconButton::new("cancel", IconName::Close)
+                        .disabled(is_loading_contents)
+                        .icon_color(Color::Error)
+                        .icon_size(IconSize::XSmall)
+                        .on_click(cx.listener(Self::cancel_editing)),
+                )
+                .child(
+                    IconButton::new("regenerate", IconName::Return)
+                        .disabled(is_loading_contents)
+                        .icon_color(Color::Muted)
+                        .icon_size(IconSize::XSmall)
+                        .tooltip(Tooltip::text(
+                            "Editing will restart the thread from this point.",
+                        ))
+                        .on_click(cx.listener({
+                            let editor = editor.clone();
+                            move |this, _, window, cx| {
+                                this.regenerate(entry_ix, editor.clone(), window, cx);
+                            }
+                        })),
+                )
+        });
+
+        let hover_group = SharedString::from(format!("claude-code-user-message-{entry_ix}"));
+        let body = if editing {
+            editor.clone().into_any_element()
+        } else {
+            self.render_claude_code_sent_message(entry_ix, message, hover_group.clone(), cx)
+        };
+
+        Some(
+            v_flex()
+                .id(("claude-code-user-message", entry_ix))
+                .debug_selector(move || format!("claude-code-user-message-{entry_ix}"))
+                .w_full()
+                .px_5()
+                .pt_4()
+                .pb_2()
+                .gap_1()
+                .children(self.render_claude_code_message_stamp((entry_ix, 0), cx))
+                .child(
+                    div()
+                        .relative()
+                        .w_full()
+                        .group(hover_group.clone())
+                        .child(
+                            div()
+                                .id(("claude-code-user-message-box", entry_ix))
+                                .w_full()
+                                .px(px(6.))
+                                .py(px(4.))
+                                .rounded(px(6.))
+                                .border_1()
+                                .border_color(border_color)
+                                .when(editing && !editor_focused, |this| this.border_dashed())
+                                .bg(colors.elevated_surface_background)
+                                .when(is_editable && !editing, |this| {
+                                    // Clicking focuses the message's editor, which
+                                    // starts editing it.
+                                    this.hover(|style| {
+                                        style.border_color(focus_border.opacity(0.8))
+                                    })
+                                    .on_click(
+                                        move |_event, window, cx| {
+                                            let editor_focus = editor.focus_handle(cx);
+                                            window.focus(&editor_focus, cx);
+                                        },
+                                    )
+                                })
+                                .child(body),
+                        )
+                        .children(edit_controls)
+                        .when(!editing, |this| {
+                            this.child(self.render_claude_code_rewind_button(entry_ix, hover_group))
+                        }),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// A sent message like Claude Code draws it: attachments as a row of
+    /// chips, then the text in the UI font, clamped to a few lines with
+    /// "Show more" on hover. Mentions read as "@name", as typed.
+    fn render_claude_code_sent_message(
+        &self,
+        entry_ix: usize,
+        message: &acp_thread::UserMessage,
+        hover_group: SharedString,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let thread_view_id = cx.entity_id();
+        let activity = thread_activity(thread_view_id, cx);
+        let is_expanded =
+            activity.is_some_and(|activity| activity.is_user_message_expanded(entry_ix));
+        let overflows = activity.is_some_and(|activity| activity.user_message_overflows(entry_ix));
+        let path_style = self.claude_code_path_style(cx);
+        let text = sent_message_text(message.content.source_blocks(), path_style);
+        let text_style = ui_font_text_style(cx);
+        let colors = cx.theme().colors();
+        let background = colors.elevated_surface_background;
+
+        let toggle_expanded = |label: &'static str, id: &'static str| {
+            div()
+                .id((id, entry_ix))
+                .debug_selector(move || format!("{id}-{entry_ix}"))
+                .px_2()
+                .py_1()
+                .rounded(px(4.))
+                .bg(colors.text)
+                .text_color(colors.elevated_surface_background)
+                .text_ui_sm(cx)
+                .cursor_pointer()
+                .child(label)
+                .on_click(cx.listener(move |_this, _event: &ClickEvent, _window, cx| {
+                    // The click must not also start editing the message.
+                    cx.stop_propagation();
+                    toggle_user_message_expanded(cx.entity_id(), entry_ix, cx);
+                    cx.notify();
+                }))
+        };
+
+        let text_block = (!text.is_empty()).then(|| {
+            div()
+                .relative()
+                .w_full()
+                .when(!is_expanded, |this| {
+                    this.max_h(USER_MESSAGE_COLLAPSED_HEIGHT).overflow_hidden()
+                })
+                .child(
+                    div()
+                        .w_full()
+                        .on_children_prepainted(move |bounds, _window, cx| {
+                            let height = bounds
+                                .first()
+                                .map(|bounds| bounds.size.height)
+                                .unwrap_or_default();
+                            set_user_message_overflows(
+                                thread_view_id,
+                                entry_ix,
+                                height > USER_MESSAGE_COLLAPSED_HEIGHT + px(1.),
+                                cx,
+                            );
+                        })
+                        // Highlights only carry font and colour, so the size and line
+                        // height have to be set on the container.
+                        .text_size(text_style.font_size)
+                        .line_height(text_style.line_height)
+                        .child(StyledText::new(text).with_default_highlights(&text_style, [])),
+                )
+                .when(overflows && !is_expanded, |this| {
+                    this.child(
+                        div()
+                            .absolute()
+                            .left_0()
+                            .right_0()
+                            .bottom_0()
+                            .h(USER_MESSAGE_FADE_HEIGHT)
+                            .bg(linear_gradient(
+                                180.,
+                                linear_color_stop(background.opacity(0.), 0.),
+                                linear_color_stop(background, 1.),
+                            )),
+                    )
+                    .child(
+                        div().absolute().right_0().bottom_0().child(
+                            toggle_expanded("Show more", "claude-code-show-more")
+                                .invisible()
+                                .group_hover(hover_group.clone(), |style| style.visible()),
+                        ),
+                    )
+                })
+        });
+
+        v_flex()
+            .w_full()
+            .gap_1p5()
+            .children(self.render_claude_code_attachment_chips(entry_ix, message, path_style, cx))
+            .children(text_block)
+            .when(overflows && is_expanded, |this| {
+                this.child(
+                    h_flex()
+                        .w_full()
+                        .justify_end()
+                        .child(toggle_expanded("Show less", "claude-code-show-less")),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn claude_code_path_style(&self, cx: &App) -> PathStyle {
+        self.project
+            .upgrade()
+            .map(|project| project.read(cx).path_style(cx))
+            .unwrap_or_else(PathStyle::local)
+    }
+
+    /// Images sent with a message, as Claude Code's attachment chips: a
+    /// thumbnail, the file name and the pixel size.
+    fn render_claude_code_attachment_chips(
+        &self,
+        entry_ix: usize,
+        message: &acp_thread::UserMessage,
+        path_style: PathStyle,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        let names = message
+            .content
+            .source_blocks()
+            .iter()
+            .filter_map(|block| match block {
+                acp_v2::ContentBlock::Image(image) => Some(attachment_name(
+                    image.uri.as_deref(),
+                    &image.mime_type.0,
+                    path_style,
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if names.is_empty() {
+            return None;
+        }
+        let images = message
+            .content
+            .blocks()
+            .filter_map(|block| block.image().map(|(image, size)| (image.clone(), size)))
+            .collect::<Vec<_>>();
+        let colors = cx.theme().colors();
+        Some(
+            h_flex()
+                .debug_selector(move || format!("claude-code-attachments-{entry_ix}"))
+                .w_full()
+                .flex_wrap()
+                .gap_1()
+                .children(names.into_iter().enumerate().map(|(index, name)| {
+                    let image = images.get(index).cloned();
+                    h_flex()
+                        .id(("claude-code-attachment", index))
+                        .gap_1()
+                        .px_1()
+                        .py_0p5()
+                        .rounded_sm()
+                        .bg(colors.element_background)
+                        .when_some(image.as_ref(), |this, (image, _)| {
+                            this.child(
+                                img(image.clone())
+                                    .flex_none()
+                                    .size(px(14.))
+                                    .rounded_xs()
+                                    .object_fit(ObjectFit::Cover),
+                            )
+                        })
+                        .child(Label::new(name).size(LabelSize::Small))
+                        .when_some(image.and_then(|(_, size)| size), |this, size| {
+                            this.child(
+                                Label::new(format!("{}×{}", size.width, size.height))
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            )
+                        })
+                }))
+                .into_any_element(),
+        )
+    }
+
+    /// The hover button on a sent message's corner that opens Claude Code's
+    /// rewind menu. Its actions need ACP plumbing vszed doesn't have yet:
+    /// forking needs Zed's agent client to send `session/fork` with a fork
+    /// point, and claude-agent-acp doesn't expose Claude's file checkpoints.
+    fn render_claude_code_rewind_button(
+        &self,
+        entry_ix: usize,
+        hover_group: SharedString,
+    ) -> AnyElement {
+        const FORK_UNAVAILABLE: &str =
+            "Not available yet: Zed's agent client doesn't send ACP session/fork.";
+        const REWIND_UNAVAILABLE: &str =
+            "Not available: the Claude adapter doesn't expose Claude's file checkpoints.";
+        let unavailable_entry = |label: &'static str, reason: &'static str| {
+            ContextMenuEntry::new(label)
+                .disabled(true)
+                .documentation_aside(DocumentationSide::Left, move |_| {
+                    Label::new(reason).into_any_element()
+                })
+        };
+        div()
+            .absolute()
+            .top(px(-10.))
+            .right(px(-10.))
+            .child(
+                PopoverMenu::new(("claude-code-rewind-menu", entry_ix))
+                    .trigger_with_tooltip(
+                        IconButton::new(("claude-code-rewind", entry_ix), IconName::Undo)
+                            .style(ButtonStyle::Filled)
+                            .icon_size(IconSize::XSmall)
+                            .icon_color(Color::Muted)
+                            .visible_on_hover(hover_group),
+                        Tooltip::text("Rewind"),
+                    )
+                    .anchor(gpui::Anchor::TopRight)
+                    .menu(move |window, cx| {
+                        Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                            menu.item(unavailable_entry(
+                                "Fork conversation from here",
+                                FORK_UNAVAILABLE,
+                            ))
+                            .item(unavailable_entry("Rewind code to here", REWIND_UNAVAILABLE))
+                            .item(unavailable_entry(
+                                "Fork conversation and rewind code",
+                                REWIND_UNAVAILABLE,
+                            ))
+                        }))
+                    }),
+            )
+            .into_any_element()
+    }
+
+    /// Claude Code's muted time above a message, preceded by a date line
+    /// where the day changes.
+    fn render_claude_code_message_stamp(
+        &self,
+        key: (usize, usize),
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        let activity = thread_activity(cx.entity_id(), cx)?;
+        let time = activity.message_time(key)?;
+        let starts_new_day = activity.starts_new_day(key);
+        let (entry_ix, chunk_ix) = key;
+        Some(
+            v_flex()
+                .w_full()
+                .gap_2()
+                .when(starts_new_day, |this| {
+                    this.child(
+                        h_flex()
+                            .debug_selector(move || {
+                                format!("claude-code-day-line-{entry_ix}-{chunk_ix}")
+                            })
+                            .w_full()
+                            .py_2()
+                            .gap_2()
+                            .child(wavy_line(cx))
+                            .child(
+                                Label::new(format_day(time, Local::now()))
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            )
+                            .child(wavy_line(cx)),
+                    )
+                })
+                .child(
+                    h_flex().w_full().justify_end().child(
+                        Label::new(format_timestamp(time))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn render_claude_code_assistant_message(
+        &self,
+        entry_ix: usize,
+        message: &AssistantMessage,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> Option<Div> {
+        let thread = self.thread.read(cx);
+        let is_streaming_entry = matches!(thread.status(), ThreadStatus::Generating)
+            && entry_ix + 1 == thread.entries().len();
+        let last_chunk_ix = message.chunks.len().checked_sub(1);
+        let activity = thread_activity(cx.entity_id(), cx);
+        let markdown_style = transcript_markdown_style(window, cx);
+
+        let rows = message
+            .chunks
+            .iter()
+            .enumerate()
+            .filter_map(|(chunk_ix, chunk)| match chunk {
+                AssistantMessageChunk::Message { block, .. } => {
+                    block.visible_content(cx).then(|| {
+                        v_flex()
+                            .w_full()
+                            .gap_1()
+                            .children(
+                                self.render_claude_code_message_stamp((entry_ix, chunk_ix), cx),
+                            )
+                            .child(timeline_row(
+                                TimelineDot::new(
+                                    ("claude-code-message-dot", chunk_ix),
+                                    StepStatus::Neutral,
+                                ),
+                                self.render_claude_code_message_content(
+                                    entry_ix,
+                                    chunk_ix,
+                                    block,
+                                    &markdown_style,
+                                    window,
+                                    cx,
+                                ),
+                                window,
+                            ))
+                            .into_any_element()
+                    })
+                }
+                // A thought without text still shows its label, as Claude Code
+                // shows "Thought for Ns" when thinking summaries are off.
+                AssistantMessageChunk::Thought { block, .. } => {
+                    let is_streaming = is_streaming_entry && Some(chunk_ix) == last_chunk_ix;
+                    let duration =
+                        activity.and_then(|activity| activity.thought_duration(entry_ix, chunk_ix));
+                    Some(self.render_claude_code_thought(
+                        entry_ix,
+                        chunk_ix,
+                        block,
+                        thought_label(duration, is_streaming),
+                        window,
+                        cx,
+                    ))
+                }
+            })
+            .collect::<Vec<_>>();
+
+        if rows.is_empty() {
+            return None;
+        }
+        Some(
+            v_flex()
+                .w_full()
+                .px_5()
+                .py_1()
+                .gap_2()
+                .text_ui(cx)
+                .children(rows),
+        )
+    }
+
+    /// Assistant text in the transcript's smaller size. Images and resources
+    /// render as in Zed's own style.
+    fn render_claude_code_message_content(
+        &self,
+        entry_ix: usize,
+        chunk_ix: usize,
+        content: &acp_thread::MessageContent,
+        markdown_style: &MarkdownStyle,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> Div {
+        v_flex().w_full().gap_3().children(
+            content
+                .blocks()
+                .enumerate()
+                .filter(|(_, block)| block.visible_content(cx))
+                .map(|(block_ix, block)| {
+                    let rendered = match block.markdown() {
+                        Some(markdown) => self
+                            .render_markdown(markdown.clone(), markdown_style.clone(), cx)
+                            .into_any_element(),
+                        None => self.render_output_content_block(
+                            entry_ix, block_ix, block, None, false, window, cx,
+                        ),
+                    };
+                    div()
+                        .id(("message-content-block", block_ix))
+                        .debug_selector(move || {
+                            format!("message-content-{entry_ix}-{chunk_ix}-{block_ix}")
+                        })
+                        .child(self.render_message_context_menu(
+                            entry_ix,
+                            block.markdown().cloned(),
+                            rendered,
+                            cx,
+                        ))
+                }),
+        )
+    }
+
+    /// "Thought for Ns", with a chevron only when the thought has summary
+    /// text. Clicking one opens or closes every summary in the conversation,
+    /// as in Claude Code, shown in muted text beside a guide line that drops
+    /// from the step's dot.
+    fn render_claude_code_thought(
+        &self,
+        entry_ix: usize,
+        chunk_ix: usize,
+        block: &acp_thread::MessageContent,
+        label: SharedString,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let has_summary = thought_has_summary(block);
+        let is_open = has_summary
+            && thread_activity(cx.entity_id(), cx)
+                .is_some_and(|activity| activity.thoughts_expanded());
+
+        let header = h_flex()
+            .gap_1()
+            .child(Label::new(label).color(Color::Muted))
+            .when(has_summary, |this| {
+                this.child(
+                    Icon::new(if is_open {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    })
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+                )
+            });
+
+        v_flex()
+            .id(("claude-code-thought", chunk_ix))
+            .w_full()
+            .child(
+                div()
+                    .id(("claude-code-thought-header", chunk_ix))
+                    .debug_selector(move || format!("claude-code-thought-{entry_ix}-{chunk_ix}"))
+                    .child(timeline_row(
+                        TimelineDot::new(("claude-code-thought-dot", chunk_ix), StepStatus::Muted),
+                        header,
+                        window,
+                    ))
+                    .when(has_summary, |this| {
+                        this.cursor_pointer().on_click(cx.listener(
+                            move |this, _event: &ClickEvent, window, cx| {
+                                toggle_thoughts_expanded(cx.entity_id(), cx);
+                                this.refresh_thread_search(window, cx);
+                                cx.notify();
+                            },
+                        ))
+                    }),
+            )
+            .when(is_open, |this| {
+                let mut style = transcript_markdown_style(window, cx);
+                style.base_text_style.color = Color::Muted.color(cx);
+                let guide_offset = (TIMELINE_GUTTER - px(1.)) / 2.;
+                this.child(
+                    v_flex()
+                        .id(("claude-code-thought-summary", chunk_ix))
+                        .debug_selector(move || {
+                            format!("claude-code-thought-summary-{entry_ix}-{chunk_ix}")
+                        })
+                        .ml(guide_offset)
+                        .pl(guide_offset)
+                        .py_1()
+                        .gap_2()
+                        .border_l_1()
+                        .border_color(cx.theme().colors().border_variant)
+                        .children(block.markdowns().map(|markdown| {
+                            self.render_markdown(markdown.clone(), style.clone(), cx)
+                        })),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_claude_code_tool_call(
+        &self,
+        entry_ix: usize,
+        tool_call: &ToolCall,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
+        let session_id = self.thread.read(cx).session_id().clone();
+        let focus_handle = self.focus_handle(cx);
+
+        if tool_call.is_subagent() {
+            return self.render_any_tool_call(
+                &session_id,
+                entry_ix,
+                tool_call,
+                &focus_handle,
+                ToolCallLayout::Standalone,
+                window,
+                cx,
+            );
+        }
+
+        if let Some(row) = self.render_claude_code_question_row(entry_ix, tool_call, cx) {
+            return row;
+        }
+
+        let label = tool_call.label.read(cx).source().to_string();
+        let summary = summarize_tool_call(tool_call, &label);
+        let status = tool_call.status();
+        let has_failed = matches!(
+            status,
+            ToolCallStatus::Rejected | ToolCallStatus::Canceled | ToolCallStatus::Failed
+        );
+        let command_failed = tool_call.terminals().any(|terminal| {
+            terminal.read(cx).output().is_some_and(|output| {
+                output
+                    .exit_status
+                    .exit_code
+                    .is_some_and(|exit_code| exit_code != 0)
+                    || output.exit_status.signal.is_some()
+            })
+        });
+        let step_status = if command_failed {
+            StepStatus::Failed
+        } else {
+            StepStatus::from_tool_call_status(status)
+        };
+
+        let is_edit = matches!(tool_call.kind(), acp_v2::ToolKind::Edit)
+            || tool_call.diffs().next().is_some()
+            || tool_call
+                .content()
+                .iter()
+                .any(|content| matches!(content, ToolCallContent::DiffPatch { .. }));
+        let is_expanded = self
+            .entry_view_state
+            .read(cx)
+            .is_tool_call_expanded(&tool_call.id);
+        let toggle_expansion = || {
+            let tool_call_id = tool_call.id.clone();
+            cx.listener(move |this, _event: &ClickEvent, window, cx| {
+                this.entry_view_state.update(cx, |state, _cx| {
+                    state.toggle_tool_call_expansion(&tool_call_id);
+                });
+                this.materialize_tool_call_views(entry_ix, window, cx);
+                this.refresh_thread_search(window, cx);
+                cx.notify();
+            })
+        };
+
+        let description = summary.description.clone().map(|description| {
+            self.claude_code_project_relative_path(&description, cx)
+                .unwrap_or(description)
+        });
+        let file_tool_row = self.render_claude_code_file_tool_row(
+            entry_ix,
+            tool_call,
+            step_status,
+            has_failed,
+            window,
+            cx,
+        );
+        let is_file_tool_row = file_tool_row.is_some();
+        let mut row = file_tool_row.unwrap_or_else(|| {
+            ToolRow::new(("claude-code-tool", entry_ix), summary.name, step_status)
+                .description(description)
+        });
+
+        if is_edit && !is_file_tool_row {
+            if let Some((lines_added, lines_removed)) = edit_line_stats(tool_call) {
+                row = row.header_suffix(
+                    DiffStat::new(
+                        ("claude-code-diff-stat", entry_ix),
+                        lines_added,
+                        lines_removed,
+                    )
+                    .label_size(LabelSize::XSmall),
+                );
+            }
+            row = row.on_header_click(toggle_expansion());
+            if is_expanded {
+                let diff_contents = tool_call
+                    .content()
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, content)| {
+                        matches!(
+                            content,
+                            ToolCallContent::Diff(_)
+                                | ToolCallContent::LegacyDiff { .. }
+                                | ToolCallContent::DiffPatch { .. }
+                        )
+                    })
+                    .map(|(content_ix, content)| {
+                        self.render_tool_call_content(
+                            &session_id,
+                            entry_ix,
+                            content,
+                            content_ix,
+                            tool_call,
+                            true,
+                            has_failed,
+                            &focus_handle,
+                            window,
+                            cx,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                if !diff_contents.is_empty() {
+                    row = row.body(
+                        v_flex()
+                            .w_full()
+                            .overflow_hidden()
+                            .rounded(px(6.))
+                            .border_1()
+                            .border_color(cx.theme().colors().border_variant)
+                            .children(diff_contents),
+                    );
+                }
+            }
+        } else if !is_file_tool_row {
+            let output = tool_output_text(tool_call, summary.description.as_deref(), cx);
+            let output_is_long = output.as_deref().is_some_and(is_long_tool_text);
+            row = row
+                .input(summary.input)
+                .copy_input(matches!(tool_call.kind(), acp_v2::ToolKind::Execute))
+                .output(output);
+            if output_is_long {
+                let tool_call_id = tool_call.id.clone();
+                row = row.on_open_output(cx.listener(
+                    move |this, _event: &ClickEvent, window, cx| {
+                        this.open_claude_code_tool_output(tool_call_id.clone(), window, cx);
+                    },
+                ));
+            }
+
+            let images = tool_call
+                .content()
+                .iter()
+                .enumerate()
+                .filter(|(_, content)| content.image().is_some())
+                .map(|(content_ix, content)| {
+                    self.render_tool_call_content(
+                        &session_id,
+                        entry_ix,
+                        content,
+                        content_ix,
+                        tool_call,
+                        false,
+                        has_failed,
+                        &focus_handle,
+                        window,
+                        cx,
+                    )
+                })
+                .collect::<Vec<_>>();
+            if !images.is_empty() {
+                row = row.body(v_flex().w_full().gap_1().children(images));
+            }
+        }
+
+        if matches!(status, ToolCallStatus::WaitingForConfirmation) {
+            if let Some(details) = tool_call.sandbox_authorization_details.as_ref() {
+                row = row.footer(self.render_sandbox_authorization_details(
+                    entry_ix,
+                    &tool_call.id,
+                    details,
+                    window,
+                    cx,
+                ));
+            }
+            if let Some(details) = tool_call.sandbox_fallback_authorization_details.as_ref() {
+                row = row.footer(self.render_sandbox_fallback_authorization_details(details, cx));
+            }
+        }
+        // ACP v2 requests and flat ACP v1 options are answered in the
+        // permission card that replaces the prompt box, as in Claude Code.
+        if let Some(request) = tool_call
+            .authorization_id()
+            .and_then(|id| self.thread.read(cx).permission_request(id))
+            .filter(|request| !claude_code_card_handles(request))
+        {
+            row = row.footer(self.render_permission_buttons(
+                session_id.clone(),
+                self.is_first_tool_call(&session_id, &tool_call.id, cx),
+                request,
+                entry_ix,
+                &focus_handle,
+                self.sandbox_confusables_block_allow(tool_call, cx),
+                cx,
+            ));
+        }
+
+        div()
+            .id(("claude-code-tool-entry", entry_ix))
+            .debug_selector(move || format!("claude-code-tool-{entry_ix}"))
+            .w_full()
+            .px_5()
+            .py_1()
+            .text_ui(cx)
+            .child(row)
+    }
+
+    /// Claude Code's own rows for its file tools: "Read" with the file names of a
+    /// run of reads and no output, "Edit" with the file, a summary and the diff of
+    /// its old and new text, "Write" with the file, its line count and content, and
+    /// "<skill> skill" with no output.
+    fn render_claude_code_file_tool_row(
+        &self,
+        entry_ix: usize,
+        tool_call: &ToolCall,
+        step_status: StepStatus,
+        has_failed: bool,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> Option<ToolRow> {
+        let tool = reported_claude_code_tool(tool_call)?;
+        let id = ("claude-code-tool", entry_ix);
+        let file_link = |entry_ix: usize, path: &str, suffix: Option<SharedString>| {
+            FileLink::new(
+                display_file_name(path).to_string(),
+                suffix,
+                cx.listener(move |this, _event: &ClickEvent, window, cx| {
+                    this.open_tool_call_location(entry_ix, 0, window, cx);
+                }),
+            )
+        };
+        match tool.as_ref() {
+            "Read" => {
+                let entries = self.thread.read(cx).entries();
+                let mut reads = vec![(entry_ix, tool_call)];
+                if is_coalescable_read(entries.get(entry_ix)) {
+                    reads.extend((entry_ix + 1..entries.len()).map_while(|next| {
+                        match entries.get(next) {
+                            Some(AgentThreadEntry::ToolCall(next_call))
+                                if is_coalescable_read(entries.get(next)) =>
+                            {
+                                Some((next, next_call))
+                            }
+                            _ => None,
+                        }
+                    }));
+                }
+                let links = reads
+                    .into_iter()
+                    .filter_map(|(read_ix, read)| {
+                        let path = read.raw_input.as_ref()?.get("file_path")?.as_str()?;
+                        Some(file_link(
+                            read_ix,
+                            path,
+                            read_range_suffix(read.raw_input.as_ref()),
+                        ))
+                    })
+                    .collect();
+                Some(ToolRow::new(id, tool, step_status).file_links(links))
+            }
+            "Edit" | "Write" => {
+                let input = file_tool_input(tool_call, &tool);
+                let links = input
+                    .file_path
+                    .map(|path| file_link(entry_ix, path, None))
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                let has_links = !links.is_empty();
+                let mut row = ToolRow::new(id, tool.clone(), step_status)
+                    .file_links(links)
+                    .description((!has_links).then(|| "file".into()));
+                if tool.as_ref() == "Write" {
+                    let summary = if has_failed {
+                        "Write failed".to_string()
+                    } else {
+                        write_summary(input.new_text)
+                    };
+                    let content = input
+                        .new_text
+                        .map(|content| SharedString::from(content.to_string()));
+                    let content_is_long = content.as_deref().is_some_and(is_long_tool_text);
+                    row = row
+                        .secondary_line(Some(summary.into()))
+                        .output(content)
+                        .unlabeled_output();
+                    if content_is_long {
+                        let tool_call_id = tool_call.id.clone();
+                        row = row.on_open_output(cx.listener(
+                            move |this, _event: &ClickEvent, window, cx| {
+                                this.open_claude_code_tool_output(tool_call_id.clone(), window, cx);
+                            },
+                        ));
+                    }
+                    return Some(row);
+                }
+                // The new text is the last of the input to arrive; without it the
+                // diff would read as a deletion.
+                let Some(new_text) = input.new_text else {
+                    return Some(row);
+                };
+                let summary = if has_failed {
+                    "Edit failed".to_string()
+                } else {
+                    edit_summary(input.old_text, new_text)
+                };
+                Some(row.secondary_line(Some(summary.into())).body(
+                    self.render_claude_code_edit_diff(
+                        &tool_call.id,
+                        input.file_path,
+                        input.old_text,
+                        new_text,
+                        window,
+                        cx,
+                    ),
+                ))
+            }
+            "Skill" => {
+                let skill = tool_call
+                    .raw_input
+                    .as_ref()?
+                    .get("skill")?
+                    .as_str()?
+                    .trim_start_matches('/')
+                    .to_string();
+                Some(ToolRow::new(id, skill, step_status).description(Some("skill".into())))
+            }
+            _ => None,
+        }
+    }
+
+    /// Claude Code opens a long tool output in a read-only editor tab, which
+    /// lands beside the conversation because the conversation's editor group
+    /// is locked. Here the tab also follows the output while the tool call
+    /// streams, and clicking OUT again focuses it while it is open.
+    fn open_claude_code_tool_output(
+        &mut self,
+        tool_call_id: acp_v2::ToolCallId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let thread_view_id = cx.entity_id();
+        if let Some((editor, _)) = thread_activity(thread_view_id, cx)
+            .and_then(|activity| activity.output_tab(&tool_call_id))
+        {
+            let activated = workspace.update(cx, |workspace, cx| {
+                workspace.activate_item(&editor, true, true, window, cx)
+            });
+            if activated {
+                return;
+            }
+        }
+        let Some(project) = self.project.upgrade() else {
+            return;
+        };
+        let Some((title, output)) =
+            self.thread
+                .read(cx)
+                .tool_call(&tool_call_id)
+                .map(|(_, tool_call)| {
+                    (
+                        tool_output_title(tool_call, cx),
+                        Self::full_tool_output(tool_call, cx),
+                    )
+                })
+        else {
+            return;
+        };
+        let create_buffer =
+            project.update(cx, |project, cx| project.create_buffer(None, false, cx));
+        cx.spawn_in(window, async move |this, cx| {
+            let buffer = create_buffer.await?;
+            this.update_in(cx, |this, window, cx| {
+                this.show_claude_code_tool_output(
+                    tool_call_id,
+                    title,
+                    output,
+                    buffer,
+                    project,
+                    workspace,
+                    window,
+                    cx,
+                );
+            })
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn show_claude_code_tool_output(
+        &mut self,
+        tool_call_id: acp_v2::ToolCallId,
+        title: SharedString,
+        output: String,
+        buffer: Entity<language::Buffer>,
+        project: Entity<Project>,
+        workspace: Entity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        buffer.update(cx, |buffer, cx| {
+            buffer.set_text(output, cx);
+            buffer.set_capability(language::Capability::ReadOnly, cx);
+        });
+        let multibuffer =
+            cx.new(|cx| MultiBuffer::singleton(buffer.clone(), cx).with_title(title.to_string()));
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::for_multibuffer(multibuffer, Some(project), window, cx);
+            editor.set_read_only(true);
+            editor.set_breadcrumb_header(title.to_string());
+            editor.disable_mouse_wheel_zoom();
+            editor
+        });
+
+        let mut subscriptions = vec![cx.subscribe(&self.thread, {
+            let tool_call_id = tool_call_id.clone();
+            move |this, thread, event, cx| {
+                if let AcpThreadEvent::EntryUpdated(entry_ix) = event
+                    && let Some(AgentThreadEntry::ToolCall(tool_call)) =
+                        thread.read(cx).entries().get(*entry_ix)
+                    && tool_call.id == tool_call_id
+                {
+                    this.refresh_claude_code_tool_output(&tool_call_id, cx);
+                }
+            }
+        })];
+        // Display terminals (Bash over claude-agent-acp) grow without
+        // touching the thread entry.
+        let terminals = self
+            .thread
+            .read(cx)
+            .tool_call(&tool_call_id)
+            .map(|(_, tool_call)| tool_call.terminals().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for terminal in terminals {
+            let tool_call_id = tool_call_id.clone();
+            subscriptions.push(cx.observe(&terminal, move |this, _terminal, cx| {
+                this.refresh_claude_code_tool_output(&tool_call_id, cx);
+            }));
+        }
+        set_output_tab(
+            cx.entity_id(),
+            tool_call_id,
+            ToolOutputTab {
+                editor: editor.downgrade(),
+                buffer: buffer.downgrade(),
+                _subscriptions: subscriptions,
+            },
+            cx,
+        );
+
+        workspace.update(cx, |workspace, cx| {
+            let pane = match workspace.find_pane_in_direction(SplitDirection::Right, cx) {
+                Some(pane) => pane,
+                None => {
+                    let active_pane = workspace.active_pane().clone();
+                    workspace.split_pane(active_pane, SplitDirection::Right, window, cx)
+                }
+            };
+            workspace.add_item(pane, Box::new(editor), None, true, true, window, cx);
+        });
+    }
+
+    fn refresh_claude_code_tool_output(
+        &mut self,
+        tool_call_id: &acp_v2::ToolCallId,
+        cx: &mut Context<Self>,
+    ) {
+        let thread_view_id = cx.entity_id();
+        let Some((_, buffer)) = thread_activity(thread_view_id, cx)
+            .and_then(|activity| activity.output_tab(tool_call_id))
+        else {
+            remove_output_tab(thread_view_id, tool_call_id, cx);
+            return;
+        };
+        let Some(output) = self
+            .thread
+            .read(cx)
+            .tool_call(tool_call_id)
+            .map(|(_, tool_call)| Self::full_tool_output(tool_call, cx))
+        else {
+            return;
+        };
+        buffer.update(cx, |buffer, cx| {
+            let current = buffer.text();
+            if current == output {
+                return;
+            }
+            match output.strip_prefix(current.as_str()) {
+                Some(appended) => {
+                    buffer.append(appended.to_string(), cx);
+                }
+                None => {
+                    buffer.set_text(output, cx);
+                }
+            }
+        });
+    }
+
+    fn full_tool_output(tool_call: &ToolCall, cx: &App) -> String {
+        if reported_claude_code_tool(tool_call).as_deref() == Some("Write") {
+            return file_tool_input(tool_call, "Write")
+                .new_text
+                .unwrap_or_default()
+                .to_string();
+        }
+        let label = tool_call.label.read(cx).source().to_string();
+        let summary = summarize_tool_call(tool_call, &label);
+        tool_output_text(tool_call, summary.description.as_deref(), cx)
+            .map(|output| output.to_string())
+            .unwrap_or_default()
+    }
+
+    /// Agents report absolute paths; Claude Code shows them relative to the workspace.
+    fn claude_code_project_relative_path(
+        &self,
+        text: &SharedString,
+        cx: &App,
+    ) -> Option<SharedString> {
+        let path = Path::new(text.as_ref());
+        if !path.is_absolute() {
+            return None;
+        }
+        let project = self.project.upgrade()?;
+        let project = project.read(cx);
+        let project_path = project.find_project_path(path, cx)?;
+        if project_path.path.is_empty() {
+            return None;
+        }
+        Some(
+            project_path
+                .path
+                .display(project.path_style(cx))
+                .into_owned()
+                .into(),
+        )
+    }
+
+    fn render_claude_code_compaction(
+        &self,
+        entry_ix: usize,
+        compaction: &acp_thread::ContextCompaction,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let (label, step_status) = match &compaction.status {
+            acp_thread::ContextCompactionStatus::InProgress => {
+                ("Compacting conversation…", StepStatus::Running)
+            }
+            acp_thread::ContextCompactionStatus::Completed => {
+                ("Conversation compacted", StepStatus::Muted)
+            }
+            acp_thread::ContextCompactionStatus::Failed => {
+                ("Conversation compaction failed", StepStatus::Failed)
+            }
+            acp_thread::ContextCompactionStatus::Canceled => {
+                ("Conversation compaction canceled", StepStatus::Canceled)
+            }
+            acp_thread::ContextCompactionStatus::Other(_) => {
+                ("Conversation compaction", StepStatus::Muted)
+            }
+        };
+        let summary = &compaction.summary;
+        let error = compaction.error.clone();
+        let has_details = summary.blocks().len() > 0 || error.is_some();
+        let is_expanded = has_details
+            && self
+                .entry_view_state
+                .read(cx)
+                .is_compaction_expanded(entry_ix);
+
+        v_flex()
+            .id(("claude-code-compaction", entry_ix))
+            .w_full()
+            .px_5()
+            .py_1()
+            .gap_1()
+            .text_ui(cx)
+            .child(
+                div()
+                    .id("header")
+                    .child(timeline_row(
+                        TimelineDot::new("dot", step_status),
+                        Label::new(label).color(Color::Muted),
+                        window,
+                    ))
+                    .when(has_details, |this| {
+                        this.cursor_pointer().on_click(cx.listener(
+                            move |this, _event: &ClickEvent, window, cx| {
+                                this.toggle_compaction_expansion(entry_ix, window, cx);
+                            },
+                        ))
+                    }),
+            )
+            .when(is_expanded, |this| {
+                this.child(
+                    v_flex()
+                        .pl(TIMELINE_GUTTER)
+                        .gap_2()
+                        .children(summary.blocks().enumerate().map(|(content_ix, content)| {
+                            match content.markdown() {
+                                Some(markdown) => self
+                                    .render_markdown(
+                                        markdown.clone(),
+                                        transcript_markdown_style(window, cx),
+                                        cx,
+                                    )
+                                    .into_any_element(),
+                                None => self.render_output_content_block(
+                                    entry_ix, content_ix, content, None, true, window, cx,
+                                ),
+                            }
+                        }))
+                        .when_some(error, |this, error| {
+                            let mut style = transcript_markdown_style(window, cx);
+                            style.base_text_style.color = Color::Error.color(cx);
+                            this.child(self.render_markdown(error, style, cx))
+                        }),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_claude_code_generating(&self, cx: &Context<Self>) -> AnyElement {
+        // Like Claude Code, the spinner steps aside while a prompt waits for the user.
+        let awaiting_user = self.thread.read(cx).is_waiting_for_confirmation()
+            || self.has_pending_request_elicitation(cx);
+        if awaiting_user {
+            return Empty.into_any_element();
+        }
+        div()
+            .debug_selector(|| "claude-code-spinner".to_string())
+            .px_5()
+            .py_2()
+            .child(ClaudeCodeSpinnerElement::new(
+                self.turn_fields.turn_generation,
+                self.turn_fields.turn_started_at,
+            ))
+            .into_any_element()
+    }
+}
+
+/// Claude Code merges consecutive reads that succeeded into one "Read a, b" row.
+fn is_coalescable_read(entry: Option<&AgentThreadEntry>) -> bool {
+    matches!(
+        entry,
+        Some(AgentThreadEntry::ToolCall(tool_call))
+            if matches!(tool_call.status(), ToolCallStatus::Completed)
+                && reported_claude_code_tool(tool_call).as_deref() == Some("Read")
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::conversation_view::tests::{StubAgentServer, init_test};
+    use acp_thread::StubAgentConnection;
+    use agent_client_protocol::v1::schema as acp_v1;
+    use fs::FakeFs;
+    use gpui::{KeyBinding, TestAppContext, TextStyle, UpdateGlobal as _, VisualTestContext};
+    use serde_json::json;
+    use settings::SettingsStore;
+    use theme_settings::ThemeSettings;
+    use workspace::{Item, MultiWorkspace};
+
+    struct TestThreadItem {
+        conversation_view: Entity<ConversationView>,
+    }
+
+    impl Item for TestThreadItem {
+        type Event = ();
+
+        fn include_in_nav_history() -> bool {
+            false
+        }
+
+        fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
+            "Test".into()
+        }
+    }
+
+    impl EventEmitter<()> for TestThreadItem {}
+
+    impl Focusable for TestThreadItem {
+        fn focus_handle(&self, cx: &App) -> FocusHandle {
+            self.conversation_view.read(cx).focus_handle(cx)
+        }
+    }
+
+    impl Render for TestThreadItem {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            v_flex().size_full().child(self.conversation_view.clone())
+        }
+    }
+
+    fn set_ui_style(ui_style: &str, cx: &mut VisualTestContext) {
+        cx.update(|_window, cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store
+                    .set_user_settings(
+                        &format!(r#"{{ "agent": {{ "ui_style": "{ui_style}" }} }}"#),
+                        cx,
+                    )
+                    .expect("valid ui_style settings");
+            });
+        });
+        cx.run_until_parked();
+    }
+
+    async fn setup_thread_view(
+        connection: StubAgentConnection,
+        cx: &mut TestAppContext,
+    ) -> (Entity<ThreadView>, &mut VisualTestContext) {
+        init_test(cx);
+        cx.update(crate::ui_styles::init);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        let thread_store = cx.update(|_window, cx| cx.new(|cx| ThreadStore::new(cx)));
+        let connection_store =
+            cx.update(|_window, cx| cx.new(|cx| AgentConnectionStore::new(project.clone(), cx)));
+
+        let conversation_view = cx.update(|window, cx| {
+            cx.new(|cx| {
+                ConversationView::new(
+                    Rc::new(StubAgentServer::new(connection)),
+                    connection_store,
+                    Agent::Custom { id: "Test".into() },
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    workspace.downgrade(),
+                    project,
+                    Some(thread_store),
+                    AgentThreadSource::AgentPanel,
+                    window,
+                    cx,
+                )
+            })
+        });
+        cx.run_until_parked();
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(
+                Box::new(cx.new(|_| TestThreadItem {
+                    conversation_view: conversation_view.clone(),
+                })),
+                None,
+                true,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let thread_view = cx.read(|cx| {
+            conversation_view
+                .read(cx)
+                .active_thread()
+                .cloned()
+                .expect("active thread")
+        });
+        (thread_view, cx)
+    }
+
+    fn bash_tool_call() -> acp_v1::ToolCall {
+        acp_v1::ToolCall::new("bash-1", "`git remote -v && ls crates`")
+            .kind(acp_v1::ToolKind::Execute)
+            .status(acp_v1::ToolCallStatus::Completed)
+            .raw_input(json!({
+                "command": "git remote -v && ls crates",
+                "description": "Show remotes and list crates",
+            }))
+            .content(vec!["```console\norigin\nagent_ui\ngpui\nzed\n```".into()])
+            .meta(acp_v2::Meta::from_iter([(
+                "claudeCode".into(),
+                json!({ "toolName": "Bash" }),
+            )]))
+    }
+
+    #[gpui::test]
+    async fn test_claude_code_style_renders_timeline(cx: &mut TestAppContext) {
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![
+            acp_v1::SessionUpdate::AgentThoughtChunk(acp_v1::ContentChunk::new(
+                "Let me look at the repository.".into(),
+            )),
+            acp_v1::SessionUpdate::ToolCall(bash_tool_call()),
+            acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(
+                "Here is what I found.".into(),
+            )),
+        ]);
+        let (thread_view, cx) = setup_thread_view(connection, cx).await;
+        set_ui_style("claude_code", cx);
+
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Show me the repo", cx))
+            .await
+            .expect("prompt should succeed");
+        cx.run_until_parked();
+
+        let (tool_call_ix, summary, output) = thread_view.read_with(cx, |view, cx| {
+            let entries = view.thread.read(cx).entries();
+            entries
+                .iter()
+                .enumerate()
+                .find_map(|(entry_ix, entry)| match entry {
+                    AgentThreadEntry::ToolCall(tool_call) => {
+                        let label = tool_call.label.read(cx).source().to_string();
+                        let summary = summarize_tool_call(tool_call, &label);
+                        let output =
+                            tool_output_text(tool_call, summary.description.as_deref(), cx);
+                        Some((entry_ix, summary, output))
+                    }
+                    _ => None,
+                })
+                .expect("tool call entry")
+        });
+        assert_eq!(summary.name.as_ref(), "Bash");
+        assert_eq!(
+            summary.description.as_deref(),
+            Some("Show remotes and list crates")
+        );
+        assert_eq!(summary.input.as_deref(), Some("git remote -v && ls crates"));
+        assert_eq!(output.as_deref(), Some("origin\nagent_ui\ngpui\nzed"));
+
+        assert!(cx.debug_bounds("claude-code-user-message-0").is_some());
+        assert!(cx.debug_bounds("claude-code-thought-1-0").is_some());
+        assert_eq!(tool_call_ix, 2);
+        assert!(cx.debug_bounds("claude-code-tool-2").is_some());
+
+        thread_view.read_with(cx, |_, cx| {
+            let activity =
+                thread_activity(thread_view.entity_id(), cx).expect("thread activity is tracked");
+            assert!(activity.message_time((0, 0)).is_some());
+            assert!(activity.thought_duration(1, 0).is_some());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_claude_code_replayed_thought_has_no_duration(cx: &mut TestAppContext) {
+        let connection = StubAgentConnection::new();
+        let (thread_view, cx) = setup_thread_view(connection.clone(), cx).await;
+        set_ui_style("claude_code", cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+        // Updates outside a turn, as a loaded session replays its history.
+        cx.update(|_window, cx| {
+            connection.send_update(
+                session_id,
+                acp_v1::SessionUpdate::AgentThoughtChunk(acp_v1::ContentChunk::new(
+                    "An earlier thought.".into(),
+                )),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        assert!(cx.debug_bounds("claude-code-thought-0-0").is_some());
+        thread_view.read_with(cx, |_, cx| {
+            let activity =
+                thread_activity(thread_view.entity_id(), cx).expect("thread activity is tracked");
+            assert_eq!(activity.thought_duration(0, 0), None);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_claude_code_thought_rows(cx: &mut TestAppContext) {
+        let thought = |text: &str| {
+            acp_v1::SessionUpdate::AgentThoughtChunk(acp_v1::ContentChunk::new(text.into()))
+        };
+        let message = |text: &str| {
+            acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(text.into()))
+        };
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![
+            thought("Weighing what the user means."),
+            message("Happy to."),
+            thought(""),
+            message("Done."),
+            thought("A second summary."),
+        ]);
+        let (thread_view, cx) = setup_thread_view(connection, cx).await;
+        set_ui_style("claude_code", cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        thread
+            .update(cx, |thread, cx| thread.send_raw("think", cx))
+            .await
+            .expect("prompt should succeed");
+        cx.run_until_parked();
+
+        let summaries_shown = |cx: &mut VisualTestContext| {
+            [
+                cx.debug_bounds("claude-code-thought-summary-1-0").is_some(),
+                cx.debug_bounds("claude-code-thought-summary-1-2").is_some(),
+                cx.debug_bounds("claude-code-thought-summary-1-4").is_some(),
+            ]
+        };
+        let click = |selector: &'static str, cx: &mut VisualTestContext| {
+            let bounds = cx.debug_bounds(selector).expect("thought header");
+            cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+            cx.run_until_parked();
+        };
+
+        assert_eq!(summaries_shown(cx), [false; 3], "summaries start closed");
+        click("claude-code-thought-1-2", cx);
+        assert_eq!(
+            summaries_shown(cx),
+            [false; 3],
+            "a thought without text doesn't open"
+        );
+        click("claude-code-thought-1-0", cx);
+        assert_eq!(
+            summaries_shown(cx),
+            [true, false, true],
+            "one click opens every summary"
+        );
+        click("claude-code-thought-1-4", cx);
+        assert_eq!(summaries_shown(cx), [false; 3]);
+    }
+
+    fn claude_tool_call(
+        id: &str,
+        tool: &str,
+        kind: acp_v1::ToolKind,
+        raw_input: serde_json::Value,
+    ) -> acp_v1::ToolCall {
+        acp_v1::ToolCall::new(id.to_string(), format!("{tool} file"))
+            .kind(kind)
+            .status(acp_v1::ToolCallStatus::Completed)
+            .raw_input(raw_input)
+            .content(vec!["```\n1\tcontent\n```".into()])
+            .meta(acp_v2::Meta::from_iter([(
+                "claudeCode".into(),
+                json!({ "toolName": tool }),
+            )]))
+    }
+
+    #[gpui::test]
+    async fn test_claude_code_file_tool_rows(cx: &mut TestAppContext) {
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![
+            acp_v1::SessionUpdate::ToolCall(claude_tool_call(
+                "read-1",
+                "Read",
+                acp_v1::ToolKind::Read,
+                json!({ "file_path": "/project/src/main.rs" }),
+            )),
+            acp_v1::SessionUpdate::ToolCall(claude_tool_call(
+                "read-2",
+                "Read",
+                acp_v1::ToolKind::Read,
+                json!({ "file_path": "/project/src/lib.rs", "offset": 10, "limit": 5 }),
+            )),
+            acp_v1::SessionUpdate::ToolCall(claude_tool_call(
+                "edit-1",
+                "Edit",
+                acp_v1::ToolKind::Edit,
+                json!({
+                    "file_path": "/project/src/lib.rs",
+                    "old_string": "fn a() {}",
+                    "new_string": "fn a() {}\nfn b() {}",
+                }),
+            )),
+        ]);
+        let (thread_view, cx) = setup_thread_view(connection, cx).await;
+        set_ui_style("claude_code", cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Read and edit", cx))
+            .await
+            .expect("prompt should succeed");
+        cx.run_until_parked();
+
+        assert!(cx.debug_bounds("claude-code-tool-1").is_some());
+        assert!(
+            cx.debug_bounds("claude-code-tool-2").is_none(),
+            "consecutive reads share the first read's row"
+        );
+        assert!(cx.debug_bounds("claude-code-tool-1-output").is_none());
+        assert!(cx.debug_bounds("claude-code-tool-3").is_some());
+        assert!(
+            cx.debug_bounds("claude-code-tool-3-output").is_none(),
+            "an edit shows its diff, not its output"
+        );
+
+        let layout = thread_view.read_with(cx, |_, cx| {
+            thread_activity(thread_view.entity_id(), cx)
+                .expect("thread activity is tracked")
+                .diff_layout()
+                .get()
+        });
+        assert_ne!(layout, crate::ui_styles::claude_code::DiffLayout::Unknown);
+        let diff_shown = cx.debug_bounds("claude-code-diff-edit-1").is_some();
+        assert_eq!(
+            diff_shown,
+            layout != crate::ui_styles::claude_code::DiffLayout::Hidden
+        );
+    }
+
+    #[gpui::test]
+    async fn test_claude_code_tool_output_tab(cx: &mut TestAppContext) {
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![acp_v1::SessionUpdate::ToolCall(bash_tool_call())]);
+        let (thread_view, cx) = setup_thread_view(connection.clone(), cx).await;
+        set_ui_style("claude_code", cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Run a command", cx))
+            .await
+            .expect("prompt should succeed");
+        cx.run_until_parked();
+        let workspace = thread_view
+            .read_with(cx, |view, _| view.workspace.upgrade())
+            .expect("workspace");
+
+        let click_output = |cx: &mut VisualTestContext| {
+            let bounds = cx
+                .debug_bounds("claude-code-tool-1-output")
+                .expect("OUT row");
+            cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+            cx.run_until_parked();
+        };
+        let output_editors = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, cx| {
+                workspace
+                    .panes()
+                    .iter()
+                    .flat_map(|pane| pane.read(cx).items().collect::<Vec<_>>())
+                    .filter_map(|item| item.downcast::<Editor>())
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        click_output(cx);
+        let editors = output_editors(cx);
+        assert_eq!(editors.len(), 1);
+        let editor = editors[0].clone();
+        assert_eq!(
+            workspace.read_with(cx, |workspace, _| workspace.panes().len()),
+            2
+        );
+        editor.read_with(cx, |editor, cx| {
+            assert_eq!(editor.text(cx), "origin\nagent_ui\ngpui\nzed");
+            assert!(editor.read_only(cx));
+            assert_eq!(editor.buffer().read(cx).title(cx), "Bash tool output");
+        });
+
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+        cx.update(|_window, cx| {
+            connection.send_update(
+                session_id,
+                acp_v1::SessionUpdate::ToolCallUpdate(acp_v1::ToolCallUpdate::new(
+                    "bash-1",
+                    acp_v1::ToolCallUpdateFields::new().content(vec![
+                        "```console\norigin\nagent_ui\ngpui\nzed\nworkspace\n```".into(),
+                    ]),
+                )),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            editor.read_with(cx, |editor, cx| editor.text(cx)),
+            "origin\nagent_ui\ngpui\nzed\nworkspace",
+            "the tab follows the output"
+        );
+
+        thread_view.update_in(cx, |view, window, cx| {
+            let editor_focus = view.message_editor.focus_handle(cx);
+            window.focus(&editor_focus, cx);
+        });
+        cx.run_until_parked();
+        click_output(cx);
+        let editors = output_editors(cx);
+        assert_eq!(editors.len(), 1, "clicking again reuses the open tab");
+        assert_eq!(editors[0].entity_id(), editor.entity_id());
+        assert_eq!(
+            workspace.read_with(cx, |workspace, _| workspace.panes().len()),
+            2
+        );
+        let active_item_id = workspace.read_with(cx, |workspace, cx| {
+            workspace.active_item(cx).map(|item| item.item_id())
+        });
+        assert_eq!(active_item_id, Some(editor.entity_id()));
+    }
+
+    /// A 1×1 PNG.
+    const TINY_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+
+    #[gpui::test]
+    async fn test_claude_code_sent_message(cx: &mut TestAppContext) {
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![acp_v1::SessionUpdate::AgentMessageChunk(
+            acp_v1::ContentChunk::new("Got it.".into()),
+        )]);
+        let (thread_view, cx) = setup_thread_view(connection, cx).await;
+        cx.simulate_resize(gpui::size(px(1600.), px(1000.)));
+        set_ui_style("claude_code", cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let long_text = (1..=12)
+            .map(|line| format!("Line {line} of a long prompt"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let image = acp_v2::ContentBlock::Image(acp_v2::ImageContent::new(TINY_PNG, "image/png"));
+        thread
+            .update(cx, |thread, cx| {
+                thread.send(vec![image.clone(), image, long_text.as_str().into()], cx)
+            })
+            .await
+            .expect("prompt should succeed");
+        cx.run_until_parked();
+
+        assert!(cx.debug_bounds("claude-code-attachments-0").is_some());
+        assert!(
+            cx.debug_bounds("claude-code-day-line-0-0").is_some(),
+            "the first message with a time gets a date line"
+        );
+        let collapsed = cx
+            .debug_bounds("claude-code-user-message-0")
+            .expect("user message");
+        let max_content_width = cx.update(|_window, cx| {
+            AgentSettings::get_global(cx)
+                .max_content_width
+                .unwrap_or(px(0.))
+        });
+        assert!(
+            collapsed.size.width > max_content_width,
+            "the transcript is not capped at Zed's max content width"
+        );
+        let thread_view_id = thread_view.entity_id();
+        let overflows = cx.update(|_window, cx| {
+            thread_activity(thread_view_id, cx)
+                .is_some_and(|activity| activity.user_message_overflows(0))
+        });
+        assert!(overflows, "the long message is clamped");
+        assert!(cx.debug_bounds("claude-code-show-less-0").is_none());
+
+        cx.simulate_mouse_move(collapsed.center(), None, gpui::Modifiers::default());
+        cx.run_until_parked();
+        let show_more = cx
+            .debug_bounds("claude-code-show-more-0")
+            .expect("Show more while hovered");
+        cx.simulate_click(show_more.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        let expanded = cx
+            .debug_bounds("claude-code-user-message-0")
+            .expect("user message");
+        assert!(expanded.size.height > collapsed.size.height);
+        assert!(cx.debug_bounds("claude-code-show-less-0").is_some());
+        assert_eq!(
+            thread_view.read_with(cx, |view, _| view.editing_message),
+            None,
+            "Show more doesn't start editing"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_claude_code_turn_controls(cx: &mut TestAppContext) {
+        let connection = StubAgentConnection::new();
+        let (thread_view, cx) = setup_thread_view(connection.clone(), cx).await;
+        set_ui_style("claude_code", cx);
+
+        let message_editor = thread_view.read_with(cx, |view, _| view.message_editor.clone());
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("Hello", window, cx);
+        });
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+        let session_id =
+            thread_view.read_with(cx, |view, cx| view.thread.read(cx).session_id().clone());
+        cx.update(|_window, cx| {
+            connection.send_update(
+                session_id.clone(),
+                acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(
+                    "Here is what I found.".into(),
+                )),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("claude-code-turn-controls-1").is_none(),
+            "no controls while the turn runs"
+        );
+
+        connection.end_turn(session_id, acp_v1::StopReason::EndTurn);
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("claude-code-turn-controls-1").is_some());
+    }
+
+    #[gpui::test]
+    async fn test_claude_code_activity_bar_matches_prompt_box(cx: &mut TestAppContext) {
+        let connection = StubAgentConnection::new();
+        let (thread_view, cx) = setup_thread_view(connection.clone(), cx).await;
+        let session_id =
+            thread_view.read_with(cx, |view, cx| view.thread.read(cx).session_id().clone());
+        cx.update(|_window, cx| {
+            connection.send_update(
+                session_id,
+                acp_v1::SessionUpdate::Plan(acp_v1::Plan::new(vec![acp_v1::PlanEntry::new(
+                    "Do the thing",
+                    acp_v1::PlanEntryPriority::Medium,
+                    acp_v1::PlanEntryStatus::Pending,
+                )])),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("plan_summary").is_some());
+        assert!(cx.debug_bounds("claude-code-activity-bar").is_none());
+
+        set_ui_style("claude_code", cx);
+        let activity_bar = cx
+            .debug_bounds("claude-code-activity-bar")
+            .expect("activity bar in the Claude Code style");
+        let plan_summary = cx.debug_bounds("plan_summary").expect("plan summary");
+        let prompt_box = cx
+            .debug_bounds("claude-code-prompt-box")
+            .expect("prompt box");
+        assert!(
+            plan_summary.top() >= activity_bar.top()
+                && plan_summary.bottom() <= activity_bar.bottom()
+        );
+        assert_eq!(activity_bar.left(), prompt_box.left());
+        assert_eq!(activity_bar.right(), prompt_box.right());
+        assert!(activity_bar.bottom() <= prompt_box.top());
+    }
+
+    /// The default keymap's global menu bindings, plus the `Workspace` escape
+    /// binding they have to win over.
+    fn bind_permission_keys(cx: &mut VisualTestContext) {
+        cx.update(|_window, cx| {
+            cx.bind_keys([
+                KeyBinding::new("escape", menu::Cancel, None),
+                KeyBinding::new("escape", workspace::Unfollow, Some("Workspace")),
+                KeyBinding::new("down", menu::SelectNext, None),
+                KeyBinding::new("up", menu::SelectPrevious, None),
+                KeyBinding::new("enter", menu::Confirm, None),
+            ]);
+        });
+    }
+
+    fn focus_message_editor(thread_view: &Entity<ThreadView>, cx: &mut VisualTestContext) {
+        thread_view.update_in(cx, |view, window, cx| {
+            let editor_focus = view.message_editor.focus_handle(cx);
+            window.focus(&editor_focus, cx);
+        });
+        cx.run_until_parked();
+    }
+
+    fn permission_card_is_focused(
+        thread_view: &Entity<ThreadView>,
+        cx: &mut VisualTestContext,
+    ) -> bool {
+        let thread_view_id = thread_view.entity_id();
+        cx.update(|window, cx| {
+            thread_activity(thread_view_id, cx)
+                .and_then(|activity| activity.permission_focus())
+                .is_some_and(|focus| focus.is_focused(window))
+        })
+    }
+
+    fn selected_legacy_option(outcome: acp_thread::RequestPermissionOutcome) -> String {
+        match outcome {
+            acp_thread::RequestPermissionOutcome::Selected(selected) => {
+                selected.option_id.0.to_string()
+            }
+            other => panic!("expected a selected option, got {other:?}"),
+        }
+    }
+
+    fn selected_option(outcome: acp_v2::RequestPermissionOutcome) -> String {
+        match outcome {
+            acp_v2::RequestPermissionOutcome::Selected(selected) => {
+                selected.option_id.0.to_string()
+            }
+            other => panic!("expected a selected option, got {other:?}"),
+        }
+    }
+
+    #[gpui::test]
+    async fn test_claude_code_permission_card_keys(cx: &mut TestAppContext) {
+        let (thread_view, cx) = setup_thread_view(StubAgentConnection::new(), cx).await;
+        set_ui_style("claude_code", cx);
+        bind_permission_keys(cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+
+        // claude-agent-acp v0.106.0 Bash options, sent as an ACP v1 request.
+        let request_authorization = |tool_call_id: &str, cx: &mut VisualTestContext| {
+            let task = thread.update(cx, |thread, cx| {
+                thread
+                    .request_tool_call_authorization(
+                        acp_v1::ToolCall::new(tool_call_id.to_string(), "git status")
+                            .kind(acp_v1::ToolKind::Execute)
+                            .into(),
+                        acp_thread::PermissionOptions::Flat(vec![
+                            acp_v2::PermissionOption::new(
+                                "allow-once",
+                                "Yes",
+                                acp_v2::PermissionOptionKind::AllowOnce,
+                            ),
+                            acp_v2::PermissionOption::new(
+                                "allow-with-updates",
+                                "Yes, and don't ask again for `git status` commands",
+                                acp_v2::PermissionOptionKind::AllowAlways,
+                            ),
+                            acp_v2::PermissionOption::new(
+                                "reject",
+                                "No",
+                                acp_v2::PermissionOptionKind::RejectOnce,
+                            ),
+                        ]),
+                        acp_thread::AuthorizationKind::PermissionGrant,
+                        cx,
+                    )
+                    .expect("authorization request")
+            });
+            cx.run_until_parked();
+            task
+        };
+
+        focus_message_editor(&thread_view, cx);
+        let first = request_authorization("bash-1", cx);
+        assert!(cx.debug_bounds("claude-code-permission-card").is_some());
+        assert!(cx.debug_bounds("claude-code-permission-option-2").is_some());
+        assert!(cx.debug_bounds("claude-code-permission-option-3").is_none());
+        assert!(
+            cx.debug_bounds("claude-code-prompt-box").is_none(),
+            "the card takes the prompt box's place"
+        );
+        assert!(
+            permission_card_is_focused(&thread_view, cx),
+            "focus moves from the prompt to the card"
+        );
+        cx.simulate_keystrokes("2");
+        assert_eq!(selected_legacy_option(first.await), "allow-with-updates");
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("claude-code-permission-card").is_none());
+        assert!(cx.debug_bounds("claude-code-prompt-box").is_some());
+        let editor_focused = thread_view.update_in(cx, |view, window, cx| {
+            view.message_editor.focus_handle(cx).is_focused(window)
+        });
+        assert!(editor_focused, "focus returns to the prompt once answered");
+
+        let second = request_authorization("bash-2", cx);
+        assert!(permission_card_is_focused(&thread_view, cx));
+        cx.simulate_keystrokes("escape");
+        assert_eq!(selected_legacy_option(second.await), "reject");
+        cx.run_until_parked();
+
+        let third = request_authorization("bash-3", cx);
+        cx.simulate_keystrokes("down enter");
+        assert_eq!(selected_legacy_option(third.await), "allow-with-updates");
+    }
+
+    #[gpui::test]
+    async fn test_claude_code_plan_approval_card(cx: &mut TestAppContext) {
+        let (thread_view, cx) = setup_thread_view(StubAgentConnection::new(), cx).await;
+        set_ui_style("claude_code", cx);
+        bind_permission_keys(cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().0.to_string());
+
+        // claude-agent-acp v0.106.0 ExitPlanMode request over ACP v2, with auto mode available.
+        let request_plan_approval = |tool_call_id: &str, cx: &mut VisualTestContext| {
+            let request: acp_v2::RequestPermissionRequest = serde_json::from_value(json!({
+                "sessionId": session_id,
+                "title": "Ready to code?",
+                "subject": {
+                    "type": "tool_call",
+                    "toolCall": {
+                        "toolCallId": tool_call_id,
+                        "title": "Approve Plan",
+                        "kind": "switch_mode",
+                        "status": "pending",
+                        "content": [{
+                            "type": "content",
+                            "content": { "type": "text", "text": "# Plan\n\n1. Add the card" }
+                        }]
+                    }
+                },
+                "options": [
+                    { "optionId": "exit-plan-auto", "name": "Yes, and use auto mode", "kind": "allow_always" },
+                    { "optionId": "exit-plan-default", "name": "Yes, manually approve edits", "kind": "allow_once" },
+                    { "optionId": "reject", "name": "No, keep planning", "kind": "reject_once" }
+                ]
+            }))
+            .expect("plan approval request");
+            let (_, task) = thread.update(cx, |thread, cx| {
+                thread
+                    .request_permission(request, cx)
+                    .expect("permission request")
+            });
+            cx.run_until_parked();
+            task
+        };
+
+        focus_message_editor(&thread_view, cx);
+        let first = request_plan_approval("plan-1", cx);
+        assert!(cx.debug_bounds("claude-code-permission-card").is_some());
+        assert!(cx.debug_bounds("claude-code-permission-plan").is_some());
+        assert!(cx.debug_bounds("claude-code-prompt-box").is_none());
+        assert!(
+            cx.debug_bounds("standalone-generic-permissions").is_none()
+                && cx.debug_bounds("claude-code-activity-bar").is_none(),
+            "only the card asks"
+        );
+        assert!(permission_card_is_focused(&thread_view, cx));
+        cx.simulate_keystrokes("1");
+        assert_eq!(selected_option(first.await), "exit-plan-auto");
+        cx.run_until_parked();
+
+        let second = request_plan_approval("plan-2", cx);
+        cx.simulate_keystrokes("escape");
+        assert_eq!(selected_option(second.await), "reject");
+        cx.run_until_parked();
+
+        let third = request_plan_approval("plan-3", cx);
+        cx.simulate_keystrokes("down enter");
+        assert_eq!(selected_option(third.await), "exit-plan-default");
+    }
+
+    #[gpui::test]
+    async fn test_switching_ui_style_rerenders_thread(cx: &mut TestAppContext) {
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![acp_v1::SessionUpdate::ToolCall(bash_tool_call())]);
+        let (thread_view, cx) = setup_thread_view(connection, cx).await;
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Run a command", cx))
+            .await
+            .expect("prompt should succeed");
+        cx.run_until_parked();
+
+        assert!(cx.debug_bounds("claude-code-user-message-0").is_none());
+        assert!(cx.debug_bounds("claude-code-tool-1").is_none());
+
+        set_ui_style("claude_code", cx);
+        assert!(cx.debug_bounds("claude-code-user-message-0").is_some());
+        assert!(cx.debug_bounds("claude-code-tool-1").is_some());
+
+        set_ui_style("zed", cx);
+        assert!(cx.debug_bounds("claude-code-user-message-0").is_none());
+        assert!(cx.debug_bounds("claude-code-tool-1").is_none());
+    }
+
+    fn placeholder(message_editor: &Entity<MessageEditor>, cx: &mut VisualTestContext) -> String {
+        message_editor.update(cx, |message_editor, cx| {
+            message_editor
+                .editor()
+                .update(cx, |editor, cx| editor.placeholder_text(cx))
+                .unwrap_or_default()
+        })
+    }
+
+    #[gpui::test]
+    async fn test_claude_code_prompt_box_floats_over_the_transcript(cx: &mut TestAppContext) {
+        let connection = StubAgentConnection::new();
+        let (thread_view, cx) = setup_thread_view(connection, cx).await;
+        let message_editor = thread_view.read_with(cx, |view, _| view.message_editor.clone());
+        let editor_mode = |cx: &mut VisualTestContext| {
+            message_editor.read_with(cx, |message_editor, cx| {
+                message_editor.editor().read(cx).mode().clone()
+            })
+        };
+        let zed_mode = editor_mode(cx);
+
+        set_ui_style("claude_code", cx);
+        cx.run_until_parked();
+        assert_eq!(
+            editor_mode(cx),
+            editor::EditorMode::AutoHeight {
+                min_lines: 1,
+                max_lines: Some(9),
+            },
+            "the prompt starts at one line"
+        );
+        let prompt_box = cx
+            .debug_bounds("claude-code-prompt-box")
+            .expect("prompt box is drawn");
+        assert!(
+            prompt_box.size.width <= px(680.),
+            "the prompt box is at most 680px wide, got {:?}",
+            prompt_box.size.width
+        );
+        let floating_height = thread_view.read_with(cx, |_, cx| {
+            thread_activity(thread_view.entity_id(), cx)
+                .map(|activity| activity.floating_prompt_height().get())
+        });
+        assert!(
+            floating_height.is_some_and(|height| height >= prompt_box.size.height),
+            "the transcript keeps the floating box's height clear"
+        );
+
+        set_ui_style("zed", cx);
+        cx.run_until_parked();
+        assert_eq!(editor_mode(cx), zed_mode);
+    }
+
+    #[gpui::test]
+    async fn test_claude_code_agents_chip_from_sdk_messages(cx: &mut TestAppContext) {
+        let connection = StubAgentConnection::new();
+        let (thread_view, cx) = setup_thread_view(connection, cx).await;
+        set_ui_style("claude_code", cx);
+        assert!(cx.debug_bounds("claude-code-agents-chip").is_none());
+
+        let session_id =
+            thread_view.read_with(cx, |view, cx| view.thread.read(cx).session_id().clone());
+        let send = |message: serde_json::Value, cx: &mut VisualTestContext| {
+            let session_id = session_id.clone();
+            cx.update(|_, cx| {
+                let notifications = agent_servers::AgentExtNotifications::global(cx);
+                notifications.update(cx, |_, cx| {
+                    cx.emit(agent_servers::AgentExtNotification {
+                        session_id: Some(session_id.clone()),
+                        method: "_claude/sdkMessage".into(),
+                        params: std::sync::Arc::new(json!({
+                            "sessionId": session_id.0.to_string(),
+                            "message": message,
+                        })),
+                    })
+                });
+            });
+            cx.run_until_parked();
+        };
+        send(
+            json!({
+                "type": "system",
+                "subtype": "task_started",
+                "task_id": "agent-1",
+                "tool_use_id": "toolu_1",
+                "description": "Explore agent UI architecture",
+                "subagent_type": "Explore",
+                "task_type": "local_agent",
+                "is_backgrounded": true,
+            }),
+            cx,
+        );
+        assert!(cx.debug_bounds("claude-code-agents-chip").is_some());
+        let live = thread_view.read_with(cx, |view, cx| {
+            let agents = agent_summaries(
+                view.thread.read(cx),
+                thread_activity(thread_view.entity_id(), cx),
+                Instant::now(),
+                cx,
+            );
+            crate::ui_styles::claude_code::live_agent_count(&agents)
+        });
+        assert_eq!(live, 1);
+
+        send(
+            json!({
+                "type": "system",
+                "subtype": "task_notification",
+                "task_id": "agent-1",
+                "status": "completed",
+                "output_file": "",
+                "summary": "",
+            }),
+            cx,
+        );
+        let live = thread_view.read_with(cx, |view, cx| {
+            let agents = agent_summaries(
+                view.thread.read(cx),
+                thread_activity(thread_view.entity_id(), cx),
+                Instant::now(),
+                cx,
+            );
+            crate::ui_styles::claude_code::live_agent_count(&agents)
+        });
+        assert_eq!(
+            live, 0,
+            "finished agents stay in the map but not in the count"
+        );
+        assert!(cx.debug_bounds("claude-code-agents-chip").is_some());
+    }
+
+    #[gpui::test]
+    async fn test_claude_code_status_item_follows_the_style(cx: &mut TestAppContext) {
+        let connection = StubAgentConnection::new();
+        let (thread_view, cx) = setup_thread_view(connection, cx).await;
+        let workspace = thread_view.read_with(cx, |view, _| view.workspace.clone());
+        let has_status_item = |cx: &mut VisualTestContext| {
+            workspace
+                .read_with(cx, |workspace, cx| {
+                    workspace
+                        .status_bar()
+                        .read(cx)
+                        .item_of_type::<crate::ui_styles::claude_code::ClaudeCodeStatusItem>()
+                        .is_some()
+                })
+                .expect("workspace")
+        };
+        assert!(!has_status_item(cx));
+        set_ui_style("claude_code", cx);
+        cx.run_until_parked();
+        assert!(has_status_item(cx));
+        set_ui_style("zed", cx);
+        cx.run_until_parked();
+        assert!(!has_status_item(cx));
+    }
+
+    #[gpui::test]
+    async fn test_claude_code_prompt_box(cx: &mut TestAppContext) {
+        let connection = StubAgentConnection::new();
+        let (thread_view, cx) = setup_thread_view(connection.clone(), cx).await;
+        let message_editor = thread_view.read_with(cx, |view, _| view.message_editor.clone());
+        let zed_placeholder = placeholder(&message_editor, cx);
+        assert!(cx.debug_bounds("claude-code-prompt-box").is_none());
+
+        set_ui_style("claude_code", cx);
+        assert!(cx.debug_bounds("claude-code-prompt-box").is_some());
+        assert_eq!(
+            placeholder(&message_editor, cx),
+            crate::ui_styles::claude_code::idle_placeholder()
+        );
+
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("Hello", window, cx);
+        });
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+        assert_eq!(placeholder(&message_editor, cx), "Queue another message…");
+
+        let session_id =
+            thread_view.read_with(cx, |view, cx| view.thread.read(cx).session_id().clone());
+        connection.end_turn(session_id, acp_v1::StopReason::EndTurn);
+        cx.run_until_parked();
+        assert_eq!(
+            placeholder(&message_editor, cx),
+            crate::ui_styles::claude_code::idle_placeholder()
+        );
+
+        set_ui_style("zed", cx);
+        assert!(cx.debug_bounds("claude-code-prompt-box").is_none());
+        assert_eq!(placeholder(&message_editor, cx), zed_placeholder);
+    }
+
+    #[gpui::test]
+    async fn test_claude_code_prompt_uses_ui_font(cx: &mut TestAppContext) {
+        let (_thread_view, cx) = setup_thread_view(StubAgentConnection::new(), cx).await;
+        let set_settings = |ui_style: &str, cx: &mut VisualTestContext| {
+            cx.update(|_window, cx| {
+                SettingsStore::update_global(cx, |store, cx| {
+                    store
+                        .set_user_settings(
+                            &format!(
+                                r#"{{
+                                    "ui_font_family": "Helvetica",
+                                    "buffer_font_family": "Menlo",
+                                    "agent": {{ "ui_style": "{ui_style}" }}
+                                }}"#
+                            ),
+                            cx,
+                        )
+                        .expect("valid settings");
+                });
+            });
+            cx.run_until_parked();
+        };
+        let zed_style = TextStyle {
+            font_family: "Menlo".into(),
+            ..TextStyle::default()
+        };
+        let prompt_font = |cx: &mut VisualTestContext| {
+            cx.update(|_window, cx| {
+                crate::ui_styles::message_editor_text_style(zed_style.clone(), cx).font_family
+            })
+        };
+
+        set_settings("zed", cx);
+        assert_eq!(prompt_font(cx).as_ref(), "Menlo");
+
+        set_settings("claude_code", cx);
+        assert_eq!(prompt_font(cx).as_ref(), "Helvetica");
+        assert_eq!(
+            cx.update(|_window, cx| ThemeSettings::get_global(cx).ui_font.family.clone())
+                .as_ref(),
+            "Helvetica"
+        );
+
+        set_settings("zed", cx);
+        assert_eq!(prompt_font(cx).as_ref(), "Menlo");
+    }
+
+    #[gpui::test]
+    async fn test_claude_code_slash_button_opens_commands(cx: &mut TestAppContext) {
+        let (thread_view, cx) = setup_thread_view(StubAgentConnection::new(), cx).await;
+        set_ui_style("claude_code", cx);
+        let message_editor = thread_view.read_with(cx, |view, _| view.message_editor.clone());
+
+        thread_view.update_in(cx, |view, window, cx| {
+            view.open_claude_code_slash_menu(window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            message_editor.read_with(cx, |editor, cx| editor.text(cx)),
+            "/"
+        );
+
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("explain", window, cx);
+            editor.editor().update(cx, |editor, cx| {
+                editor.move_to_end(&editor::actions::MoveToEnd, window, cx)
+            });
+        });
+        thread_view.update_in(cx, |view, window, cx| {
+            view.open_claude_code_slash_menu(window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            message_editor.read_with(cx, |editor, cx| editor.text(cx)),
+            "explain /"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_claude_code_add_context_types_a_mention(cx: &mut TestAppContext) {
+        let (thread_view, cx) = setup_thread_view(StubAgentConnection::new(), cx).await;
+        set_ui_style("claude_code", cx);
+        let message_editor = thread_view.read_with(cx, |view, _| view.message_editor.clone());
+
+        thread_view.update_in(cx, |view, window, cx| {
+            view.insert_claude_code_mention_trigger(window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            message_editor.read_with(cx, |editor, cx| editor.text(cx)),
+            "@"
+        );
+
+        // The cursor sits mid-word; the extension types at the end, after a space.
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("check these", window, cx);
+            editor.editor().update(cx, |editor, cx| {
+                editor.move_to_beginning(&editor::actions::MoveToBeginning, window, cx)
+            });
+        });
+        thread_view.update_in(cx, |view, window, cx| {
+            view.insert_claude_code_mention_trigger(window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            message_editor.read_with(cx, |editor, cx| editor.text(cx)),
+            "check these @"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_claude_code_context_ring_after_half_the_context(cx: &mut TestAppContext) {
+        let (thread_view, cx) = setup_thread_view(StubAgentConnection::new(), cx).await;
+        set_ui_style("claude_code", cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+
+        // 200k tokens leave 167k before auto-compact: 80k is under half of it.
+        thread.update(cx, |thread, cx| {
+            thread.update_usage(acp_v2::UsageUpdate::new(80_000, 200_000), cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("claude-code-context-ring").is_none());
+
+        thread.update(cx, |thread, cx| {
+            thread.update_usage(acp_v2::UsageUpdate::new(120_000, 200_000), cx)
+        });
+        cx.run_until_parked();
+        let ring = cx
+            .debug_bounds("claude-code-context-ring")
+            .expect("the ring shows once less than half is left");
+        let slash = cx
+            .debug_bounds("claude-code-slash-commands")
+            .expect("the slash button");
+        assert!(ring.left() > slash.left(), "the ring follows the / button");
+    }
+
+    #[gpui::test]
+    async fn test_claude_code_spinner_while_generating(cx: &mut TestAppContext) {
+        let connection = StubAgentConnection::new();
+        let (thread_view, cx) = setup_thread_view(connection.clone(), cx).await;
+        set_ui_style("claude_code", cx);
+
+        let message_editor = thread_view.read_with(cx, |view, _| view.message_editor.clone());
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("Hello", window, cx);
+        });
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("claude-code-spinner").is_some());
+
+        let session_id =
+            thread_view.read_with(cx, |view, cx| view.thread.read(cx).session_id().clone());
+        cx.update(|_window, cx| {
+            connection.send_update(
+                session_id.clone(),
+                acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(
+                    "Working on it".into(),
+                )),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("claude-code-spinner").is_some());
+
+        connection.end_turn(session_id, acp_v1::StopReason::EndTurn);
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("claude-code-spinner").is_none());
+    }
+
+    /// An AskUserQuestion tool call as claude-agent-acp 0.106.0 reports it over
+    /// ACP v1 once its input has streamed: the questions as display text.
+    fn ask_user_question_call(
+        id: &str,
+        questions: &serde_json::Value,
+        status: acp_v1::ToolCallStatus,
+    ) -> acp_v1::ToolCall {
+        let display = questions
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|question| question.get("question")?.as_str())
+            .map(|question| question.into())
+            .collect::<Vec<_>>();
+        acp_v1::ToolCall::new(id.to_string(), "Asking for your input")
+            .kind(acp_v1::ToolKind::Other)
+            .status(status)
+            .raw_input(json!({ "questions": questions }))
+            .content(display)
+            .meta(acp_v2::Meta::from_iter([(
+                "claudeCode".into(),
+                json!({ "toolName": "AskUserQuestion" }),
+            )]))
+    }
+
+    /// The elicitation claude-agent-acp 0.106.0 builds for these questions
+    /// (`askUserQuestionsToCreateRequest`).
+    fn ask_user_question_request(
+        session_id: &acp_v2::SessionId,
+        tool_call_id: &str,
+        questions: &serde_json::Value,
+    ) -> acp_v2::CreateElicitationRequest {
+        let questions = questions.as_array().cloned().unwrap_or_default();
+        let single = questions.len() == 1;
+        let mut properties = serde_json::Map::new();
+        for (index, question) in questions.iter().enumerate() {
+            let options = question["options"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|option| {
+                    let mut enum_option = json!({
+                        "const": option["label"],
+                        "title": option["label"],
+                    });
+                    if let Some(description) = option.get("description") {
+                        enum_option["description"] = description.clone();
+                    }
+                    if let Some(preview) = option.get("preview") {
+                        enum_option["_meta"] =
+                            json!({ "_claude/askUserQuestionOption": { "preview": preview } });
+                    }
+                    enum_option
+                })
+                .collect::<Vec<_>>();
+            let mut field = if question["multiSelect"].as_bool() == Some(true) {
+                json!({ "type": "array", "items": { "anyOf": options } })
+            } else {
+                json!({ "type": "string", "oneOf": options })
+            };
+            field["title"] = question["header"].clone();
+            if !single {
+                field["description"] = question["question"].clone();
+            }
+            properties.insert(format!("question_{index}"), field);
+            properties.insert(
+                format!("question_{index}_custom"),
+                json!({
+                    "type": "string",
+                    "title": "Other",
+                    "description": "Type your own answer, or add a note to the option you chose above (optional).",
+                }),
+            );
+        }
+        let message = if single {
+            questions[0]["question"].clone()
+        } else {
+            json!("Please answer the following questions.")
+        };
+        serde_json::from_value(json!({
+            "mode": "form",
+            "sessionId": session_id.0.to_string(),
+            "toolCallId": tool_call_id,
+            "message": message,
+            "requestedSchema": { "type": "object", "properties": properties },
+        }))
+        .expect("AskUserQuestion elicitation")
+    }
+
+    fn dock_and_features_questions() -> serde_json::Value {
+        json!([
+            {
+                "question": "Which panel should the agent dock into?",
+                "header": "Dock target",
+                "multiSelect": false,
+                "options": [
+                    { "label": "Right sidebar", "description": "Next to the editor." },
+                    { "label": "Bottom panel", "description": "Shares space with the terminal." }
+                ]
+            },
+            {
+                "question": "Which features do you want?",
+                "header": "Features",
+                "multiSelect": true,
+                "options": [
+                    { "label": "Inline diffs" },
+                    { "label": "Tool call rows" },
+                    { "label": "Codicon icons" }
+                ]
+            }
+        ])
+    }
+
+    /// Starts a turn that stays open, as a real one does while Claude asks.
+    async fn start_open_turn(
+        thread_view: &Entity<ThreadView>,
+        cx: &mut VisualTestContext,
+    ) -> acp_v2::SessionId {
+        let message_editor = thread_view.read_with(cx, |view, _| view.message_editor.clone());
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("Ask me some questions", window, cx);
+        });
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+        thread_view.read_with(cx, |view, cx| view.thread.read(cx).session_id().clone())
+    }
+
+    /// Adds the tool call and asks its questions, as claude-agent-acp does, and
+    /// returns the pending answer.
+    fn ask_questions(
+        thread_view: &Entity<ThreadView>,
+        connection: &StubAgentConnection,
+        session_id: &acp_v2::SessionId,
+        tool_call_id: &str,
+        questions: &serde_json::Value,
+        cx: &mut VisualTestContext,
+    ) -> Task<acp_v2::CreateElicitationResponse> {
+        cx.update(|_window, cx| {
+            connection.send_update(
+                session_id.clone(),
+                acp_v1::SessionUpdate::ToolCall(ask_user_question_call(
+                    tool_call_id,
+                    questions,
+                    acp_v1::ToolCallStatus::Pending,
+                )),
+                cx,
+            );
+        });
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let request = ask_user_question_request(session_id, tool_call_id, questions);
+        let response = thread.update(cx, |thread, cx| {
+            thread
+                .request_elicitation(request, cx)
+                .expect("the elicitation is valid")
+        });
+        cx.run_until_parked();
+        response
+    }
+
+    fn accepted_content(response: acp_v2::CreateElicitationResponse) -> serde_json::Value {
+        match response.action {
+            acp_v2::ElicitationAction::Accept(accept) => {
+                serde_json::to_value(accept.content).expect("content serializes")
+            }
+            other => panic!("expected the answers to be accepted, got {other:?}"),
+        }
+    }
+
+    /// The tool result claude-agent-acp reports once the CLI has the answers.
+    fn finish_question_call(
+        connection: &StubAgentConnection,
+        session_id: &acp_v2::SessionId,
+        tool_call_id: &str,
+        status: acp_v1::ToolCallStatus,
+        result: &str,
+        cx: &mut VisualTestContext,
+    ) {
+        cx.update(|_window, cx| {
+            connection.send_update(
+                session_id.clone(),
+                acp_v1::SessionUpdate::ToolCallUpdate(acp_v1::ToolCallUpdate::new(
+                    tool_call_id.to_string(),
+                    acp_v1::ToolCallUpdateFields::new()
+                        .status(status)
+                        .content(vec![result.into()])
+                        .raw_output(json!(result)),
+                )),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+    }
+
+    fn question_card(
+        thread_view: &Entity<ThreadView>,
+        cx: &mut VisualTestContext,
+    ) -> Option<(usize, usize, Vec<Vec<usize>>)> {
+        let thread_view_id = thread_view.entity_id();
+        cx.update(|_window, cx| {
+            crate::ui_styles::claude_code::question_card_state(thread_view_id, cx).map(|card| {
+                (
+                    card.active_question,
+                    card.highlighted_row,
+                    card.selections.clone(),
+                )
+            })
+        })
+    }
+
+    #[gpui::test]
+    async fn test_claude_code_question_card_keys(cx: &mut TestAppContext) {
+        let connection = StubAgentConnection::new();
+        let (thread_view, cx) = setup_thread_view(connection.clone(), cx).await;
+        set_ui_style("claude_code", cx);
+        bind_permission_keys(cx);
+        let session_id = start_open_turn(&thread_view, cx).await;
+        focus_message_editor(&thread_view, cx);
+
+        let questions = dock_and_features_questions();
+        let response = ask_questions(
+            &thread_view,
+            &connection,
+            &session_id,
+            "toolu_ask",
+            &questions,
+            cx,
+        );
+        assert!(cx.debug_bounds("claude-code-question-card").is_some());
+        assert!(
+            cx.debug_bounds("claude-code-prompt-box").is_none(),
+            "the card takes the prompt box's place"
+        );
+        assert!(
+            permission_card_is_focused(&thread_view, cx),
+            "focus moves from the prompt to the card"
+        );
+        assert!(cx.debug_bounds("claude-code-question-tab-1").is_some());
+        assert!(
+            cx.debug_bounds("claude-code-question-option-2").is_some(),
+            "Other follows the options"
+        );
+        assert!(cx.debug_bounds("claude-code-question-option-3").is_none());
+        assert!(
+            cx.debug_bounds("claude-code-tool-1-output").is_none(),
+            "the timeline shows the Questions row without the questions as OUT"
+        );
+
+        // A single choice moves on to the next question after a moment.
+        cx.simulate_keystrokes("down space");
+        assert_eq!(
+            question_card(&thread_view, cx),
+            Some((0, 1, vec![vec![1], vec![]]))
+        );
+        cx.executor().advance_clock(Duration::from_millis(300));
+        cx.run_until_parked();
+        assert_eq!(question_card(&thread_view, cx).map(|card| card.0), Some(1));
+
+        // Left and Right switch questions.
+        cx.simulate_keystrokes("left");
+        assert_eq!(question_card(&thread_view, cx).map(|card| card.0), Some(0));
+        cx.simulate_keystrokes("right");
+        assert_eq!(question_card(&thread_view, cx).map(|card| card.0), Some(1));
+
+        // Several choices toggle; `1` only submits once every question is answered.
+        cx.simulate_keystrokes("1");
+        assert!(cx.debug_bounds("claude-code-question-card").is_some());
+        cx.simulate_keystrokes("down space up space down down space space");
+        assert_eq!(
+            question_card(&thread_view, cx).map(|card| card.2),
+            Some(vec![vec![1], vec![1, 0]]),
+            "Codicon icons was chosen, then unchosen"
+        );
+        cx.simulate_keystrokes("1");
+        assert_eq!(
+            accepted_content(response.await),
+            json!({
+                "question_0": "Bottom panel",
+                "question_1": ["Tool call rows", "Inline diffs"],
+            })
+        );
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("claude-code-question-card").is_none());
+        assert!(cx.debug_bounds("claude-code-prompt-box").is_some());
+        let editor_focused = thread_view.update_in(cx, |view, window, cx| {
+            view.message_editor.focus_handle(cx).is_focused(window)
+        });
+        assert!(editor_focused, "focus returns to the prompt once answered");
+
+        finish_question_call(
+            &connection,
+            &session_id,
+            "toolu_ask",
+            acp_v1::ToolCallStatus::Completed,
+            "Your questions have been answered: \"Which panel should the agent dock into?\"=\"Bottom panel\", \"Which features do you want?\"=\"Tool call rows, Inline diffs\". You can now continue with these answers in mind.",
+            cx,
+        );
+        assert!(cx.debug_bounds("claude-code-question-status-1").is_some());
+        assert!(
+            cx.debug_bounds("claude-code-question-answer-1-0-1")
+                .is_some()
+        );
+        assert!(
+            cx.debug_bounds("claude-code-question-answer-1-0-0")
+                .is_none()
+        );
+        assert!(
+            cx.debug_bounds("claude-code-question-answer-1-1-0")
+                .is_some()
+        );
+        assert!(
+            cx.debug_bounds("claude-code-question-answer-1-1-1")
+                .is_some()
+        );
+        assert!(
+            cx.debug_bounds("claude-code-question-answer-1-1-2")
+                .is_none()
+        );
+        assert!(
+            cx.debug_bounds("claude-code-question-interrupted-1")
+                .is_none()
+        );
+        assert!(cx.debug_bounds("claude-code-tool-1-output").is_none());
+
+        // The status line hides and shows the questions.
+        let status = cx
+            .debug_bounds("claude-code-question-status-1")
+            .expect("the status line");
+        cx.simulate_click(status.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("claude-code-question-answer-1-0-1")
+                .is_none()
+        );
+    }
+
+    #[gpui::test]
+    async fn test_claude_code_question_card_other_and_enter(cx: &mut TestAppContext) {
+        let connection = StubAgentConnection::new();
+        let (thread_view, cx) = setup_thread_view(connection.clone(), cx).await;
+        set_ui_style("claude_code", cx);
+        bind_permission_keys(cx);
+        let session_id = start_open_turn(&thread_view, cx).await;
+        focus_message_editor(&thread_view, cx);
+
+        let questions = json!([{
+            "question": "Which database?",
+            "header": "Database",
+            "multiSelect": false,
+            "options": [
+                { "label": "Postgres", "description": "Relational", "preview": "CREATE TABLE t ();" },
+                { "label": "Redis", "description": "Key-value" }
+            ]
+        }]);
+        let response = ask_questions(
+            &thread_view,
+            &connection,
+            &session_id,
+            "toolu_db",
+            &questions,
+            cx,
+        );
+        assert!(
+            cx.debug_bounds("claude-code-question-preview").is_some(),
+            "an option with a preview shows the preview pane"
+        );
+
+        // Enter chooses the highlighted row until every question is answered;
+        // "Other" opens its text field.
+        cx.simulate_keystrokes("up enter");
+        let other_editor = thread_view
+            .read_with(cx, |_, cx| {
+                crate::ui_styles::claude_code::question_card_state(thread_view.entity_id(), cx)
+                    .and_then(|card| card.other_editors.first().cloned().flatten())
+            })
+            .expect("choosing Other opens its field");
+        let other_focused =
+            cx.update(|window, cx| other_editor.focus_handle(cx).is_focused(window));
+        assert!(other_focused, "the Other field takes focus");
+        cx.simulate_keystrokes("1");
+        cx.simulate_input(" SQLite");
+        assert_eq!(
+            other_editor.read_with(cx, |editor, cx| editor.text(cx)),
+            "1 SQLite",
+            "keys typed into the field stay there"
+        );
+
+        // The editor bindings the default keymap gives an auto-height editor.
+        cx.update(|_window, cx| {
+            cx.bind_keys([
+                KeyBinding::new(
+                    "shift-enter",
+                    editor::actions::Newline,
+                    Some("Editor && mode == auto_height"),
+                ),
+                KeyBinding::new("escape", editor::actions::Cancel, Some("Editor")),
+                KeyBinding::new("tab", editor::actions::Tab, Some("Editor")),
+            ]);
+        });
+        // Shift+Enter adds a line; Enter and Escape on the last question
+        // leave the field as it is, like the extension's textarea.
+        cx.simulate_keystrokes("shift-enter");
+        cx.simulate_input("in memory");
+        cx.simulate_keystrokes("enter escape");
+        assert_eq!(
+            other_editor.read_with(cx, |editor, cx| editor.text(cx)),
+            "1 SQLite\nin memory",
+        );
+        let other_focused =
+            cx.update(|window, cx| other_editor.focus_handle(cx).is_focused(window));
+        assert!(other_focused, "Enter and Escape keep focus in the field");
+
+        // Tab moves focus out of the field; Enter then submits.
+        cx.simulate_keystrokes("tab");
+        assert!(permission_card_is_focused(&thread_view, cx));
+        cx.simulate_keystrokes("enter");
+        assert_eq!(
+            accepted_content(response.await),
+            json!({ "question_0_custom": "1 SQLite\nin memory" })
+        );
+        cx.run_until_parked();
+
+        finish_question_call(
+            &connection,
+            &session_id,
+            "toolu_db",
+            acp_v1::ToolCallStatus::Completed,
+            "The user answered: \"Which database?\"=\"1 SQLite\". Read the answers carefully \u{2014} they may request clarification, changes, or that you not proceed \u{2014} and follow what they actually say.",
+            cx,
+        );
+        assert!(cx.debug_bounds("claude-code-question-status-1").is_some());
+        assert!(cx.debug_bounds("claude-code-question-other-1-0").is_some());
+        assert!(cx.debug_bounds("claude-code-question-typed-1-0").is_some());
+        assert!(
+            cx.debug_bounds("claude-code-question-answer-1-0-0")
+                .is_none()
+        );
+        assert!(
+            cx.debug_bounds("claude-code-question-answer-1-0-1")
+                .is_none()
+        );
+    }
+
+    #[gpui::test]
+    async fn test_claude_code_question_card_cancel(cx: &mut TestAppContext) {
+        let connection = StubAgentConnection::new();
+        let (thread_view, cx) = setup_thread_view(connection.clone(), cx).await;
+        set_ui_style("claude_code", cx);
+        bind_permission_keys(cx);
+        let session_id = start_open_turn(&thread_view, cx).await;
+        focus_message_editor(&thread_view, cx);
+
+        let questions = dock_and_features_questions();
+        let response = ask_questions(
+            &thread_view,
+            &connection,
+            &session_id,
+            "toolu_ask",
+            &questions,
+            cx,
+        );
+        assert!(permission_card_is_focused(&thread_view, cx));
+        cx.simulate_keystrokes("escape");
+        assert!(matches!(
+            response.await.action,
+            acp_v2::ElicitationAction::Cancel
+        ));
+        cx.run_until_parked();
+        assert_eq!(
+            connection.take_cancel_calls(),
+            vec![session_id],
+            "Esc interrupts the turn, as the extension's does"
+        );
+        assert!(cx.debug_bounds("claude-code-question-card").is_none());
+        assert!(cx.debug_bounds("claude-code-prompt-box").is_some());
+        assert!(cx.debug_bounds("claude-code-question-status-1").is_some());
+        assert!(
+            cx.debug_bounds("claude-code-question-interrupted-1")
+                .is_some()
+        );
+        assert!(
+            cx.debug_bounds("claude-code-question-answer-1-0-0")
+                .is_none()
+        );
+        assert!(cx.debug_bounds("claude-code-tool-1-output").is_none());
+    }
+
+    #[gpui::test]
+    async fn test_claude_code_question_rows_from_results(cx: &mut TestAppContext) {
+        let questions = dock_and_features_questions();
+        let result_update = |id: &str, status, result: &str| {
+            acp_v1::SessionUpdate::ToolCallUpdate(acp_v1::ToolCallUpdate::new(
+                id.to_string(),
+                acp_v1::ToolCallUpdateFields::new()
+                    .status(status)
+                    .content(vec![format!("```\n{result}\n```").into()])
+                    .raw_output(json!(result)),
+            ))
+        };
+        let pending = acp_v1::ToolCallStatus::Pending;
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![
+            acp_v1::SessionUpdate::ToolCall(ask_user_question_call("answered", &questions, pending)),
+            result_update(
+                "answered",
+                acp_v1::ToolCallStatus::Completed,
+                "Your questions have been answered: \"Which features do you want?\"=\"Codicon icons\". You can now continue with these answers in mind.",
+            ),
+            acp_v1::SessionUpdate::ToolCall(ask_user_question_call("aborted", &questions, pending)),
+            result_update(
+                "aborted",
+                acp_v1::ToolCallStatus::Failed,
+                "Tool permission request failed: Error: Tool use aborted",
+            ),
+            acp_v1::SessionUpdate::ToolCall(ask_user_question_call("skipped", &questions, pending)),
+            result_update(
+                "skipped",
+                acp_v1::ToolCallStatus::Completed,
+                "The user did not answer the questions.",
+            ),
+        ]);
+        let (thread_view, cx) = setup_thread_view(connection, cx).await;
+        set_ui_style("claude_code", cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Ask", cx))
+            .await
+            .expect("prompt should succeed");
+        cx.run_until_parked();
+
+        // A partial answer marks only the answered question's choice.
+        assert!(cx.debug_bounds("claude-code-question-status-1").is_some());
+        assert!(
+            cx.debug_bounds("claude-code-question-answer-1-1-2")
+                .is_some()
+        );
+        assert!(
+            cx.debug_bounds("claude-code-question-answer-1-0-0")
+                .is_none()
+        );
+        assert!(
+            cx.debug_bounds("claude-code-question-interrupted-1")
+                .is_none()
+        );
+
+        // An aborted question reads "Tool interrupted", not the raw error.
+        assert!(cx.debug_bounds("claude-code-question-status-2").is_some());
+        assert!(
+            cx.debug_bounds("claude-code-question-interrupted-2")
+                .is_some()
+        );
+        assert!(cx.debug_bounds("claude-code-tool-2-output").is_none());
+
+        assert!(cx.debug_bounds("claude-code-question-status-3").is_some());
+        assert!(
+            cx.debug_bounds("claude-code-question-interrupted-3")
+                .is_none()
+        );
+        assert!(cx.debug_bounds("claude-code-tool-3-output").is_none());
+    }
+}

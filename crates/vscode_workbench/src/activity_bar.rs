@@ -1,0 +1,843 @@
+use std::sync::Arc;
+
+use agent_settings::{AgentSettings, WindowLayout};
+use auto_update::AutoUpdater;
+use client::{Client, SignOut, UserStore, zed_urls};
+use gpui::{Action, Anchor, App, ClickEvent, Entity, Subscription, WeakEntity, svg};
+use project::DisableAiSettings;
+use settings::{Settings, SettingsStore};
+use title_bar::{UseAgenticLayout, UseClassicLayout};
+use ui::{
+    ButtonLike, ContextMenu, ContextMenuEntry, CountBadge, IconPosition, PopoverMenu, Tooltip,
+    prelude::*,
+};
+use workspace::{
+    DeploySearch, Workspace,
+    dock::{Dock, PanelButtons, PanelHandle},
+    notifications::{NotifyResultExt as _, NotifyTaskExt as _},
+};
+
+use crate::{
+    Codicon, DEBUG_PANEL_KEY, GIT_PANEL_KEY, PROJECT_PANEL_KEY, UseVsCodeLayout, WorkbenchSettings,
+    is_active_panel, panel_icon_path, reveal_panel,
+    status_items::{hide_status_items, restore_status_items},
+};
+
+const ACTIVITY_BAR_WIDTH: Pixels = px(48.);
+const ACTIVITY_BAR_ICON_SIZE: Pixels = px(24.);
+const ACTIVE_INDICATOR_WIDTH: Pixels = px(2.);
+
+pub(crate) fn init(cx: &mut App) {
+    cx.observe_new(|workspace: &mut Workspace, window, cx| {
+        let Some(window) = window else {
+            return;
+        };
+        apply_activity_bar_visibility(workspace, window, cx);
+        cx.observe_global_in::<SettingsStore>(window, apply_activity_bar_visibility)
+            .detach();
+    })
+    .detach();
+}
+
+fn apply_activity_bar_visibility(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let visible = WorkbenchSettings::get_global(cx).activity_bar.visible;
+    let installed = workspace
+        .leading_item()
+        .is_some_and(|item| item.downcast::<ActivityBar>().is_ok());
+    if visible == installed {
+        return;
+    }
+
+    if visible {
+        let activity_bar = cx.new(|cx| ActivityBar::new(workspace, cx));
+        workspace.set_leading_item(Some(activity_bar.into()), cx);
+        hide_status_items::<PanelButtons>(workspace, window, cx);
+    } else {
+        workspace.set_leading_item(None, cx);
+        restore_status_items::<PanelButtons>(workspace, window, cx);
+    }
+}
+
+enum ActivityBarEntry {
+    Panel(Arc<dyn PanelHandle>),
+    Search,
+    Extensions,
+}
+
+#[derive(Clone, Copy)]
+enum PrimarySideBarSlot {
+    Panel(&'static str),
+    Search,
+    Extensions,
+}
+
+/// The fixed order of VS Code's built-in view containers. Left dock panels without
+/// a slot follow in activation priority order.
+const PRIMARY_SIDE_BAR_ORDER: [PrimarySideBarSlot; 5] = [
+    PrimarySideBarSlot::Panel(PROJECT_PANEL_KEY),
+    PrimarySideBarSlot::Search,
+    PrimarySideBarSlot::Panel(GIT_PANEL_KEY),
+    PrimarySideBarSlot::Panel(DEBUG_PANEL_KEY),
+    PrimarySideBarSlot::Extensions,
+];
+
+fn has_fixed_slot(panel: &Arc<dyn PanelHandle>) -> bool {
+    PRIMARY_SIDE_BAR_ORDER.iter().any(|slot| {
+        matches!(slot, PrimarySideBarSlot::Panel(panel_key) if *panel_key == panel.panel_key())
+    })
+}
+
+/// Switches the primary side bar, which is the left dock. Panels in the right and
+/// bottom docks are reached through the dock headers instead, as in VS Code.
+pub struct ActivityBar {
+    workspace: WeakEntity<Workspace>,
+    left_dock: Entity<Dock>,
+    user_store: Entity<UserStore>,
+    client: Arc<Client>,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl ActivityBar {
+    fn new(workspace: &Workspace, cx: &mut Context<Self>) -> Self {
+        let left_dock = workspace.left_dock().clone();
+        let user_store = workspace.user_store().clone();
+
+        let subscriptions = vec![
+            cx.observe(&left_dock, |_, _, cx| cx.notify()),
+            cx.observe(&user_store, |_, _, cx| cx.notify()),
+            cx.observe_global::<SettingsStore>(|_, cx| cx.notify()),
+        ];
+
+        Self {
+            workspace: workspace.weak_handle(),
+            left_dock,
+            user_store,
+            client: workspace.client().clone(),
+            _subscriptions: subscriptions,
+        }
+    }
+
+    fn entries(&self, cx: &App) -> Vec<ActivityBarEntry> {
+        let left_panels = self
+            .left_dock
+            .read(cx)
+            .panels()
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let mut entries = Vec::with_capacity(left_panels.len() + 2);
+        for slot in PRIMARY_SIDE_BAR_ORDER {
+            match slot {
+                PrimarySideBarSlot::Panel(panel_key) => entries.extend(
+                    left_panels
+                        .iter()
+                        .find(|panel| panel.panel_key() == panel_key)
+                        .cloned()
+                        .map(ActivityBarEntry::Panel),
+                ),
+                PrimarySideBarSlot::Search => entries.push(ActivityBarEntry::Search),
+                PrimarySideBarSlot::Extensions => entries.push(ActivityBarEntry::Extensions),
+            }
+        }
+        entries.extend(
+            left_panels
+                .into_iter()
+                .filter(|panel| !has_fixed_slot(panel))
+                .map(ActivityBarEntry::Panel),
+        );
+        entries
+    }
+
+    fn toggle_panel(
+        &mut self,
+        panel: &Arc<dyn PanelHandle>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+
+        let (position, is_visible) = {
+            let dock = self.left_dock.read(cx);
+            (dock.position(), is_active_panel(dock, panel))
+        };
+
+        if is_visible {
+            workspace.update(cx, |workspace, cx| {
+                workspace.toggle_dock(position, window, cx);
+            });
+        } else {
+            reveal_panel(&self.left_dock, panel, window, cx);
+        }
+    }
+
+    fn render_panel_entry(
+        &self,
+        panel: Arc<dyn PanelHandle>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let icon_path = panel_icon_path(panel.as_ref(), window, cx)?;
+        let label = panel
+            .icon_tooltip(window, cx)
+            .unwrap_or_else(|| panel.persistent_name());
+        let is_active = is_active_panel(self.left_dock.read(cx), &panel);
+        let badge = panel
+            .icon_label(window, cx)
+            .filter(|_| !is_active)
+            .and_then(|icon_label| icon_label.parse::<usize>().ok());
+        let toggle_action = panel.toggle_action(window, cx);
+        let panel_key = panel.panel_key();
+
+        // The active state is part of the id so the cached tooltip is rebuilt when the
+        // panel is toggled from elsewhere, for example with a keybinding.
+        let button = activity_bar_button((panel_key, is_active as u64), icon_path, is_active, cx)
+            .aria_label(label)
+            .tooltip(move |_window, cx| Tooltip::for_action(label, &*toggle_action, cx))
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                this.toggle_panel(&panel, window, cx);
+            }));
+
+        Some(render_entry_cell(panel_key, is_active, button, badge, cx))
+    }
+
+    /// The account entries of Zed's title bar user menu, which the VS Code layout
+    /// hides. The rest of that menu is in the Manage menu.
+    fn render_accounts_menu(&self, cx: &App) -> impl IntoElement {
+        let client = self.client.clone();
+        let user_store = self.user_store.clone();
+        let workspace = self.workspace.clone();
+
+        PopoverMenu::new("activity-bar-accounts-menu")
+            .anchor(Anchor::BottomLeft)
+            .attach(Anchor::BottomRight)
+            .trigger_with_tooltip(
+                activity_bar_button("activity-bar-accounts", Codicon::Account.path(), false, cx)
+                    .aria_label("Accounts"),
+                Tooltip::text("Accounts"),
+            )
+            .menu(move |window, cx| {
+                let user_store_state = user_store.read(cx);
+                let username = user_store_state
+                    .current_user()
+                    .map(|user| user.username.clone());
+                let current_organization_id = user_store_state
+                    .current_organization()
+                    .map(|organization| organization.id.clone());
+                let organizations = user_store_state.organizations().clone();
+                let is_signing_in = username.is_none()
+                    && matches!(
+                        *client.status().borrow(),
+                        client::Status::Authenticating
+                            | client::Status::Authenticated
+                            | client::Status::Connecting
+                    );
+                let client = client.clone();
+                let user_store = user_store.clone();
+                let workspace = workspace.clone();
+
+                Some(ContextMenu::build(window, cx, move |menu, _window, _cx| {
+                    let Some(username) = username else {
+                        if is_signing_in {
+                            return menu.item(ContextMenuEntry::new("Signing In…").disabled(true));
+                        }
+                        let client = client.clone();
+                        let workspace = workspace.clone();
+                        return menu.entry("Sign In", None, move |_window, cx| {
+                            sign_in(client.clone(), workspace.clone(), cx);
+                        });
+                    };
+
+                    let menu =
+                        menu.header(username)
+                            .entry("Manage Account", None, |_window, cx| {
+                                cx.open_url(&zed_urls::account_url(cx))
+                            });
+                    let menu = if organizations.is_empty() {
+                        menu
+                    } else {
+                        organizations.iter().fold(
+                            menu.separator().header("Organization"),
+                            |menu, organization| {
+                                let is_current =
+                                    current_organization_id.as_ref() == Some(&organization.id);
+                                let organization = organization.clone();
+                                let user_store = user_store.clone();
+                                let workspace = workspace.clone();
+                                menu.toggleable_entry(
+                                    organization.name.clone(),
+                                    is_current,
+                                    IconPosition::Start,
+                                    None,
+                                    move |window, cx| {
+                                        let task = user_store.update(cx, |user_store, cx| {
+                                            user_store
+                                                .set_current_organization(organization.clone(), cx)
+                                        });
+                                        task.detach_and_notify_err(workspace.clone(), window, cx);
+                                    },
+                                )
+                            },
+                        )
+                    };
+                    menu.separator().action("Sign Out", SignOut.boxed_clone())
+                }))
+            })
+    }
+}
+
+/// Signs in like the title bar's Sign In button does, which reports failures
+/// in the workspace instead of only in the log.
+fn sign_in(client: Arc<Client>, workspace: WeakEntity<Workspace>, cx: &mut App) {
+    cx.spawn(async move |cx| {
+        client
+            .sign_in_with_optional_connect(true, cx)
+            .await
+            .notify_workspace_async_err(workspace, cx);
+    })
+    .detach();
+}
+
+impl Render for ActivityBar {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let top_entries = self
+            .entries(cx)
+            .into_iter()
+            .filter_map(|entry| match entry {
+                ActivityBarEntry::Panel(panel) => self.render_panel_entry(panel, window, cx),
+                ActivityBarEntry::Search => Some(render_action_entry(
+                    "search",
+                    Codicon::Search,
+                    "Search",
+                    DeploySearch::default().boxed_clone(),
+                    cx,
+                )),
+                ActivityBarEntry::Extensions => Some(render_action_entry(
+                    "extensions",
+                    Codicon::Extensions,
+                    "Extensions",
+                    zed_actions::Extensions::default().boxed_clone(),
+                    cx,
+                )),
+            })
+            .collect::<Vec<_>>();
+
+        let colors = cx.theme().colors();
+
+        v_flex()
+            .id("activity-bar")
+            .flex_none()
+            .h_full()
+            .w(ACTIVITY_BAR_WIDTH)
+            .justify_between()
+            .overflow_hidden()
+            .bg(colors.title_bar_background)
+            // Match the borders of the adjacent workspace element so the lines under
+            // the title bar and above the status bar span the whole window.
+            .border_t_1()
+            .border_b_1()
+            .border_r_1()
+            .border_color(colors.border)
+            .child(v_flex().min_h_0().overflow_hidden().children(top_entries))
+            .child(
+                v_flex()
+                    .flex_none()
+                    .child(render_entry_cell(
+                        "accounts",
+                        false,
+                        self.render_accounts_menu(cx),
+                        None,
+                        cx,
+                    ))
+                    .child(render_entry_cell(
+                        "manage",
+                        false,
+                        render_manage_menu(cx),
+                        None,
+                        cx,
+                    )),
+            )
+    }
+}
+
+fn activity_bar_button(
+    id: impl Into<ElementId>,
+    icon_path: impl Into<SharedString>,
+    is_active: bool,
+    cx: &App,
+) -> ButtonLike {
+    let icon_color = if is_active {
+        Color::Default
+    } else {
+        Color::Muted
+    };
+    let hover_color = Color::Default.color(cx);
+    ButtonLike::new(id)
+        .style(ButtonStyle::Transparent)
+        .width(ACTIVITY_BAR_WIDTH)
+        .height(ACTIVITY_BAR_WIDTH.into())
+        .child(
+            // `Icon` only exposes a hover color inside the `ui` crate, so the icon
+            // is drawn directly to brighten it on hover like VS Code does.
+            svg()
+                .path(icon_path.into())
+                .size(ACTIVITY_BAR_ICON_SIZE)
+                .flex_none()
+                .text_color(icon_color.color(cx))
+                .group_hover("", move |style| style.text_color(hover_color)),
+        )
+}
+
+fn render_entry_cell(
+    name: &'static str,
+    is_active: bool,
+    button: impl IntoElement,
+    badge: Option<usize>,
+    cx: &App,
+) -> AnyElement {
+    div()
+        .debug_selector(|| format!("activity-bar-cell-{name}"))
+        .relative()
+        .flex()
+        .flex_none()
+        .w_full()
+        .h(ACTIVITY_BAR_WIDTH)
+        .items_center()
+        .justify_center()
+        .when(is_active, |this| {
+            this.child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .top_0()
+                    .h_full()
+                    .w(ACTIVE_INDICATOR_WIDTH)
+                    .bg(cx.theme().colors().text_accent),
+            )
+        })
+        .child(
+            div()
+                .relative()
+                .child(button)
+                .when_some(badge, |this, count| this.child(CountBadge::new(count))),
+        )
+        .into_any_element()
+}
+
+fn render_action_entry(
+    name: &'static str,
+    codicon: Codicon,
+    label: &'static str,
+    action: Box<dyn Action>,
+    cx: &App,
+) -> AnyElement {
+    let tooltip_action = action.boxed_clone();
+    let button = activity_bar_button(
+        SharedString::from(format!("activity-bar-{name}")),
+        codicon.path(),
+        false,
+        cx,
+    )
+    .aria_label(label)
+    .tooltip(move |_window, cx| Tooltip::for_action(label, &*tooltip_action, cx))
+    .on_click(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx));
+    render_entry_cell(name, false, button, None, cx)
+}
+
+fn render_manage_menu(cx: &App) -> impl IntoElement {
+    PopoverMenu::new("activity-bar-manage-menu")
+        .anchor(Anchor::BottomLeft)
+        .attach(Anchor::BottomRight)
+        .trigger_with_tooltip(
+            activity_bar_button(
+                "activity-bar-manage",
+                Codicon::SettingsGear.path(),
+                false,
+                cx,
+            )
+            .aria_label("Manage"),
+            Tooltip::text("Manage"),
+        )
+        .menu(|window, cx| {
+            let is_update_downloaded = AutoUpdater::get(cx)
+                .is_some_and(|auto_updater| auto_updater.read(cx).status().is_updated());
+            let ai_enabled = !DisableAiSettings::get_global(cx).disable_ai;
+            let window_layout = AgentSettings::get_layout(cx);
+            let is_classic_layout = matches!(window_layout, WindowLayout::Editor(_));
+            let is_agentic_layout = matches!(window_layout, WindowLayout::Agent(_));
+            let is_custom_layout = matches!(window_layout, WindowLayout::Custom(_));
+
+            Some(ContextMenu::build(window, cx, move |menu, _window, _cx| {
+                menu.action(
+                    "Command Palette",
+                    zed_actions::command_palette::Toggle.boxed_clone(),
+                )
+                .separator()
+                .action("Settings", zed_actions::OpenSettings.boxed_clone())
+                .action("Keymap", zed_actions::OpenKeymap.boxed_clone())
+                .action(
+                    "Themes…",
+                    zed_actions::theme_selector::Toggle::default().boxed_clone(),
+                )
+                .action(
+                    "Icon Themes…",
+                    zed_actions::icon_theme_selector::Toggle::default().boxed_clone(),
+                )
+                .action(
+                    "Extensions",
+                    zed_actions::Extensions::default().boxed_clone(),
+                )
+                .separator()
+                .action("Use VS Code Layout", UseVsCodeLayout.boxed_clone())
+                .when(ai_enabled, |menu| {
+                    menu.submenu("Panel Layout", move |menu, _window, _cx| {
+                        menu.toggleable_entry(
+                            "Classic",
+                            is_classic_layout,
+                            IconPosition::Start,
+                            Some(UseClassicLayout.boxed_clone()),
+                            |window, cx| window.dispatch_action(UseClassicLayout.boxed_clone(), cx),
+                        )
+                        .toggleable_entry(
+                            "Agentic",
+                            is_agentic_layout,
+                            IconPosition::Start,
+                            Some(UseAgenticLayout.boxed_clone()),
+                            |window, cx| window.dispatch_action(UseAgenticLayout.boxed_clone(), cx),
+                        )
+                        .when(is_custom_layout, |menu| {
+                            menu.item(
+                                ContextMenuEntry::new("Custom")
+                                    .toggleable(IconPosition::Start, true)
+                                    .disabled(true),
+                            )
+                        })
+                    })
+                })
+                .separator()
+                .map(|menu| {
+                    if is_update_downloaded {
+                        menu.entry("Restart to Update", None, |_window, cx| {
+                            workspace::reload(cx)
+                        })
+                    } else {
+                        menu.action("Check for Updates", auto_update::Check.boxed_clone())
+                    }
+                })
+            }))
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{Empty, EntityId, Modifiers, TestAppContext, VisualTestContext};
+    use workspace::{
+        HideStatusItem, ItemHandle, StatusItemView,
+        dock::{DockPosition, Panel as _},
+    };
+
+    use crate::status_items::StatusItemPlaceholder;
+    use crate::test_support::{
+        AgentTestPanel, DebugTestPanel, ExplorerTestPanel, OutlineTestPanel,
+        SourceControlTestPanel, TerminalTestPanel, init_test, open_workspace,
+        update_workbench_settings,
+    };
+
+    #[derive(Debug, PartialEq)]
+    enum EntryKind {
+        Panel(EntityId),
+        Search,
+        Extensions,
+    }
+
+    struct TestStatusItem;
+
+    impl Render for TestStatusItem {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            Empty
+        }
+    }
+
+    impl StatusItemView for TestStatusItem {
+        fn set_active_pane_item(
+            &mut self,
+            _active_pane_item: Option<&dyn ItemHandle>,
+            _window: &mut Window,
+            _cx: &mut Context<Self>,
+        ) {
+        }
+
+        fn hide_setting(&self, _cx: &App) -> Option<HideStatusItem> {
+            None
+        }
+    }
+
+    fn set_activity_bar_visible(visible: bool, cx: &mut VisualTestContext) {
+        cx.update(|_window, cx| {
+            update_workbench_settings(cx, |workbench| {
+                workbench.activity_bar.get_or_insert_default().visible = Some(visible);
+            });
+        });
+        cx.run_until_parked();
+    }
+
+    fn installed_activity_bar(
+        workspace: &Entity<Workspace>,
+        cx: &mut VisualTestContext,
+    ) -> Option<Entity<ActivityBar>> {
+        workspace.read_with(cx, |workspace, _| {
+            workspace
+                .leading_item()
+                .and_then(|item| item.downcast::<ActivityBar>().ok())
+        })
+    }
+
+    fn entry_kinds(
+        activity_bar: &Entity<ActivityBar>,
+        cx: &mut VisualTestContext,
+    ) -> Vec<EntryKind> {
+        activity_bar.read_with(cx, |activity_bar, cx| {
+            activity_bar
+                .entries(cx)
+                .into_iter()
+                .map(|entry| match entry {
+                    ActivityBarEntry::Panel(panel) => EntryKind::Panel(panel.panel_id()),
+                    ActivityBarEntry::Search => EntryKind::Search,
+                    ActivityBarEntry::Extensions => EntryKind::Extensions,
+                })
+                .collect()
+        })
+    }
+
+    #[gpui::test]
+    async fn test_activity_bar_replaces_panel_buttons(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (workspace, cx) = open_workspace(cx).await;
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let test_item = cx.new(|_| TestStatusItem);
+            workspace.status_bar().update(cx, |status_bar, cx| {
+                status_bar.add_left_item(test_item, window, cx);
+            });
+        });
+
+        let (initial_buttons_position, initial_item_position, initial_buttons) = workspace
+            .read_with(cx, |workspace, cx| {
+                let status_bar = workspace.status_bar().read(cx);
+                (
+                    status_bar.position_of_item::<PanelButtons>(),
+                    status_bar.position_of_item::<TestStatusItem>(),
+                    status_bar
+                        .item_of_type::<PanelButtons>()
+                        .map(|item| item.entity_id()),
+                )
+            });
+        assert_eq!(initial_buttons_position, Some(0));
+        assert_eq!(initial_item_position, Some(1));
+        assert!(installed_activity_bar(&workspace, cx).is_none());
+
+        set_activity_bar_visible(true, cx);
+        assert!(installed_activity_bar(&workspace, cx).is_some());
+        workspace.read_with(cx, |workspace, cx| {
+            let status_bar = workspace.status_bar().read(cx);
+            assert!(status_bar.item_of_type::<PanelButtons>().is_none());
+            assert_eq!(
+                status_bar.position_of_item::<StatusItemPlaceholder<PanelButtons>>(),
+                initial_buttons_position
+            );
+            assert_eq!(
+                status_bar.position_of_item::<TestStatusItem>(),
+                initial_item_position
+            );
+        });
+
+        set_activity_bar_visible(false, cx);
+        assert!(installed_activity_bar(&workspace, cx).is_none());
+        workspace.read_with(cx, |workspace, cx| {
+            let status_bar = workspace.status_bar().read(cx);
+            assert!(
+                status_bar
+                    .item_of_type::<StatusItemPlaceholder<PanelButtons>>()
+                    .is_none()
+            );
+            assert_eq!(
+                status_bar.position_of_item::<PanelButtons>(),
+                initial_buttons_position
+            );
+            assert_eq!(
+                status_bar.position_of_item::<TestStatusItem>(),
+                initial_item_position
+            );
+            assert_eq!(
+                status_bar
+                    .item_of_type::<PanelButtons>()
+                    .map(|item| item.entity_id()),
+                initial_buttons
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_activity_bar_installed_for_new_workspace(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            update_workbench_settings(cx, |workbench| {
+                workbench.activity_bar.get_or_insert_default().visible = Some(true);
+            });
+        });
+        let (workspace, cx) = open_workspace(cx).await;
+
+        assert!(installed_activity_bar(&workspace, cx).is_some());
+        workspace.read_with(cx, |workspace, cx| {
+            let status_bar = workspace.status_bar().read(cx);
+            assert!(status_bar.item_of_type::<PanelButtons>().is_none());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_activity_bar_toggles_panel_dock(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (workspace, cx) = open_workspace(cx).await;
+        set_activity_bar_visible(true, cx);
+
+        let panel = ExplorerTestPanel::add(&workspace, DockPosition::Left, 100, cx);
+        cx.run_until_parked();
+
+        let activity_bar =
+            installed_activity_bar(&workspace, cx).expect("activity bar should be installed");
+        let left_dock = workspace.read_with(cx, |workspace, _| workspace.left_dock().clone());
+        let panel_handle = left_dock
+            .read_with(cx, |dock, _| {
+                dock.panels()
+                    .find(|handle| handle.panel_id() == panel.entity_id())
+                    .cloned()
+            })
+            .expect("panel should be in the left dock");
+        assert!(!left_dock.read_with(cx, |dock, _| dock.is_open()));
+
+        activity_bar.update_in(cx, |activity_bar, window, cx| {
+            activity_bar.toggle_panel(&panel_handle, window, cx);
+        });
+        cx.run_until_parked();
+        left_dock.read_with(cx, |dock, _| {
+            assert!(dock.is_open(), "clicking a hidden panel opens its dock");
+            assert_eq!(
+                dock.active_panel()
+                    .map(|active_panel| active_panel.panel_id()),
+                Some(panel.entity_id())
+            );
+        });
+
+        activity_bar.update_in(cx, |activity_bar, window, cx| {
+            activity_bar.toggle_panel(&panel_handle, window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            !left_dock.read_with(cx, |dock, _| dock.is_open()),
+            "clicking the visible panel closes its dock"
+        );
+    }
+
+    fn click_cell(cell: &'static str, cx: &mut VisualTestContext) {
+        let bounds = cx
+            .debug_bounds(cell)
+            .unwrap_or_else(|| panic!("{cell} should be rendered"));
+        cx.simulate_click(bounds.center(), Modifiers::none());
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_activity_bar_menus_cover_user_menu(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (_workspace, cx) = open_workspace(cx).await;
+        set_activity_bar_visible(true, cx);
+
+        click_cell("activity-bar-cell-accounts", cx);
+        assert!(
+            cx.debug_bounds("MENU_ITEM-Sign In").is_some(),
+            "signed out, the accounts menu offers to sign in"
+        );
+        click_cell("activity-bar-cell-accounts", cx);
+        assert!(
+            cx.debug_bounds("MENU_ITEM-Sign In").is_none(),
+            "clicking the button again closes the menu"
+        );
+
+        click_cell("activity-bar-cell-manage", cx);
+        for entry in [
+            "MENU_ITEM-Command Palette",
+            "MENU_ITEM-Settings",
+            "MENU_ITEM-Keymap",
+            "MENU_ITEM-Themes…",
+            "MENU_ITEM-Icon Themes…",
+            "MENU_ITEM-Extensions",
+            "MENU_ITEM-Use VS Code Layout",
+            "MENU_ITEM-Check for Updates",
+        ] {
+            assert!(
+                cx.debug_bounds(entry).is_some(),
+                "the manage menu should have {entry}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn test_activity_bar_entry_order(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (workspace, cx) = open_workspace(cx).await;
+        set_activity_bar_visible(true, cx);
+
+        let agent = AgentTestPanel::add(&workspace, DockPosition::Left, 5, cx);
+        let outline = OutlineTestPanel::add(&workspace, DockPosition::Left, 10, cx);
+        let debug = DebugTestPanel::add(&workspace, DockPosition::Left, 20, cx);
+        let explorer = ExplorerTestPanel::add(&workspace, DockPosition::Left, 30, cx);
+        let source_control = SourceControlTestPanel::add(&workspace, DockPosition::Left, 40, cx);
+        TerminalTestPanel::add(&workspace, DockPosition::Bottom, 1, cx);
+        cx.run_until_parked();
+
+        let activity_bar =
+            installed_activity_bar(&workspace, cx).expect("activity bar should be installed");
+        assert_eq!(
+            entry_kinds(&activity_bar, cx),
+            vec![
+                EntryKind::Panel(explorer.entity_id()),
+                EntryKind::Search,
+                EntryKind::Panel(source_control.entity_id()),
+                EntryKind::Panel(debug.entity_id()),
+                EntryKind::Extensions,
+                EntryKind::Panel(agent.entity_id()),
+                EntryKind::Panel(outline.entity_id()),
+            ],
+            "VS Code's containers come first in their fixed order, then the remaining \
+             left dock panels by activation priority; other docks are left out"
+        );
+
+        explorer.update_in(cx, |panel, window, cx| {
+            panel.set_position(DockPosition::Right, window, cx);
+        });
+        debug.update_in(cx, |panel, window, cx| {
+            panel.set_position(DockPosition::Right, window, cx);
+        });
+        agent.update_in(cx, |panel, window, cx| {
+            panel.set_position(DockPosition::Right, window, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            entry_kinds(&activity_bar, cx),
+            vec![
+                EntryKind::Search,
+                EntryKind::Panel(source_control.entity_id()),
+                EntryKind::Extensions,
+                EntryKind::Panel(outline.entity_id()),
+            ],
+            "panels moved out of the left dock disappear, Search and Extensions stay"
+        );
+    }
+}

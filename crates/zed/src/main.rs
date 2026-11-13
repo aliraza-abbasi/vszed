@@ -668,6 +668,7 @@ fn main() {
         auto_update::init(client.clone(), cx);
         dap_adapters::init(cx);
         auto_update_ui::init(cx);
+        upstream_release_notifier::init(cx);
         reliability::init(client.clone(), app_state.workspace_store.clone(), cx);
         extension_host::init(
             extension_host_proxy.clone(),
@@ -784,6 +785,7 @@ fn main() {
         call::init(app_state.client.clone(), app_state.user_store.clone(), cx);
         notifications::init(app_state.client.clone(), app_state.user_store.clone(), cx);
         collab_ui::init(&app_state, cx);
+        vscode_workbench::init(cx);
         git_ui::init(cx);
         feedback::init(cx);
         markdown_preview::init(cx);

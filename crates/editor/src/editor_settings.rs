@@ -141,6 +141,7 @@ pub struct Minimap {
     pub thumb_border: MinimapThumbBorder,
     pub current_line_highlight: Option<CurrentLineHighlight>,
     pub max_width_columns: num::NonZeroU32,
+    pub line_height: Option<theme_settings::BufferLineHeight>,
 }
 
 impl Minimap {
@@ -287,6 +288,9 @@ impl Settings for EditorSettings {
                 thumb_border: minimap.thumb_border.unwrap(),
                 current_line_highlight: minimap.current_line_highlight,
                 max_width_columns: minimap.max_width_columns.unwrap(),
+                line_height: minimap
+                    .line_height
+                    .map(theme_settings::buffer_line_height_from_settings),
             },
             gutter: Gutter {
                 min_line_number_digits: gutter.min_line_number_digits.unwrap(),

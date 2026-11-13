@@ -231,6 +231,8 @@ pub struct TitleBar {
     update_version: Entity<UpdateVersion>,
     screen_share_popover_handle: PopoverMenuHandle<ContextMenu>,
     _diagnostics_subscription: Option<gpui::Subscription>,
+    center_item: Option<AnyView>,
+    trailing_item: Option<AnyView>,
 }
 
 impl Render for TitleBar {
@@ -254,7 +256,7 @@ impl Render for TitleBar {
 
         let show_menus = show_menus(cx);
 
-        let mut children = <ArrayVec<_, 5>>::new();
+        let mut children = <ArrayVec<_, 6>>::new();
 
         let mut project_name = None;
         let mut repository = None;
@@ -362,6 +364,17 @@ impl Render for TitleBar {
                 .into_any_element(),
         );
 
+        if let Some(center_item) = self.center_item.clone() {
+            children.push(
+                h_flex()
+                    .absolute()
+                    .inset_0()
+                    .justify_center()
+                    .child(center_item)
+                    .into_any_element(),
+            );
+        }
+
         children.push(self.render_collaborator_list(window, cx).into_any_element());
 
         if title_bar_settings.show_onboarding_banner {
@@ -391,6 +404,7 @@ impl Render for TitleBar {
                 .pr_1()
                 .gap_1()
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .children(self.trailing_item.clone())
                 .child(self.render_call_controls(window, cx))
                 .children(self.render_connection_status(status, cx))
                 .child(self.update_version.clone())
@@ -545,6 +559,8 @@ impl TitleBar {
             update_version,
             screen_share_popover_handle: PopoverMenuHandle::default(),
             _diagnostics_subscription: None,
+            center_item: None,
+            trailing_item: None,
         };
 
         this.observe_diagnostics(cx);
@@ -554,6 +570,30 @@ impl TitleBar {
 
     fn worktree_count(&self, cx: &App) -> usize {
         self.project.read(cx).visible_worktrees(cx).count()
+    }
+
+    pub fn workspace(&self) -> &WeakEntity<Workspace> {
+        &self.workspace
+    }
+
+    /// Shows a view centered over the full width of the title bar.
+    pub fn set_center_item(&mut self, item: Option<AnyView>, cx: &mut Context<Self>) {
+        self.center_item = item;
+        cx.notify();
+    }
+
+    pub fn center_item(&self) -> Option<&AnyView> {
+        self.center_item.as_ref()
+    }
+
+    /// Shows a view right before the items at the end of the title bar.
+    pub fn set_trailing_item(&mut self, item: Option<AnyView>, cx: &mut Context<Self>) {
+        self.trailing_item = item;
+        cx.notify();
+    }
+
+    pub fn trailing_item(&self) -> Option<&AnyView> {
+        self.trailing_item.as_ref()
     }
 
     fn toggle_update_simulation(&mut self, cx: &mut Context<Self>) {

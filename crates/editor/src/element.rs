@@ -1645,16 +1645,8 @@ impl EditorElement {
             top_right_anchor,
             size(minimap_width, editor_bounds.size.height),
         );
-        let minimap_line_height = self.get_minimap_line_height(
-            minimap_editor
-                .read(cx)
-                .text_style_refinement
-                .as_ref()
-                .and_then(|refinement| refinement.font_size)
-                .unwrap_or(MINIMAP_FONT_SIZE),
-            window,
-            cx,
-        );
+        let minimap_style = minimap_editor.read(cx).text_style_refinement.clone();
+        let minimap_line_height = self.get_minimap_line_height(minimap_style.as_ref(), window, cx);
         let minimap_height = minimap_bounds.size.height;
 
         let visible_editor_lines = (editor_bounds.size.height / line_height) as f64;
@@ -1722,13 +1714,18 @@ impl EditorElement {
 
     fn get_minimap_line_height(
         &self,
-        font_size: AbsoluteLength,
+        minimap_style: Option<&TextStyleRefinement>,
         window: &mut Window,
         cx: &mut App,
     ) -> Pixels {
         let rem_size = self.rem_size(cx).unwrap_or(window.rem_size());
         let mut text_style = self.style.text.clone();
-        text_style.font_size = font_size;
+        text_style.font_size = minimap_style
+            .and_then(|style| style.font_size)
+            .unwrap_or(MINIMAP_FONT_SIZE);
+        if let Some(line_height) = minimap_style.and_then(|style| style.line_height) {
+            text_style.line_height = line_height;
+        }
         text_style.line_height_in_pixels(rem_size)
     }
 
@@ -11427,7 +11424,7 @@ mod tests {
         Editor, FoldPlaceholder, HighlightKey, Inlay, MultiBuffer, NavigationOverlayKey,
         NavigationOverlayLabel, NavigationTargetOverlay, SelectionEffects,
         display_map::{BlockPlacement, BlockProperties, DisplayMap},
-        editor_tests::{init_test, update_test_language_settings},
+        editor_tests::{init_test, update_test_editor_settings, update_test_language_settings},
     };
     use buffer_diff::BufferDiff;
     use gpui::{
@@ -11491,6 +11488,58 @@ mod tests {
             assert!(!has_highlight_underline(editor, &minimap_style, cx));
         })
         .expect("checked full editor and minimap");
+    }
+
+    #[gpui::test]
+    fn test_minimap_line_height_setting(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        update_test_editor_settings(cx, &|settings| {
+            settings.minimap.get_or_insert_default().show = Some(ShowMinimap::Always);
+        });
+        let window = cx.add_window(|window, cx| {
+            let buffer = MultiBuffer::build_simple(&sample_text(200, 40, 'a'), cx);
+            Editor::new(EditorMode::full(), buffer, None, window, cx)
+        });
+        let cx = &mut VisualTestContext::from_window(*window, cx);
+        let editor = window.root(cx).unwrap();
+        let style = cx.update(|_, cx| editor.update(cx, |editor, cx| editor.style(cx).clone()));
+
+        // The line height the minimap is laid out with must match the one its
+        // editor renders with, or the thumb drifts from the visible lines.
+        let minimap_line_heights =
+            |cx: &mut VisualTestContext| {
+                cx.update(|window, cx| {
+                    let minimap = editor
+                        .read(cx)
+                        .minimap()
+                        .cloned()
+                        .expect("the editor should have a minimap");
+                    let minimap_style = minimap.read(cx).text_style_refinement.clone();
+                    let laid_out = EditorElement::new(&editor, style.clone())
+                        .get_minimap_line_height(minimap_style.as_ref(), window, cx);
+                    let rendered = minimap
+                        .read(cx)
+                        .create_style(cx)
+                        .text
+                        .line_height_in_pixels(window.rem_size());
+                    (laid_out, rendered)
+                })
+            };
+
+        // The 2px minimap font at the default comfortable buffer line height
+        // (1.618), rounded to whole pixels.
+        assert_eq!(
+            minimap_line_heights(cx),
+            (px(3.), px(3.)),
+            "the minimap inherits the buffer line height by default"
+        );
+
+        update_test_editor_settings(cx, &|settings| {
+            settings.minimap.get_or_insert_default().line_height =
+                Some(settings::BufferLineHeight::Custom(1.0));
+        });
+        cx.run_until_parked();
+        assert_eq!(minimap_line_heights(cx), (px(2.), px(2.)));
     }
 
     struct MinimapGeometry {

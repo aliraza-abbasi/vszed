@@ -61,6 +61,9 @@ use super::subagent_card::{
 };
 use super::*;
 
+#[path = "../ui_styles/claude_code/thread.rs"]
+mod claude_code_thread;
+
 /// How a parent's view names a subagent. An ACP parent's own title for the subagent
 /// describes it in that view, so it wins over the subagent's title for itself.
 pub(super) fn subagent_label(thread: &AcpThread) -> SharedString {
@@ -3993,6 +3996,9 @@ impl ThreadView {
 
     fn activity_bar_bg(&self, cx: &Context<Self>) -> Hsla {
         let editor_bg_color = cx.theme().colors().editor_background;
+        if crate::ui_styles::claude_code_style_enabled(cx) {
+            return editor_bg_color;
+        }
         let active_color = cx.theme().colors().element_selected;
         editor_bg_color.blend(active_color.opacity(0.3))
     }
@@ -4002,6 +4008,10 @@ impl ThreadView {
         window: &mut Window,
         cx: &Context<Self>,
     ) -> Option<AnyElement> {
+        if crate::ui_styles::claude_code_style_enabled(cx) {
+            // Drawn with the prompt box, floating over the transcript.
+            return None;
+        }
         let thread = self.thread.read(cx);
         let action_log = thread.action_log();
         let telemetry = ActionLogTelemetry::from(thread);
@@ -5562,6 +5572,10 @@ impl ThreadView {
                         .filter(|view| view.read(cx).is_read_only()),
                 )
                 .into_any_element();
+        }
+        if crate::ui_styles::claude_code_style_enabled(cx) {
+            // Floats over the transcript; see `render_ui_style_conversation`.
+            return Empty.into_any_element();
         }
 
         let focus_handle = self.message_editor.focus_handle(cx);
@@ -7406,6 +7420,9 @@ fn sandbox_network_rows(network: &SandboxNetPolicy) -> Vec<SandboxRow> {
 
 impl ThreadView {
     fn render_entries(&mut self, cx: &mut Context<Self>) -> List {
+        if crate::ui_styles::claude_code_style_enabled(cx) {
+            return self.render_claude_code_entries(cx);
+        }
         let max_content_width = AgentSettings::get_global(cx).max_content_width;
         let centered_container = move |content: AnyElement| {
             h_flex().w_full().justify_center().child(
@@ -14324,7 +14341,7 @@ impl Render for ThreadView {
                     .flatten(),
                 |this, bar| this.child(bar),
             )
-            .child(conversation)
+            .child(self.render_ui_style_conversation(conversation, window, cx))
             .children(self.render_multi_root_callout(cx))
             .children(self.render_activity_bar(window, cx))
             .when_some(
