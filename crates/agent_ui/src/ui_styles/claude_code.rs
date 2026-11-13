@@ -1076,6 +1076,19 @@ pub(crate) fn sent_message_text(blocks: &[acp_v2::ContentBlock], path_style: Pat
 /// size, which Zed's labels reach at 14/16 of the UI font size.
 const TRANSCRIPT_FONT_RATIO: f32 = 14. / 16.;
 
+/// The extension sizes its side bar in `em`s of VS Code's chat font size, whose
+/// Zed counterpart is the agent UI font size. The base sits a step above the
+/// transcript's because Zed's UI font reads smaller than VS Code's system font.
+const SIDE_BAR_FONT_RATIO: f32 = 15. / 16.;
+
+/// A side bar label `em` times the side bar's base size, so it follows the
+/// agent font size settings and actions.
+pub(crate) fn side_bar_label_size(em: f32, cx: &App) -> LabelSize {
+    let settings = ThemeSettings::get_global(cx);
+    let agent_scale = settings.agent_ui_font_size(cx) / settings.ui_font_size(cx);
+    LabelSize::Custom(rems(agent_scale * SIDE_BAR_FONT_RATIO * em))
+}
+
 /// The agent markdown style, scaled to the size of the transcript's labels.
 pub(crate) fn transcript_markdown_style(window: &Window, cx: &App) -> MarkdownStyle {
     let mut style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);

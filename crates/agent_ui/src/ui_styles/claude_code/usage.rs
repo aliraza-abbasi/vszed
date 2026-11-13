@@ -15,6 +15,7 @@ use serde_json::Value;
 use ui::prelude::*;
 
 use crate::conversation_view::ThreadView;
+use crate::ui_styles::claude_code::side_bar_label_size;
 
 /// The usage update `_meta` key claude-agent-acp puts the Claude CLI's
 /// `rate_limit_info` under.
@@ -856,28 +857,33 @@ pub(crate) fn render_account_and_usage(
         .px_3()
         .pb_2()
         .gap_1()
-        .child(subheading("Account"))
+        .child(subheading("Account", cx))
         .child(
             h_flex()
                 .w_full()
                 .items_start()
                 .justify_between()
                 .gap_3()
-                .child(Label::new("Email").flex_none())
+                .child(
+                    Label::new("Email")
+                        .size(side_bar_label_size(1., cx))
+                        .flex_none(),
+                )
                 .child(
                     div().flex_1().min_w_0().text_right().child(match email {
                         Some(email) => Label::new(email)
+                            .size(side_bar_label_size(1., cx))
                             .single_line()
                             .truncate()
                             .into_any_element(),
                         None => Label::new("Not available")
-                            .size(LabelSize::Small)
+                            .size(side_bar_label_size(0.9, cx))
                             .color(Color::Muted)
                             .into_any_element(),
                     }),
                 ),
         )
-        .child(div().pt_2().child(subheading("Usage")))
+        .child(div().pt_2().child(subheading("Usage", cx)))
         .map(|this| {
             if windows.is_empty() {
                 this.child(
@@ -885,12 +891,12 @@ pub(crate) fn render_account_and_usage(
                         .debug_selector(|| "claude-code-usage-empty".to_string())
                         .child(
                             Label::new("Usage appears after Claude's next reply")
-                                .size(LabelSize::Small)
+                                .size(side_bar_label_size(0.9, cx))
                                 .color(Color::Muted),
                         )
                         .child(
                             Label::new("Claude reports plan limits for claude.ai sign-ins only")
-                                .size(LabelSize::XSmall)
+                                .size(side_bar_label_size(0.8, cx))
                                 .color(Color::Muted),
                         ),
                 )
@@ -904,9 +910,9 @@ pub(crate) fn render_account_and_usage(
         })
 }
 
-fn subheading(text: &'static str) -> impl IntoElement {
+fn subheading(text: &'static str, cx: &App) -> impl IntoElement {
     Label::new(text.to_uppercase())
-        .size(LabelSize::Small)
+        .size(side_bar_label_size(0.9, cx))
         .weight(FontWeight::SEMIBOLD)
         .color(Color::Muted)
 }
@@ -959,10 +965,15 @@ fn render_usage_window(window: &UsageWindow, cx: &App) -> impl IntoElement {
                 .w_full()
                 .justify_between()
                 .gap_2()
-                .child(Label::new(window.label()).truncate())
+                .child(
+                    Label::new(window.label())
+                        .size(side_bar_label_size(1., cx))
+                        .truncate(),
+                )
                 .when_some(window.utilization, |this, utilization| {
                     this.child(
                         Label::new(format_percent(utilization))
+                            .size(side_bar_label_size(1., cx))
                             .color(percent_color)
                             .flex_none(),
                     )
@@ -974,7 +985,7 @@ fn render_usage_window(window: &UsageWindow, cx: &App) -> impl IntoElement {
         .when(!details.is_empty(), |this| {
             this.child(
                 Label::new(details)
-                    .size(LabelSize::XSmall)
+                    .size(side_bar_label_size(0.8, cx))
                     .color(Color::Muted),
             )
         })
