@@ -67,29 +67,24 @@ pub(crate) struct ListedSession {
     pub updated_at: Option<DateTime<Utc>>,
 }
 
-/// Keeps the sessions whose working directory is exactly one of the project's
-/// roots. Claude keys history by the exact directory, so another git worktree
-/// of the same repository is a different project.
-pub(crate) fn sessions_for_roots(
+/// The sessions the adapter listed for `root`, which is Claude's history folder
+/// for that exact directory (another git worktree is a different project).
+///
+/// A session's reported directory is the first one its transcript recorded, so
+/// it isn't filtered on: it differs from `root` for a session started before the
+/// repository moved, or one whose first prompt ran in a subdirectory, and the
+/// extension lists those too.
+pub(crate) fn sessions_for_root(
     sessions: Vec<AgentSessionInfo>,
     root: &Path,
 ) -> Vec<ListedSession> {
     sessions
         .into_iter()
-        .filter_map(|session| {
-            let work_dirs = session.work_dirs.as_ref();
-            // The adapter filters by `cwd` itself; the returned directories are
-            // checked too so that an adapter ignoring `cwd` can't leak other
-            // projects into the list.
-            let matches_root = work_dirs.is_none_or(|work_dirs| {
-                work_dirs.paths().iter().any(|path| path.as_path() == root)
-            });
-            matches_root.then(|| ListedSession {
-                session_id: session.session_id,
-                cwd: root.to_path_buf(),
-                title: session.title,
-                updated_at: session.updated_at,
-            })
+        .map(|session| ListedSession {
+            session_id: session.session_id,
+            cwd: root.to_path_buf(),
+            title: session.title,
+            updated_at: session.updated_at,
         })
         .collect()
 }
@@ -1455,7 +1450,7 @@ async fn list_sessions_in(
             ..Default::default()
         };
         let response = cx.update(|_, cx| list.list_sessions(request, cx))?.await?;
-        sessions.extend(sessions_for_roots(response.sessions, root));
+        sessions.extend(sessions_for_root(response.sessions, root));
         match response.next_cursor {
             Some(next) if Some(&next) != cursor.as_ref() => cursor = Some(next),
             _ => break,
@@ -1818,11 +1813,11 @@ mod tests {
         info
     }
 
-    /// A session list over sessions of two projects. `honors_cwd` decides
-    /// whether it filters by the requested `cwd` like claude-agent-acp does.
+    /// Lists sessions like claude-agent-acp: every transcript in the history
+    /// folder of the requested `cwd`, each reporting the first directory its
+    /// transcript recorded.
     struct FakeSessionList {
-        sessions: Vec<AgentSessionInfo>,
-        honors_cwd: bool,
+        sessions_by_history_folder: Vec<(PathBuf, AgentSessionInfo)>,
         requested_cwds: RefCell<Vec<Option<PathBuf>>>,
     }
 
@@ -1834,17 +1829,12 @@ mod tests {
         ) -> Task<Result<AgentSessionListResponse>> {
             self.requested_cwds.borrow_mut().push(request.cwd.clone());
             let sessions = self
-                .sessions
+                .sessions_by_history_folder
                 .iter()
-                .filter(|session| {
-                    !self.honors_cwd
-                        || request.cwd.as_ref().is_none_or(|cwd| {
-                            session.work_dirs.as_ref().is_some_and(|work_dirs| {
-                                work_dirs.paths().iter().any(|path| path == cwd)
-                            })
-                        })
+                .filter(|(history_folder, _)| {
+                    request.cwd.as_ref().is_none_or(|cwd| cwd == history_folder)
                 })
-                .cloned()
+                .map(|(_, session)| session.clone())
                 .collect();
             Task::ready(Ok(AgentSessionListResponse::new(sessions)))
         }
@@ -1862,36 +1852,42 @@ mod tests {
         let (_, cx) =
             cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
 
-        let all_sessions = vec![
-            session("a", "/work/app"),
-            session("b", "/work/other"),
-            session("c", "/work/app-worktree"),
-            session("d", "/work/app"),
-        ];
-        for honors_cwd in [true, false] {
-            let fake = Rc::new(FakeSessionList {
-                sessions: all_sessions.clone(),
-                honors_cwd,
-                requested_cwds: RefCell::new(Vec::new()),
-            });
-            let list: Rc<dyn AgentSessionList> = fake.clone();
-            let root = Path::new("/work/app");
-            let sessions = cx
-                .update(|window, cx| {
-                    window.spawn(cx, async move |cx| list_sessions_in(&list, root, cx).await)
-                })
-                .await
-                .expect("listing succeeds");
-            let ids = sessions
-                .iter()
-                .map(|session| session.session_id.0.to_string())
-                .collect::<Vec<_>>();
-            assert_eq!(ids, vec!["a", "d"], "honors_cwd: {honors_cwd}");
-            assert_eq!(
-                fake.requested_cwds.borrow().as_slice(),
-                &[Some(PathBuf::from("/work/app"))]
-            );
-        }
+        let fake = Rc::new(FakeSessionList {
+            sessions_by_history_folder: vec![
+                (PathBuf::from("/work/app"), session("a", "/work/app")),
+                (PathBuf::from("/work/other"), session("b", "/work/other")),
+                (
+                    PathBuf::from("/work/app-worktree"),
+                    session("c", "/work/app-worktree"),
+                ),
+                // Started before the repository moved to /work/app.
+                (PathBuf::from("/work/app"), session("d", "/old/app")),
+            ],
+            requested_cwds: RefCell::new(Vec::new()),
+        });
+        let list: Rc<dyn AgentSessionList> = fake.clone();
+        let root = Path::new("/work/app");
+        let sessions = cx
+            .update(|window, cx| {
+                window.spawn(cx, async move |cx| list_sessions_in(&list, root, cx).await)
+            })
+            .await
+            .expect("listing succeeds");
+        let listed = sessions
+            .iter()
+            .map(|session| (session.session_id.0.to_string(), session.cwd.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            listed,
+            vec![
+                ("a".to_string(), PathBuf::from("/work/app")),
+                ("d".to_string(), PathBuf::from("/work/app")),
+            ]
+        );
+        assert_eq!(
+            fake.requested_cwds.borrow().as_slice(),
+            &[Some(PathBuf::from("/work/app"))]
+        );
     }
 
     #[gpui::test]
