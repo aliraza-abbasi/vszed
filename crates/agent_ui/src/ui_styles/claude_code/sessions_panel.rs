@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -9,29 +10,31 @@ use collections::HashSet;
 use db::kvp::KeyValueStore;
 use editor::{Editor, EditorEvent};
 use gpui::{
-    Action, Anchor, AnyElement, App, AsyncWindowContext, Context, Entity, EventEmitter,
-    FocusHandle, Focusable, FontWeight, Stateful, Subscription, Task, WeakEntity, Window, actions,
-    px,
+    Action, Anchor, AnyElement, App, AsyncWindowContext, Context, DismissEvent, Entity,
+    EventEmitter, FocusHandle, Focusable, FontWeight, Stateful, Subscription, Task, WeakEntity,
+    Window, actions, px,
 };
 use project::{AgentId, Project};
 use serde::{Deserialize, Serialize};
+use settings::Settings as _;
 use std::rc::Rc;
 use ui::{ButtonLike, ContextMenu, PopoverMenu, Tooltip, prelude::*, right_click_menu};
 use util::ResultExt as _;
 use workspace::{
-    PathList, Workspace,
+    MultiWorkspace, PathList, Workspace,
     dock::{DockPosition, Panel, PanelEvent},
+    notifications::{NotificationId, simple_message_notification::MessageNotification},
 };
 
 use crate::agent_panel::AgentPanel;
 use crate::thread_metadata_store::{ThreadId, ThreadMetadata, ThreadMetadataStore};
 use crate::ui_styles::claude_code::side_bar_label_size;
 use crate::ui_styles::claude_code::usage::{self, UsageWindow};
-use crate::ui_styles::claude_code_style_enabled;
 use crate::ui_styles::thread_item::{
     AgentThreadItem, ThreadTabRequest, connection_store, global_thread_store, new_thread_tab,
     open_thread_tab, panel_connection_store, threads_open_in_editor,
 };
+use crate::ui_styles::{AgentUiStyleSettings, claude_code_style_enabled};
 use crate::{Agent, AgentThreadSource, NewExternalAgentThread};
 
 actions!(
@@ -49,6 +52,15 @@ const FILTERS_KEY: &str = "claude_code_session_filters";
 /// them per workspace folder.
 const GROUPS_NAMESPACE: &str = "claude_code_session_groups";
 const NEW_GROUP_NAME: &str = "New group";
+/// When each session was last unarchived, in Unix milliseconds by session id:
+/// unarchiving restarts a session's auto-archive clock, like the extension's
+/// `sessionUnarchivedAt`.
+const UNARCHIVED_AT_KEY: &str = "claude_code_session_unarchived_at";
+/// The extension forgets unarchive times after 14 days.
+const UNARCHIVE_MEMORY_DAYS: i64 = 14;
+const AUTO_ARCHIVE_NOTICE_SHOWN_KEY: &str = "claude_code_auto_archive_notice_shown";
+/// The extension checks for inactive sessions hourly.
+const AUTO_ARCHIVE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const WEB_SESSIONS_UNAVAILABLE: &str =
     "Cloud sessions from claude.ai aren't available through the Claude adapter";
 
@@ -305,6 +317,7 @@ pub(crate) struct ClaudeCodeSessionsPanel {
     _usage_reset_timer: Task<()>,
     _account_watch: usage::AccountFileWatch,
     _refresh_task: Task<()>,
+    _auto_archive_timer: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -353,6 +366,21 @@ impl ClaudeCodeSessionsPanel {
             subscriptions.push(cx.observe(&store, |_, _, cx| cx.notify()));
         }
         let account_watch = usage::watch_account_file(project.read(cx).fs().clone(), cx);
+        // Refreshing sweeps for inactive sessions. Before the panel first lists
+        // its sessions there is nothing to sweep, and listing would start the agent.
+        let auto_archive_timer = cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor().timer(AUTO_ARCHIVE_INTERVAL).await;
+                let refreshed = this.update_in(cx, |this, window, cx| {
+                    if this.has_requested_sessions {
+                        this.refresh(window, cx);
+                    }
+                });
+                if refreshed.is_err() {
+                    break;
+                }
+            }
+        });
         let mut this = Self {
             workspace: workspace.weak_handle(),
             project,
@@ -376,6 +404,7 @@ impl ClaudeCodeSessionsPanel {
             _usage_reset_timer: Task::ready(()),
             _account_watch: account_watch,
             _refresh_task: Task::ready(()),
+            _auto_archive_timer: auto_archive_timer,
             _subscriptions: subscriptions,
         };
         this.load_groups(cx);
@@ -522,6 +551,7 @@ impl ClaudeCodeSessionsPanel {
                     Ok(Some(sessions)) => {
                         this.sessions = sessions;
                         this.load_state = LoadState::Loaded;
+                        this.auto_archive_inactive_sessions(cx);
                     }
                     Ok(None) => this.load_state = LoadState::Unsupported,
                     Err(error) => {
@@ -536,6 +566,10 @@ impl ClaudeCodeSessionsPanel {
     }
 
     fn rows(&self, cx: &App) -> Vec<SessionRow> {
+        self.session_rows(&self.search_query(cx), cx)
+    }
+
+    fn session_rows(&self, query: &str, cx: &App) -> Vec<SessionRow> {
         let store = ThreadMetadataStore::try_global(cx);
         let open_tabs = self
             .workspace
@@ -547,7 +581,6 @@ impl ClaudeCodeSessionsPanel {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let query = self.search_query(cx);
         let mut seen = HashSet::default();
         let mut rows = self
             .sessions
@@ -585,7 +618,7 @@ impl ClaudeCodeSessionsPanel {
                     },
                 }
             })
-            .filter(|row| query.is_empty() || row.title.to_lowercase().contains(&query))
+            .filter(|row| query.is_empty() || row.title.to_lowercase().contains(query))
             .collect::<Vec<_>>();
         rows.sort_by_key(|row| std::cmp::Reverse(row.session.updated_at));
         rows
@@ -897,6 +930,99 @@ impl ClaudeCodeSessionsPanel {
             } else {
                 store.unarchive(thread_id, cx);
             }
+        });
+        if !archived {
+            record_unarchive(&session.session_id, cx);
+        }
+    }
+
+    fn is_archived(&self, session_id: &acp_v2::SessionId, cx: &App) -> bool {
+        ThreadMetadataStore::try_global(cx).is_some_and(|store| {
+            store
+                .read(cx)
+                .entry_by_session(session_id)
+                .is_some_and(|metadata| metadata.archived)
+        })
+    }
+
+    /// Archives the sessions with no activity for `agent.claude_code.archive_inactive_sessions`
+    /// days, as the extension's auto-archive does, and says so the first time.
+    fn auto_archive_inactive_sessions(&mut self, cx: &mut Context<Self>) {
+        let days = AgentUiStyleSettings::get_global(cx).archive_inactive_sessions;
+        if days == 0 {
+            return;
+        }
+        let open_sessions = sessions_open_in_any_window(cx);
+        let unarchived_at = unarchive_times(cx).clone();
+        let inactive = sessions_to_auto_archive(
+            &self.session_rows("", cx),
+            days,
+            Utc::now(),
+            &unarchived_at,
+            |session_id| open_sessions.contains(session_id) || self.group_of(session_id).is_some(),
+        );
+        if inactive.is_empty() {
+            return;
+        }
+        for session in &inactive {
+            self.set_archived(session, true, cx);
+        }
+        self.show_auto_archive_notice(inactive, days, cx);
+    }
+
+    fn show_auto_archive_notice(
+        &self,
+        archived: Vec<ListedSession>,
+        days: u32,
+        cx: &mut Context<Self>,
+    ) {
+        let store = KeyValueStore::global(cx);
+        let shown = store
+            .read_kvp(AUTO_ARCHIVE_NOTICE_SHOWN_KEY)
+            .log_err()
+            .flatten()
+            .is_some();
+        if shown {
+            return;
+        }
+        db::write_and_log(cx, move || async move {
+            store
+                .write_kvp(
+                    AUTO_ARCHIVE_NOTICE_SHOWN_KEY.to_string(),
+                    "true".to_string(),
+                )
+                .await
+        });
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let panel = cx.weak_entity();
+        let message = auto_archive_notice(archived.len(), days);
+        workspace.update(cx, |workspace, cx| {
+            workspace.show_notification(NotificationId::unique::<AutoArchiveNotice>(), cx, |cx| {
+                cx.new(|cx| {
+                    MessageNotification::new(message, cx)
+                        .primary_message("Unarchive")
+                        .primary_on_click(move |_, cx| {
+                            panel
+                                .update(cx, |panel, cx| {
+                                    for session in &archived {
+                                        if panel.is_archived(&session.session_id, cx) {
+                                            panel.set_archived(session, false, cx);
+                                        }
+                                    }
+                                })
+                                .log_err();
+                            cx.emit(DismissEvent);
+                        })
+                        .secondary_message("Open Settings")
+                        .secondary_on_click(|window, cx| {
+                            window.dispatch_action(zed_actions::OpenSettingsFile.boxed_clone(), cx);
+                            cx.emit(DismissEvent);
+                        })
+                        .show_suppress_button(false)
+                })
+            });
         });
     }
 
@@ -1459,6 +1585,129 @@ async fn list_sessions_in(
     Ok(sessions)
 }
 
+struct AutoArchiveNotice;
+
+/// The extension's auto-archive notice.
+fn auto_archive_notice(count: usize, days: u32) -> String {
+    let sessions = if count == 1 {
+        "1 session".to_string()
+    } else {
+        format!("{count} sessions")
+    };
+    let inactivity = if days == 1 {
+        "with no activity in the last day".to_string()
+    } else {
+        format!("with no activity in the last {days} days")
+    };
+    let still_available = if count == 1 { "It is" } else { "They are" };
+    format!(
+        "Claude Code archived {sessions} {inactivity}. {still_available} still available under \
+         Archived sessions in your session history."
+    )
+}
+
+/// The sessions the extension's auto-archive would archive: unarchived ones
+/// with no activity in the last `days`, where unarchiving counts as activity,
+/// that aren't open, running, waiting for input, unread, or otherwise in use.
+fn sessions_to_auto_archive(
+    rows: &[SessionRow],
+    days: u32,
+    now: DateTime<Utc>,
+    unarchived_at: &BTreeMap<String, i64>,
+    is_in_use: impl Fn(&acp_v2::SessionId) -> bool,
+) -> Vec<ListedSession> {
+    if days == 0 {
+        return Vec::new();
+    }
+    let cutoff = now - chrono::Duration::days(i64::from(days));
+    rows.iter()
+        .filter(|row| !row.archived)
+        .filter(|row| {
+            let Some(updated_at) = row.session.updated_at else {
+                return false;
+            };
+            let unarchived = unarchived_at
+                .get(row.session.session_id.0.as_ref())
+                .copied()
+                .and_then(DateTime::<Utc>::from_timestamp_millis);
+            let last_activity =
+                unarchived.map_or(updated_at, |unarchived| updated_at.max(unarchived));
+            last_activity <= cutoff
+        })
+        .filter(|row| {
+            let state = &row.state;
+            state.status == SessionStatus::Idle
+                && !state.is_open
+                && !state.unread
+                && !is_in_use(&row.session.session_id)
+        })
+        .map(|row| row.session.clone())
+        .collect()
+}
+
+/// Sessions open anywhere, as an editor tab or in an agent panel, in any
+/// window. Archiving a session closes it in the agent panel.
+fn sessions_open_in_any_window(cx: &App) -> HashSet<acp_v2::SessionId> {
+    let mut open_sessions = HashSet::default();
+    for window in cx.windows() {
+        let Some(multi_workspace) = window.downcast::<MultiWorkspace>() else {
+            continue;
+        };
+        let Ok(multi_workspace) = multi_workspace.read(cx) else {
+            continue;
+        };
+        for workspace in multi_workspace.workspaces() {
+            let workspace = workspace.read(cx);
+            open_sessions.extend(
+                workspace
+                    .items_of_type::<AgentThreadItem>(cx)
+                    .filter_map(|tab| tab.read(cx).session_id(cx)),
+            );
+            if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+                open_sessions.extend(panel.read(cx).conversation_views().into_iter().filter_map(
+                    |view| Some(view.read(cx).root_thread(cx)?.read(cx).session_id().clone()),
+                ));
+            }
+        }
+    }
+    open_sessions
+}
+
+/// The unarchive times, read from the database once and then written through,
+/// because database writes land later: unarchiving several sessions at once
+/// would otherwise keep only the last one's time.
+struct UnarchiveTimes(BTreeMap<String, i64>);
+
+impl gpui::Global for UnarchiveTimes {}
+
+fn unarchive_times(cx: &mut App) -> &mut BTreeMap<String, i64> {
+    if !cx.has_global::<UnarchiveTimes>() {
+        let saved = KeyValueStore::global(cx)
+            .read_kvp(UNARCHIVED_AT_KEY)
+            .log_err()
+            .flatten()
+            .and_then(|value| serde_json::from_str(&value).log_err())
+            .unwrap_or_default();
+        cx.set_global(UnarchiveTimes(saved));
+    }
+    &mut cx.global_mut::<UnarchiveTimes>().0
+}
+
+fn record_unarchive(session_id: &acp_v2::SessionId, cx: &mut App) {
+    let now = Utc::now().timestamp_millis();
+    let forget_before = now - chrono::Duration::days(UNARCHIVE_MEMORY_DAYS).num_milliseconds();
+    let unarchived_at = unarchive_times(cx);
+    unarchived_at.retain(|_, unarchived| *unarchived > forget_before);
+    unarchived_at.insert(session_id.0.to_string(), now);
+    let Some(value) = serde_json::to_string(unarchived_at).log_err() else {
+        return;
+    };
+    let store = KeyValueStore::global(cx);
+    db::write_and_log(cx, move || async move {
+        store.write_kvp(UNARCHIVED_AT_KEY.to_string(), value).await
+    });
+}
+
 /// Gives a Claude session a Zed thread metadata row, which Zed's archive,
 /// rename and panel resume work through.
 fn ensure_metadata(
@@ -1745,11 +1994,13 @@ impl Render for ClaudeCodeSessionsPanel {
                                 .overflow_y_scroll()
                                 .px_1()
                                 .when_some(empty_text, |this, text| {
-                                    this.child(div().px_3().py_2().child(
-                                        Label::new(text)
-                                            .size(side_bar_label_size(0.9, cx))
-                                            .color(Color::Muted),
-                                    ))
+                                    this.child(
+                                        div().px_3().py_2().child(
+                                            Label::new(text)
+                                                .size(side_bar_label_size(0.9, cx))
+                                                .color(Color::Muted),
+                                        ),
+                                    )
                                 })
                                 .children(list_children),
                         ),
@@ -2384,5 +2635,205 @@ mod tests {
         assert_eq!(relative_time(now, ago(16 * 60)), "Yesterday");
         assert_eq!(relative_time(now, ago(3 * 24 * 60)), "3d");
         assert_eq!(relative_time(now, ago(30 * 24 * 60)), "Oct 12");
+    }
+
+    #[test]
+    fn test_sessions_to_auto_archive() {
+        let now = Utc::now();
+        let idle = SessionState {
+            status: SessionStatus::Idle,
+            is_open: false,
+            unread: false,
+            is_selected: false,
+        };
+        let row = |id: &str, days_ago: i64, state: SessionState| SessionRow {
+            session: ListedSession {
+                session_id: acp_v2::SessionId::new(id.to_string()),
+                cwd: PathBuf::from("/work/app"),
+                title: None,
+                updated_at: Some(now - chrono::Duration::days(days_ago)),
+            },
+            title: id.to_string().into(),
+            archived: false,
+            state,
+        };
+        let mut already_archived = row("archived", 30, idle);
+        already_archived.archived = true;
+        let rows = vec![
+            row("inactive", 15, idle),
+            row("recent", 13, idle),
+            row(
+                "open",
+                30,
+                SessionState {
+                    is_open: true,
+                    ..idle
+                },
+            ),
+            row(
+                "running",
+                30,
+                SessionState {
+                    status: SessionStatus::Running,
+                    is_open: true,
+                    ..idle
+                },
+            ),
+            row(
+                "waiting",
+                30,
+                SessionState {
+                    status: SessionStatus::WaitingForPermission,
+                    is_open: true,
+                    ..idle
+                },
+            ),
+            row(
+                "unread",
+                30,
+                SessionState {
+                    unread: true,
+                    ..idle
+                },
+            ),
+            row("grouped", 30, idle),
+            row("unarchived lately", 30, idle),
+            row("unarchived long ago", 30, idle),
+            already_archived,
+        ];
+        let unarchived_at = BTreeMap::from_iter([
+            (
+                "unarchived lately".to_string(),
+                (now - chrono::Duration::days(2)).timestamp_millis(),
+            ),
+            (
+                "unarchived long ago".to_string(),
+                (now - chrono::Duration::days(20)).timestamp_millis(),
+            ),
+        ]);
+        let is_grouped = |session_id: &acp_v2::SessionId| session_id.0.as_ref() == "grouped";
+        let ids = |sessions: Vec<ListedSession>| {
+            sessions
+                .into_iter()
+                .map(|session| session.session_id.0.to_string())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            ids(sessions_to_auto_archive(
+                &rows,
+                14,
+                now,
+                &unarchived_at,
+                is_grouped
+            )),
+            ["inactive", "unarchived long ago"]
+        );
+        assert_eq!(
+            ids(sessions_to_auto_archive(
+                &rows,
+                1,
+                now,
+                &unarchived_at,
+                is_grouped
+            )),
+            [
+                "inactive",
+                "recent",
+                "unarchived lately",
+                "unarchived long ago"
+            ]
+        );
+        assert!(sessions_to_auto_archive(&rows, 0, now, &unarchived_at, is_grouped).is_empty());
+    }
+
+    #[test]
+    fn test_auto_archive_notice() {
+        assert_eq!(
+            auto_archive_notice(1, 14),
+            "Claude Code archived 1 session with no activity in the last 14 days. It is still \
+             available under Archived sessions in your session history."
+        );
+        assert_eq!(
+            auto_archive_notice(3, 1),
+            "Claude Code archived 3 sessions with no activity in the last day. They are still \
+             available under Archived sessions in your session history."
+        );
+    }
+
+    #[gpui::test]
+    async fn test_auto_archive_inactive_sessions(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            crate::ui_styles::init(cx);
+            gpui::UpdateGlobal::update_global(cx, |store: &mut settings::SettingsStore, cx| {
+                store
+                    .set_user_settings(r#"{ "agent": { "ui_style": "claude_code" } }"#, cx)
+                    .expect("valid settings");
+            });
+        });
+        let root = "/work/claude-auto-archive";
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(root, json!({ "README.md": "" })).await;
+        let project = Project::test(fs, [Path::new(root)], cx).await;
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .expect("window is open");
+        let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
+        let panel = workspace
+            .read_with(cx, |workspace, cx| {
+                workspace.panel::<ClaudeCodeSessionsPanel>(cx)
+            })
+            .expect("the Claude Code style adds the sessions panel");
+
+        let listed = |id: &str, days_ago: i64| ListedSession {
+            session_id: acp_v2::SessionId::new(id.to_string()),
+            cwd: PathBuf::from(root),
+            title: Some(format!("Session {id}").into()),
+            updated_at: Some(Utc::now() - chrono::Duration::days(days_ago)),
+        };
+        let is_archived = |id: &str, cx: &mut VisualTestContext| {
+            panel.read_with(cx, |panel, cx| {
+                panel.is_archived(&acp_v2::SessionId::new(id.to_string()), cx)
+            })
+        };
+        let notice_id = NotificationId::unique::<AutoArchiveNotice>();
+        let notice_shown = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| workspace.has_notification(&notice_id))
+        };
+
+        panel.update(cx, |panel, cx| {
+            panel.sessions = vec![listed("inactive", 20), listed("recent", 1)];
+            panel.load_state = LoadState::Loaded;
+            panel.auto_archive_inactive_sessions(cx);
+        });
+        cx.run_until_parked();
+        assert!(is_archived("inactive", cx));
+        assert!(!is_archived("recent", cx));
+        assert!(notice_shown(cx));
+
+        // Unarchiving restarts a session's clock, even for several at once.
+        workspace.update(cx, |workspace, cx| {
+            workspace.dismiss_notification(&notice_id, cx)
+        });
+        panel.update(cx, |panel, cx| {
+            panel.sessions.push(listed("also inactive", 30));
+            panel.auto_archive_inactive_sessions(cx);
+        });
+        cx.run_until_parked();
+        assert!(is_archived("also inactive", cx));
+        assert!(!notice_shown(cx), "the notice is shown only once");
+        panel.update(cx, |panel, cx| {
+            for session in panel.sessions.clone() {
+                panel.set_archived(&session, false, cx);
+            }
+            panel.auto_archive_inactive_sessions(cx);
+        });
+        cx.run_until_parked();
+        for id in ["inactive", "also inactive", "recent"] {
+            assert!(!is_archived(id, cx), "{id} stays unarchived");
+        }
     }
 }
