@@ -383,6 +383,8 @@ pub struct AgentSettingsContent {
     ///
     /// Default: panel
     pub thread_location: Option<AgentThreadLocation>,
+    /// Settings of the Claude Code style (`ui_style: "claude_code"`).
+    pub claude_code: Option<ClaudeCodeStyleSettingsContent>,
     /// Whether clicking the stop button on a running terminal tool should also cancel the agent's generation.
     /// Note that this only applies to the stop button, not to ctrl+c inside the terminal.
     ///
