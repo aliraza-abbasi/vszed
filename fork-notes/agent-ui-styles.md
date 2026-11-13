@@ -7,7 +7,7 @@ upstream files. Use this list when resolving rebase conflicts and when folding i
 | File | Purpose | Approx. lines |
 |---|---|---|
 | `README.md` | `.rules` review banner (first two lines). Removing it is a manual step for the human author. | +2 |
-| `crates/settings_content/src/agent.rs` (~15, ~378) | `mod ui_style; pub use ui_style::*;` and the `ui_style` / `thread_location` fields on `AgentSettingsContent` | +11 |
+| `crates/settings_content/src/agent.rs` (~15, ~378) | `mod ui_style; pub use ui_style::*;` and the `ui_style` / `thread_location` / `claude_code` fields on `AgentSettingsContent` (`claude_code` holds the mirrored extension settings, defined in `agent/ui_style.rs`) | +13 |
 | `crates/agent_ui/src/agent_ui.rs` (~39, ~714) | `mod ui_styles;` and `ui_styles::init(cx)` after `agent_panel::init` | +2 |
 | `crates/agent_ui/src/conversation_view/thread_view.rs` (~64) | `#[path = "../ui_styles/claude_code/thread.rs"] mod claude_code_thread;` so the renderer can use `ThreadView` internals | +3 |
 | `crates/agent_ui/src/conversation_view/thread_view.rs` (`render_entries`, ~7411) | early return to `render_claude_code_entries` when `agent.ui_style` is `claude_code` | +3 |
