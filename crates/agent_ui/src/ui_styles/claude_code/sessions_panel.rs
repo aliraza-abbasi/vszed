@@ -476,14 +476,24 @@ impl ClaudeCodeSessionsPanel {
     /// Lists the project's sessions from Claude's own store, one `session/list`
     /// per project root with `cwd` set to it.
     pub(crate) fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let agent = claude_agent();
+        let thread_store = global_thread_store(cx);
+        let server = agent.server(self.project.read(cx).fs().clone(), thread_store);
+        self.refresh_with_server(agent, server, window, cx);
+    }
+
+    fn refresh_with_server(
+        &mut self,
+        agent: Agent,
+        server: Rc<dyn agent_servers::AgentServer>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
         self.has_requested_sessions = true;
         let roots = self.project_roots(cx);
-        let agent = claude_agent();
-        let thread_store = global_thread_store(cx);
-        let server = agent.server(self.project.read(cx).fs().clone(), thread_store);
         let panel_store = panel_connection_store(workspace.read(cx), cx);
         let store = connection_store(panel_store, &self.project, cx);
         let entry = store.update(cx, |store, cx| store.request_connection(agent, server, cx));
@@ -493,6 +503,10 @@ impl ClaudeCodeSessionsPanel {
         }
         cx.notify();
         self._refresh_task = cx.spawn_in(window, async move |this, cx| {
+            // At startup the agent panel may not be loaded yet, so `store` can be a
+            // fallback that nothing else holds. Releasing it shuts its connection
+            // down, which would fail the listing with "owner was released".
+            let _connection_store = store;
             let result = async {
                 let state = connection
                     .await
@@ -1872,6 +1886,48 @@ mod tests {
                 &[Some(PathBuf::from("/work/app"))]
             );
         }
+    }
+
+    #[gpui::test]
+    async fn test_refresh_before_the_agent_panel_loads(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            agent::ThreadStore::init_global(cx);
+            crate::ui_styles::init(cx);
+            gpui::UpdateGlobal::update_global(cx, |store: &mut settings::SettingsStore, cx| {
+                store
+                    .set_user_settings(r#"{ "agent": { "ui_style": "claude_code" } }"#, cx)
+                    .expect("valid settings");
+            });
+        });
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .expect("window is open");
+        let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
+        let sessions_panel = workspace
+            .read_with(cx, |workspace, cx| {
+                assert!(workspace.panel::<AgentPanel>(cx).is_none());
+                workspace.panel::<ClaudeCodeSessionsPanel>(cx)
+            })
+            .expect("the Claude Code style adds the sessions panel");
+
+        sessions_panel.update_in(cx, |panel, window, cx| {
+            let server = Rc::new(crate::conversation_view::tests::StubAgentServer::new(
+                StubAgentConnection::new(),
+            ));
+            panel.refresh_with_server(Agent::Stub, server, window, cx);
+        });
+        cx.run_until_parked();
+
+        // The stub connection has no session list, so a connection that survived
+        // the refresh ends up unsupported rather than in an error.
+        sessions_panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.load_state, LoadState::Unsupported);
+        });
     }
 
     #[gpui::test]
