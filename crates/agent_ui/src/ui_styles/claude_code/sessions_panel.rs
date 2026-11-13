@@ -25,6 +25,7 @@ use workspace::{
 
 use crate::agent_panel::AgentPanel;
 use crate::thread_metadata_store::{ThreadId, ThreadMetadata, ThreadMetadataStore};
+use crate::ui_styles::claude_code::side_bar_label_size;
 use crate::ui_styles::claude_code::usage::{self, UsageWindow};
 use crate::ui_styles::claude_code_style_enabled;
 use crate::ui_styles::thread_item::{
@@ -458,7 +459,7 @@ impl ClaudeCodeSessionsPanel {
             )
             .child(
                 Label::new(section.title())
-                    .size(LabelSize::Small)
+                    .size(side_bar_label_size(0.85, cx))
                     .weight(FontWeight::SEMIBOLD)
                     .color(Color::Muted),
             )
@@ -1020,6 +1021,7 @@ impl ClaudeCodeSessionsPanel {
                     .min_w_0()
                     .child(
                         Label::new(title.clone())
+                            .size(side_bar_label_size(1., cx))
                             .weight(FontWeight::SEMIBOLD)
                             .single_line()
                             .truncate(),
@@ -1073,7 +1075,7 @@ impl ClaudeCodeSessionsPanel {
             )
             .child(
                 Label::new(time)
-                    .size(LabelSize::Small)
+                    .size(side_bar_label_size(0.9, cx))
                     .color(Color::Muted)
                     .flex_none(),
             )
@@ -1198,14 +1200,14 @@ impl ClaudeCodeSessionsPanel {
                     .gap_1()
                     .child(
                         Label::new(group.name.clone())
-                            .size(LabelSize::Small)
+                            .size(side_bar_label_size(0.9, cx))
                             .weight(FontWeight::SEMIBOLD)
                             .single_line()
                             .truncate(),
                     )
                     .child(
                         Label::new(session_count.to_string())
-                            .size(LabelSize::Small)
+                            .size(side_bar_label_size(0.8, cx))
                             .color(Color::Muted),
                     )
                     .into_any_element(),
@@ -1259,7 +1261,7 @@ impl ClaudeCodeSessionsPanel {
                     .size(IconSize::Small)
                     .color(Color::Muted),
             )
-            .child(Label::new("New session"))
+            .child(Label::new("New session").size(side_bar_label_size(1., cx)))
             .on_click(cx.listener(|this, _, window, cx| this.new_session(window, cx)))
     }
 
@@ -1278,6 +1280,7 @@ impl ClaudeCodeSessionsPanel {
                 div().flex_1().child(
                     Button::new("claude-code-local-sessions", "Local")
                         .start_icon(Icon::new(IconName::Screen).size(IconSize::Small))
+                        .label_size(side_bar_label_size(0.9, cx))
                         .full_width()
                         .toggle_state(true),
                 ),
@@ -1290,6 +1293,7 @@ impl ClaudeCodeSessionsPanel {
                     .child(
                         Button::new("claude-code-web-sessions-button", "Web")
                             .start_icon(Icon::new(IconName::Public).size(IconSize::Small))
+                            .label_size(side_bar_label_size(0.9, cx))
                             .full_width()
                             .disabled(true),
                     ),
@@ -1381,7 +1385,7 @@ impl ClaudeCodeSessionsPanel {
                         .size(IconSize::Small)
                         .color(Color::Muted),
                 )
-                .label_size(LabelSize::Small)
+                .label_size(side_bar_label_size(0.9, cx))
                 .toggle_state(self.filters.active)
                 .tooltip(Tooltip::text(
                     "Show sessions that need input, are working or are unread",
@@ -1408,7 +1412,7 @@ impl ClaudeCodeSessionsPanel {
                                 .size(IconSize::Small)
                                 .color(Color::Muted),
                         )
-                        .label_size(LabelSize::Small)
+                        .label_size(side_bar_label_size(0.9, cx))
                         .on_click(
                             cx.listener(|this, _, window, cx| this.create_group(None, window, cx)),
                         ),
@@ -1676,7 +1680,7 @@ impl Render for ClaudeCodeSessionsPanel {
                     )
                     .child(
                         Label::new(format!("Archived sessions ({archived_count})"))
-                            .size(LabelSize::Small)
+                            .size(side_bar_label_size(0.9, cx))
                             .color(Color::Muted),
                     )
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -1747,7 +1751,9 @@ impl Render for ClaudeCodeSessionsPanel {
                                 .px_1()
                                 .when_some(empty_text, |this, text| {
                                     this.child(div().px_3().py_2().child(
-                                        Label::new(text).size(LabelSize::Small).color(Color::Muted),
+                                        Label::new(text)
+                                            .size(side_bar_label_size(0.9, cx))
+                                            .color(Color::Muted),
                                     ))
                                 })
                                 .children(list_children),
