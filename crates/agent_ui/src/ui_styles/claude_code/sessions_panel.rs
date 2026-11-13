@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -56,6 +56,9 @@ const NEW_GROUP_NAME: &str = "New group";
 /// unarchiving restarts a session's auto-archive clock, like the extension's
 /// `sessionUnarchivedAt`.
 const UNARCHIVED_AT_KEY: &str = "claude_code_session_unarchived_at";
+/// The ids of the sessions archived in the Session Manager, like the extension's
+/// `hiddenSessionIds`.
+const ARCHIVED_SESSIONS_KEY: &str = "claude_code_archived_sessions";
 /// The extension forgets unarchive times after 14 days.
 const UNARCHIVE_MEMORY_DAYS: i64 = 14;
 const AUTO_ARCHIVE_NOTICE_SHOWN_KEY: &str = "claude_code_auto_archive_notice_shown";
@@ -365,6 +368,8 @@ impl ClaudeCodeSessionsPanel {
         if let Some(store) = ThreadMetadataStore::try_global(cx) {
             subscriptions.push(cx.observe(&store, |_, _, cx| cx.notify()));
         }
+        load_archived_sessions(cx);
+        subscriptions.push(cx.observe_global::<ArchivedSessions>(|_, cx| cx.notify()));
         let account_watch = usage::watch_account_file(project.read(cx).fs().clone(), cx);
         // Refreshing sweeps for inactive sessions. Before the panel first lists
         // its sessions there is nothing to sweep, and listing would start the agent.
@@ -608,7 +613,7 @@ impl ClaudeCodeSessionsPanel {
                 SessionRow {
                     session: session.clone(),
                     title,
-                    archived: metadata.is_some_and(|metadata| metadata.archived),
+                    archived: is_session_archived(&session.session_id, cx),
                     state: SessionState {
                         status,
                         is_open: tab.is_some(),
@@ -918,31 +923,14 @@ impl ClaudeCodeSessionsPanel {
     }
 
     fn set_archived(&mut self, session: &ListedSession, archived: bool, cx: &mut Context<Self>) {
-        let Some(thread_id) = ensure_metadata(session, session.title.clone(), cx) else {
-            return;
-        };
-        let Some(store) = ThreadMetadataStore::try_global(cx) else {
-            return;
-        };
-        store.update(cx, |store, cx| {
-            if archived {
-                store.archive(thread_id, None, cx);
-            } else {
-                store.unarchive(thread_id, cx);
-            }
-        });
+        set_session_archived(&session.session_id, archived, cx);
         if !archived {
             record_unarchive(&session.session_id, cx);
         }
     }
 
     fn is_archived(&self, session_id: &acp_v2::SessionId, cx: &App) -> bool {
-        ThreadMetadataStore::try_global(cx).is_some_and(|store| {
-            store
-                .read(cx)
-                .entry_by_session(session_id)
-                .is_some_and(|metadata| metadata.archived)
-        })
+        is_session_archived(session_id, cx)
     }
 
     /// Archives the sessions with no activity for `agent.claude_code.archive_inactive_sessions`
@@ -1646,7 +1634,7 @@ fn sessions_to_auto_archive(
 }
 
 /// Sessions open anywhere, as an editor tab or in an agent panel, in any
-/// window. Archiving a session closes it in the agent panel.
+/// window, which auto-archive leaves alone.
 fn sessions_open_in_any_window(cx: &App) -> HashSet<acp_v2::SessionId> {
     let mut open_sessions = HashSet::default();
     for window in cx.windows() {
@@ -1671,6 +1659,57 @@ fn sessions_open_in_any_window(cx: &App) -> HashSet<acp_v2::SessionId> {
         }
     }
     open_sessions
+}
+
+/// The Session Manager's own archive, like the extension keeps its own. Zed's
+/// thread archive flag isn't used: Zed's thread import marks every session it
+/// imports as archived. Read from the database once and then written through,
+/// like `UnarchiveTimes`.
+#[derive(Default)]
+struct ArchivedSessions(BTreeSet<String>);
+
+impl gpui::Global for ArchivedSessions {}
+
+fn load_archived_sessions(cx: &mut App) {
+    if cx.has_global::<ArchivedSessions>() {
+        return;
+    }
+    let saved = KeyValueStore::global(cx)
+        .read_kvp(ARCHIVED_SESSIONS_KEY)
+        .log_err()
+        .flatten()
+        .and_then(|value| serde_json::from_str(&value).log_err())
+        .unwrap_or_default();
+    cx.set_global(ArchivedSessions(saved));
+}
+
+fn is_session_archived(session_id: &acp_v2::SessionId, cx: &App) -> bool {
+    cx.try_global::<ArchivedSessions>()
+        .is_some_and(|archived| archived.0.contains(session_id.0.as_ref()))
+}
+
+fn set_session_archived(session_id: &acp_v2::SessionId, archived: bool, cx: &mut App) {
+    load_archived_sessions(cx);
+    let session_id = session_id.0.to_string();
+    let changed = cx.update_global(|sessions: &mut ArchivedSessions, _| {
+        if archived {
+            sessions.0.insert(session_id)
+        } else {
+            sessions.0.remove(&session_id)
+        }
+    });
+    if !changed {
+        return;
+    }
+    let Some(value) = serde_json::to_string(&cx.global::<ArchivedSessions>().0).log_err() else {
+        return;
+    };
+    let store = KeyValueStore::global(cx);
+    db::write_and_log(cx, move || async move {
+        store
+            .write_kvp(ARCHIVED_SESSIONS_KEY.to_string(), value)
+            .await
+    });
 }
 
 /// The unarchive times, read from the database once and then written through,
@@ -1708,8 +1747,8 @@ fn record_unarchive(session_id: &acp_v2::SessionId, cx: &mut App) {
     });
 }
 
-/// Gives a Claude session a Zed thread metadata row, which Zed's archive,
-/// rename and panel resume work through.
+/// Gives a Claude session a Zed thread metadata row, which rename and panel
+/// resume work through.
 fn ensure_metadata(
     session: &ListedSession,
     title: Option<SharedString>,
@@ -2804,6 +2843,12 @@ mod tests {
             workspace.read_with(cx, |workspace, _| workspace.has_notification(&notice_id))
         };
 
+        // Zed's thread import saves the sessions it imports as archived.
+        cx.update(|_, cx| {
+            let thread_id = ensure_metadata(&listed("recent", 1), None, cx).expect("metadata");
+            ThreadMetadataStore::global(cx)
+                .update(cx, |store, cx| store.archive(thread_id, None, cx));
+        });
         panel.update(cx, |panel, cx| {
             panel.sessions = vec![listed("inactive", 20), listed("recent", 1)];
             panel.load_state = LoadState::Loaded;
@@ -2811,7 +2856,10 @@ mod tests {
         });
         cx.run_until_parked();
         assert!(is_archived("inactive", cx));
-        assert!(!is_archived("recent", cx));
+        assert!(
+            !is_archived("recent", cx),
+            "a session archived in Zed's thread history isn't archived here"
+        );
         assert!(notice_shown(cx));
 
         // Unarchiving restarts a session's clock, even for several at once.
