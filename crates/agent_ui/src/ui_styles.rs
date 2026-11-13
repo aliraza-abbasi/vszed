@@ -5,7 +5,7 @@ pub(crate) mod thread_item;
 use gpui::{App, TextStyle};
 use settings::{AgentThreadLocation, AgentUiStyle, RegisterSetting, Settings, SettingsContent};
 
-/// Resolved `agent.ui_style` and `agent.thread_location` settings.
+/// Resolved `agent.ui_style`, `agent.thread_location` and `agent.claude_code` settings.
 ///
 /// These live outside of `AgentSettings` while the alternative styles are
 /// incubating, so that the settings hook stays confined to
@@ -15,7 +15,13 @@ use settings::{AgentThreadLocation, AgentUiStyle, RegisterSetting, Settings, Set
 pub(crate) struct AgentUiStyleSettings {
     pub ui_style: AgentUiStyle,
     pub thread_location: AgentThreadLocation,
+    /// Days with no activity after which the Claude Code style archives a
+    /// session; 0 never archives.
+    pub archive_inactive_sessions: u32,
 }
+
+/// The extension's `claudeCode.archiveInactiveSessions` default.
+const DEFAULT_ARCHIVE_INACTIVE_SESSIONS_DAYS: u32 = 14;
 
 impl Settings for AgentUiStyleSettings {
     fn from_settings(content: &SettingsContent) -> Self {
@@ -25,6 +31,10 @@ impl Settings for AgentUiStyleSettings {
             thread_location: agent
                 .and_then(|agent| agent.thread_location)
                 .unwrap_or_default(),
+            archive_inactive_sessions: agent
+                .and_then(|agent| agent.claude_code.as_ref())
+                .and_then(|claude_code| claude_code.archive_inactive_sessions)
+                .unwrap_or(DEFAULT_ARCHIVE_INACTIVE_SESSIONS_DAYS),
         }
     }
 }
