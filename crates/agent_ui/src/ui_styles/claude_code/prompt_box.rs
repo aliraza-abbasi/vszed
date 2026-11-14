@@ -273,9 +273,10 @@ impl ThreadView {
             .right_0()
             .bottom_0()
             .justify_center()
-            .px_3()
+            // Claude Code's input floats 16px from the bottom and sides.
+            .px_4()
             .pt_1()
-            .pb_3()
+            .pb_4()
             .child(
                 v_flex()
                     .w_full()
