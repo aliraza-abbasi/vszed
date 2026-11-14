@@ -269,6 +269,10 @@ pub(crate) struct ThreadActivity {
     overflowing_diffs: HashSet<acp_v2::ToolCallId>,
     /// Whether a re-render is already waiting for a diff's language to load.
     diff_language_pending: Rc<Cell<bool>>,
+    /// Where each session notice shows in the transcript, by notice id: the
+    /// number of entries when it arrived, so it follows the entry before it.
+    /// Claude Code shows an API error as a reply where it happened.
+    notice_positions: HashMap<usize, usize>,
 }
 
 /// Claude Code lays an Edit's diff out side by side when it is wider than 900px,
@@ -408,6 +412,36 @@ impl ThreadActivity {
         self.prompt_cache.clock(now)
     }
 
+    /// The ids of the notices that show after the entry `entry_ix` of a
+    /// transcript of `entry_count` entries, in arrival order. One that came
+    /// before any entry shows after the first.
+    pub(crate) fn notices_after_entry(&self, entry_ix: usize, entry_count: usize) -> Vec<usize> {
+        let mut notice_ids = self
+            .notice_positions
+            .iter()
+            .filter(|(_, position)| {
+                (**position).clamp(1, entry_count.max(1)).saturating_sub(1) == entry_ix
+            })
+            .map(|(notice_id, _)| *notice_id)
+            .collect::<Vec<_>>();
+        notice_ids.sort_unstable();
+        notice_ids
+    }
+
+    /// Places the notices that arrived since the last call at the end of the
+    /// transcript, and forgets the ones the thread no longer has.
+    fn place_notices(&mut self, thread: &AcpThread) {
+        let entry_count = thread.entries().len();
+        let notices = thread.notices();
+        self.notice_positions
+            .retain(|notice_id, _| notices.iter().any(|(id, _)| id == notice_id));
+        for (notice_id, _) in notices {
+            self.notice_positions
+                .entry(*notice_id)
+                .or_insert(entry_count);
+        }
+    }
+
     fn record_event(
         &mut self,
         thread: &AcpThread,
@@ -454,6 +488,7 @@ impl ThreadActivity {
                 self.last_activity_at = Some(now);
             }
             AcpThreadEvent::EntriesRemoved(range) => self.remove_entries(range.clone()),
+            AcpThreadEvent::NoticesUpdated => self.place_notices(thread),
             AcpThreadEvent::Stopped { .. } | AcpThreadEvent::Error => {
                 self.open_thought = None;
             }
@@ -558,6 +593,12 @@ impl ThreadActivity {
                 Some(entry_ix - removed.len())
             }
         };
+        // A notice after a removed entry moves up to the entry before them.
+        for position in self.notice_positions.values_mut() {
+            if *position > removed.start {
+                *position = removed.start + position.saturating_sub(removed.end);
+            }
+        }
         self.thoughts = self
             .thoughts
             .drain()
@@ -738,15 +779,16 @@ fn track_thread_view(
     cx: &mut Context<ThreadView>,
 ) {
     let thread_view_id = cx.entity_id();
-    let activity = ThreadActivity {
+    let mut activity = ThreadActivity {
         permission_focus: Some(cx.focus_handle()),
         ..ThreadActivity::default()
     };
+    activity.place_notices(thread_view.thread.read(cx));
     cx.default_global::<ClaudeCodeActivity>()
         .threads
         .insert(thread_view_id, activity);
 
-    let thread_subscription = cx.subscribe(&thread_view.thread, move |_, thread, event, cx| {
+    let thread_subscription = cx.subscribe(&thread_view.thread, move |this, thread, event, cx| {
         let now = Instant::now();
         let wall_clock = Local::now();
         if !cx.has_global::<ClaudeCodeActivity>() {
@@ -761,6 +803,10 @@ fn track_thread_view(
             && let Some(subagent) = thread.read(cx).subagent(session_id).cloned()
         {
             track_subagent(thread_view_id, session_id.clone(), &subagent, cx);
+        }
+        // Notices show inside the rows of the entries they follow.
+        if matches!(event, AcpThreadEvent::NoticesUpdated) {
+            this.list_state.remeasure();
         }
     });
 
@@ -3204,6 +3250,24 @@ mod tests {
         assert_eq!(layout(901., DiffLayout::Inline), DiffLayout::SideBySide);
         assert_eq!(layout(890., DiffLayout::SideBySide), DiffLayout::SideBySide);
         assert_eq!(layout(870., DiffLayout::SideBySide), DiffLayout::Inline);
+    }
+
+    #[test]
+    fn test_notices_follow_the_entry_before_them() {
+        let mut activity = ThreadActivity::default();
+        // Notice 0 came after entry 1, notice 1 before any entry, notice 2 after the
+        // last of five entries.
+        activity.notice_positions.extend([(0, 2), (1, 0), (2, 5)]);
+        assert_eq!(activity.notices_after_entry(0, 5), [1]);
+        assert_eq!(activity.notices_after_entry(1, 5), [0]);
+        assert_eq!(activity.notices_after_entry(4, 5), [2]);
+        assert!(activity.notices_after_entry(2, 5).is_empty());
+
+        // Removing entries 1 and 2 moves a notice after a removed entry up to the
+        // entry before them, and shifts later ones.
+        activity.remove_entries(1..3);
+        assert_eq!(activity.notices_after_entry(0, 3), [0, 1]);
+        assert_eq!(activity.notices_after_entry(2, 3), [2]);
     }
 
     #[test]

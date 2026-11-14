@@ -37,6 +37,10 @@ const USER_MESSAGE_FADE_HEIGHT: Pixels = px(50.);
 const WAVE_LENGTH: f32 = 8.;
 const WAVE_AMPLITUDE: f32 = 2.;
 const MAX_WAVE_WIDTH: f32 = 8192.;
+/// Claude Code leaves 24px between the last message and its floating input: its
+/// messages' 40px bottom padding less the input's 16px offset. The floating box's
+/// 4px top padding is the rest.
+const TRANSCRIPT_GAP_ABOVE_PROMPT: Pixels = px(20.);
 
 /// One side of Claude Code's date line: a thin wave filling the space.
 fn wavy_line(cx: &App) -> AnyElement {
@@ -88,10 +92,11 @@ impl ThreadView {
         };
 
         // The prompt box floats over the bottom of the transcript, so the last entry
-        // scrolls up clear of it.
+        // scrolls up clear of it, and then the gap Claude Code leaves above its input.
         let floating_prompt_height = thread_activity(cx.entity_id(), cx)
             .map(|activity| activity.floating_prompt_height().get())
-            .unwrap_or_default();
+            .unwrap_or_default()
+            + TRANSCRIPT_GAP_ABOVE_PROMPT;
 
         list(
             self.list_state.clone(),
@@ -266,6 +271,15 @@ impl ThreadView {
             primary
         };
 
+        let primary = match self.render_claude_code_notices(entry_ix, total_entries, window, cx) {
+            Some(notices) => v_flex()
+                .w_full()
+                .child(primary)
+                .child(notices)
+                .into_any_element(),
+            None => primary,
+        };
+
         match self.editing_message {
             Some(editing_index) if editing_index < entry_ix => {
                 let backdrop = div()
@@ -285,6 +299,57 @@ impl ThreadView {
             }
             _ => primary,
         }
+    }
+
+    /// The session notices that arrived after the entry `entry_ix`. Claude Code
+    /// shows an API error, such as a response cut off by the computer sleeping,
+    /// as a reply in the transcript, with the reply's dot and text.
+    fn render_claude_code_notices(
+        &self,
+        entry_ix: usize,
+        total_entries: usize,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        let notice_ids =
+            thread_activity(cx.entity_id(), cx)?.notices_after_entry(entry_ix, total_entries);
+        if notice_ids.is_empty() {
+            return None;
+        }
+        let notices = self.thread.read(cx).notices();
+        let text_style = transcript_markdown_style(window, cx).base_text_style;
+        let rows = notice_ids
+            .into_iter()
+            .filter_map(|notice_id| {
+                let (_, notice) = notices.iter().find(|(id, _)| *id == notice_id)?;
+                let content = v_flex()
+                    .w_full()
+                    .gap_1()
+                    .text_size(text_style.font_size)
+                    .line_height(text_style.line_height)
+                    .debug_selector(move || format!("claude-code-notice-{notice_id}"))
+                    .child(SharedString::from(notice.title.clone()))
+                    .children(notice.description.clone().map(SharedString::from));
+                Some(timeline_row(
+                    TimelineDot::new(("claude-code-notice-dot", notice_id), StepStatus::Neutral),
+                    content,
+                    window,
+                ))
+            })
+            .collect::<Vec<_>>();
+        if rows.is_empty() {
+            return None;
+        }
+        Some(
+            v_flex()
+                .w_full()
+                .px_5()
+                .py_1()
+                .gap_2()
+                .text_ui(cx)
+                .children(rows)
+                .into_any_element(),
+        )
     }
 
     /// Claude Code shows **Copy response** under a response while it is
@@ -2484,6 +2549,60 @@ mod tests {
                 .update(cx, |editor, cx| editor.placeholder_text(cx))
                 .unwrap_or_default()
         })
+    }
+
+    #[gpui::test]
+    async fn test_claude_code_notices_show_in_the_transcript(cx: &mut TestAppContext) {
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![acp_v1::SessionUpdate::AgentMessageChunk(
+            acp_v1::ContentChunk::new("Working on it.".into()),
+        )]);
+        let (thread_view, cx) = setup_thread_view(connection.clone(), cx).await;
+        set_ui_style("claude_code", cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Start", cx))
+            .await
+            .expect("prompt should succeed");
+        cx.run_until_parked();
+
+        let api_error = acp_v2::Notice::new(
+            acp_v2::NoticeSeverity::Error,
+            "API Error: Your computer went to sleep mid-response. The response above may be incomplete.",
+        );
+        thread.update(cx, |thread, cx| thread.push_notice(api_error, cx));
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("claude-code-notice-0").is_some(),
+            "the notice shows in the transcript"
+        );
+        assert!(
+            cx.debug_bounds("session-notices").is_none(),
+            "and not in Zed's list under it"
+        );
+
+        // It stays after the reply it followed as the conversation goes on.
+        connection.set_next_prompt_updates(vec![acp_v1::SessionUpdate::AgentMessageChunk(
+            acp_v1::ContentChunk::new("Picking up again.".into()),
+        )]);
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Continue", cx))
+            .await
+            .expect("prompt should succeed");
+        cx.run_until_parked();
+        let notice = cx
+            .debug_bounds("claude-code-notice-0")
+            .expect("the notice still shows");
+        let next_message = cx
+            .debug_bounds("claude-code-user-message-2")
+            .expect("the next prompt shows");
+        assert!(notice.origin.y < next_message.origin.y);
+
+        set_ui_style("zed", cx);
+        assert!(
+            cx.debug_bounds("session-notices").is_some(),
+            "Zed's style lists it under the thread"
+        );
     }
 
     #[gpui::test]
