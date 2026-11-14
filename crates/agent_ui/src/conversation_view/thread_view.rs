@@ -13504,6 +13504,12 @@ impl ThreadView {
         if notices.is_empty() {
             return None;
         }
+        // The Claude Code style shows notices in the transcript, after the entry they follow.
+        if crate::ui_styles::claude_code_style_enabled(cx)
+            && !self.thread.read(cx).entries().is_empty()
+        {
+            return None;
+        }
 
         Some(
             crate::ui::session_notice_list("session-notices")
