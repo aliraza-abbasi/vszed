@@ -6,12 +6,15 @@ use gpui::{
 };
 use ui::{CopyButton, Tooltip, prelude::*};
 
-use super::{StepStatus, TIMELINE_GUTTER, TimelineDot, display_lines, timeline_row};
+use super::{
+    StepStatus, TIMELINE_GUTTER, TimelineDot, display_lines, is_long_tool_text, timeline_row,
+};
 
 const IO_LABEL_WIDTH: Pixels = px(36.);
 /// Caps how much input a row lays out.
 const MAX_INPUT_LINES: usize = 500;
-/// Claude Code clips OUT to 60px, fading out its last 10px.
+/// Claude Code clips IN and OUT to 60px each, fading out the last 10px
+/// (`toolBodyRowContent`).
 const OUTPUT_MAX_HEIGHT: Pixels = px(60.);
 const OUTPUT_FADE_HEIGHT: Pixels = px(10.);
 /// More lines than fit in `OUTPUT_MAX_HEIGHT` at any font size Zed allows.
@@ -65,6 +68,7 @@ pub(crate) struct ToolRow {
     output: Option<SharedString>,
     output_label: Option<&'static str>,
     on_open_output: Option<ClickHandler>,
+    on_open_input: Option<ClickHandler>,
     body: Option<AnyElement>,
     footer: Vec<AnyElement>,
 }
@@ -89,6 +93,7 @@ impl ToolRow {
             output: None,
             output_label: Some("OUT"),
             on_open_output: None,
+            on_open_input: None,
             body: None,
             footer: Vec::new(),
         }
@@ -153,6 +158,15 @@ impl ToolRow {
         handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     ) -> Self {
         self.on_open_output = Some(Rc::new(handler));
+        self
+    }
+
+    /// Opens a long input in full, as clicking it does in Claude Code.
+    pub(crate) fn on_open_input(
+        mut self,
+        handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_open_input = Some(Rc::new(handler));
         self
     }
 
@@ -299,6 +313,7 @@ impl RenderOnce for ToolRow {
 
         let output_background = output_background(cx);
         let output_selector = format!("{}-output", self.id);
+        let input_selector = format!("{}-input", self.id);
         let input_hover_group = SharedString::from(format!("{}-input", self.id));
         let output_row = self.output.map(|output| {
             let lines = output_preview_lines(&output);
@@ -385,6 +400,9 @@ impl RenderOnce for ToolRow {
                             .bg(cx.theme().colors().editor_background)
                             .when_some(self.input, |this, input| {
                                 let hover_group = input_hover_group;
+                                let input_background = cx.theme().colors().editor_background;
+                                let input_may_overflow = is_long_tool_text(&input);
+                                let on_open_input = self.on_open_input.clone();
                                 let copy_button = self.copy_input.then(|| {
                                     div().absolute().top_1().right_1().child(
                                         CopyButton::new(
@@ -398,9 +416,13 @@ impl RenderOnce for ToolRow {
                                 });
                                 this.child(
                                     h_flex()
+                                        .id("input")
+                                        .debug_selector(move || input_selector)
                                         .group(hover_group)
                                         .relative()
                                         .items_start()
+                                        .max_h(OUTPUT_MAX_HEIGHT)
+                                        .overflow_hidden()
                                         .px_2p5()
                                         .py_1p5()
                                         .child(io_label("IN"))
@@ -408,6 +430,36 @@ impl RenderOnce for ToolRow {
                                             visible_io_lines(&input, MAX_INPUT_LINES),
                                             cx,
                                         ))
+                                        .when(input_may_overflow, |this| {
+                                            this.child(
+                                                div()
+                                                    .absolute()
+                                                    .left_0()
+                                                    .right_0()
+                                                    .bottom_0()
+                                                    .h(OUTPUT_FADE_HEIGHT)
+                                                    .bg(linear_gradient(
+                                                        180.,
+                                                        linear_color_stop(
+                                                            input_background.opacity(0.),
+                                                            0.,
+                                                        ),
+                                                        linear_color_stop(input_background, 1.),
+                                                    )),
+                                            )
+                                        })
+                                        .when_some(on_open_input, |this, handler| {
+                                            let hover_background =
+                                                cx.theme().colors().element_hover;
+                                            this.cursor_pointer()
+                                                .hover(move |style| style.bg(hover_background))
+                                                .tooltip(Tooltip::text(
+                                                    "Open the full text in an editor tab",
+                                                ))
+                                                .on_click(move |event, window, cx| {
+                                                    handler(event, window, cx)
+                                                })
+                                        })
                                         .children(copy_button),
                                 )
                             })
