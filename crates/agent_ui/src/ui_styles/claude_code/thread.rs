@@ -1154,6 +1154,13 @@ impl ThreadView {
             cx,
         );
         let is_file_tool_row = file_tool_row.is_some();
+        // Claude Code titles a command's input tab "command", and other inputs by tool.
+        let input_tab_title: SharedString = if matches!(tool_call.kind(), acp_v2::ToolKind::Execute)
+        {
+            "command".into()
+        } else {
+            format!("{} tool input", summary.name).into()
+        };
         let mut row = file_tool_row.unwrap_or_else(|| {
             ToolRow::new(("claude-code-tool", entry_ix), summary.name, step_status)
                 .description(description)
@@ -1214,9 +1221,26 @@ impl ThreadView {
         } else if !is_file_tool_row {
             let output = tool_output_text(tool_call, summary.description.as_deref(), cx);
             let output_is_long = output.as_deref().is_some_and(is_long_tool_text);
+            let is_command = matches!(tool_call.kind(), acp_v2::ToolKind::Execute);
+            if let Some(input) = summary
+                .input
+                .clone()
+                .filter(|input| is_long_tool_text(input))
+            {
+                let title = input_tab_title;
+                row =
+                    row.on_open_input(cx.listener(move |this, _event: &ClickEvent, window, cx| {
+                        this.open_claude_code_tool_input(
+                            title.clone(),
+                            input.to_string(),
+                            window,
+                            cx,
+                        );
+                    }));
+            }
             row = row
                 .input(summary.input)
-                .copy_input(matches!(tool_call.kind(), acp_v2::ToolKind::Execute))
+                .copy_input(is_command)
                 .output(output);
             if output_is_long {
                 let tool_call_id = tool_call.id.clone();
@@ -1549,6 +1573,55 @@ impl ThreadView {
             };
             workspace.add_item(pane, Box::new(editor), None, true, true, window, cx);
         });
+    }
+
+    /// Opens a tool call's full input read-only beside the conversation, where its
+    /// output opens too. An input doesn't change once the call runs, so the tab
+    /// isn't kept in sync.
+    fn open_claude_code_tool_input(
+        &mut self,
+        title: SharedString,
+        input: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(workspace), Some(project)) = (self.workspace.upgrade(), self.project.upgrade())
+        else {
+            return;
+        };
+        let create_buffer =
+            project.update(cx, |project, cx| project.create_buffer(None, false, cx));
+        cx.spawn_in(window, async move |_, cx| {
+            let buffer = create_buffer.await?;
+            cx.update(|window, cx| {
+                buffer.update(cx, |buffer, cx| {
+                    buffer.set_text(input, cx);
+                    buffer.set_capability(language::Capability::ReadOnly, cx);
+                });
+                let multibuffer = cx.new(|cx| {
+                    MultiBuffer::singleton(buffer.clone(), cx).with_title(title.to_string())
+                });
+                let editor = cx.new(|cx| {
+                    let mut editor =
+                        Editor::for_multibuffer(multibuffer, Some(project), window, cx);
+                    editor.set_read_only(true);
+                    editor.set_breadcrumb_header(title.to_string());
+                    editor.disable_mouse_wheel_zoom();
+                    editor
+                });
+                workspace.update(cx, |workspace, cx| {
+                    let pane = match workspace.find_pane_in_direction(SplitDirection::Right, cx) {
+                        Some(pane) => pane,
+                        None => {
+                            let active_pane = workspace.active_pane().clone();
+                            workspace.split_pane(active_pane, SplitDirection::Right, window, cx)
+                        }
+                    };
+                    workspace.add_item(pane, Box::new(editor), None, true, true, window, cx);
+                });
+            })
+        })
+        .detach_and_log_err(cx);
     }
 
     fn refresh_claude_code_tool_output(
@@ -2549,6 +2622,120 @@ mod tests {
                 .update(cx, |editor, cx| editor.placeholder_text(cx))
                 .unwrap_or_default()
         })
+    }
+
+    #[gpui::test]
+    async fn test_claude_code_long_tool_input_is_clipped(cx: &mut TestAppContext) {
+        let command = (1..=12)
+            .map(|line| format!("echo line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![acp_v1::SessionUpdate::ToolCall(
+            acp_v1::ToolCall::new("bash-long", "Print twelve lines")
+                .kind(acp_v1::ToolKind::Execute)
+                .status(acp_v1::ToolCallStatus::Completed)
+                .raw_input(json!({ "command": command, "description": "Print twelve lines" }))
+                .meta(acp_v2::Meta::from_iter([(
+                    "claudeCode".into(),
+                    json!({ "toolName": "Bash" }),
+                )])),
+        )]);
+        let (thread_view, cx) = setup_thread_view(connection, cx).await;
+        set_ui_style("claude_code", cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Run it", cx))
+            .await
+            .expect("prompt should succeed");
+        cx.run_until_parked();
+
+        let input = cx
+            .debug_bounds("claude-code-tool-1-input")
+            .expect("the IN row shows");
+        assert!(
+            input.size.height <= px(60.),
+            "Claude Code clips IN to 60px, got {:?}",
+            input.size.height
+        );
+    }
+
+    #[gpui::test]
+    async fn test_claude_code_agent_map_nests_an_agents_own_agents(cx: &mut TestAppContext) {
+        let connection = StubAgentConnection::new();
+        let (thread_view, cx) = setup_thread_view(connection.clone(), cx).await;
+        set_ui_style("claude_code", cx);
+        let (root, project, workspace) = thread_view.read_with(cx, |view, _| {
+            (
+                view.thread.clone(),
+                view.project.upgrade().expect("project"),
+                view.workspace.upgrade().expect("workspace"),
+            )
+        });
+        let root_session_id = root.read_with(cx, |thread, _| thread.session_id().clone());
+        let subagent = |parent: acp_v2::SessionId, session_id: &str, cx: &mut VisualTestContext| {
+            let connection: Rc<dyn acp_thread::AgentConnection> = Rc::new(connection.clone());
+            let project = project.clone();
+            let session_id = acp_v2::SessionId::new(session_id);
+            cx.update(|_, cx| {
+                let action_log = cx.new(|_| action_log::ActionLog::new(project.clone()));
+                cx.new(|cx| {
+                    AcpThread::new(
+                        Some(parent),
+                        None,
+                        None,
+                        connection,
+                        project,
+                        action_log,
+                        session_id,
+                        watch::Receiver::constant(acp_v2::PromptCapabilities::new()),
+                        cx,
+                    )
+                })
+            })
+        };
+        let launcher = subagent(root_session_id.clone(), "launcher", cx);
+        let sibling = subagent(root_session_id, "sibling", cx);
+        let own_agent = subagent(acp_v2::SessionId::new("launcher"), "own-agent", cx);
+        launcher.update(cx, |launcher, cx| {
+            launcher.register_subagent(own_agent.clone(), cx)
+        });
+        root.update(cx, |root, cx| {
+            root.register_subagent(launcher.clone(), cx);
+            root.register_subagent(sibling.clone(), cx);
+        });
+        cx.run_until_parked();
+
+        let thread_view_id = thread_view.entity_id();
+        cx.update(|window, cx| {
+            crate::ui_styles::claude_code::open_agent_map(
+                &workspace,
+                root.clone(),
+                thread_view_id,
+                None,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let launcher_node = cx
+            .debug_bounds("agent-map-agent-launcher")
+            .expect("the agent map shows the launcher");
+        let sibling_node = cx
+            .debug_bounds("agent-map-agent-sibling")
+            .expect("the agent map shows the sibling");
+        let own_agent_node = cx
+            .debug_bounds("agent-map-agent-own-agent")
+            .expect("the agent map shows the launcher's own agent");
+        assert_eq!(
+            launcher_node.origin.x, sibling_node.origin.x,
+            "the session's agents share a column"
+        );
+        assert!(
+            own_agent_node.origin.x > launcher_node.origin.x,
+            "an agent's own agent sits in a column to its right"
+        );
     }
 
     #[gpui::test]

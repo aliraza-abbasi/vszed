@@ -2498,6 +2498,35 @@ pub(crate) struct AgentSummary {
     pub activity: Option<SharedString>,
     pub summary: Option<SharedString>,
     pub error: Option<SharedString>,
+    /// When it started its current run, for the Agent map's order.
+    pub started_at: Option<Instant>,
+    /// When its last run ended; `None` while it works.
+    pub ended_at: Option<Instant>,
+}
+
+/// The order of the Agent map's agents, as Claude Code sorts them: working
+/// agents first, the longest-running on top; then failed ones; then the rest,
+/// the latest to end on top. An agent with no end time goes below those with
+/// one, and a tie goes to the later start.
+pub(crate) fn agent_map_order(left: &AgentSummary, right: &AgentSummary) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let group = |agent: &AgentSummary| match agent.status {
+        AgentStatus::Working => 0,
+        AgentStatus::Failed => 1,
+        AgentStatus::Finished | AgentStatus::Stopped => 2,
+    };
+    group(left).cmp(&group(right)).then_with(|| {
+        if left.status == AgentStatus::Working {
+            return left.started_at.cmp(&right.started_at);
+        }
+        let later_start = right.started_at.cmp(&left.started_at);
+        match (left.ended_at, right.ended_at) {
+            (Some(left_end), Some(right_end)) => right_end.cmp(&left_end).then(later_start),
+            (None, Some(_)) => Ordering::Greater,
+            (Some(_), None) => Ordering::Less,
+            (None, None) => later_start,
+        }
+    })
 }
 
 /// The status dot states of the extension (`statusDot*`).
@@ -2650,6 +2679,11 @@ pub(crate) fn agent_summaries(
                     activity: task.activity.clone().map(SharedString::from),
                     summary: task.summary.clone().map(SharedString::from),
                     error: task.error.clone().map(SharedString::from),
+                    started_at: Some(task.started_at),
+                    ended_at: match task.status {
+                        AgentStatus::Working => None,
+                        _ => task.ended_at,
+                    },
                 })
                 .collect::<Vec<_>>()
         })
@@ -2731,6 +2765,10 @@ fn collect_subagents(
             activity: latest_tool_call,
             summary: None,
             error: None,
+            started_at: times.map(|times| times.started_at),
+            ended_at: times
+                .filter(|_| status != AgentStatus::Working)
+                .map(|times| times.last_activity_at),
         });
         collect_subagents(subagent, Some(key), activity, now, agents, cx);
     }
@@ -3833,6 +3871,8 @@ mod tests {
             activity: task.activity.clone().map(SharedString::from),
             summary: None,
             error: None,
+            started_at: None,
+            ended_at: None,
         };
         assert_eq!(
             summary.background_line(),
@@ -3916,6 +3956,53 @@ mod tests {
     }
 
     #[test]
+    fn test_agent_map_order() {
+        let start = Instant::now();
+        let at = |seconds: u64| Some(start + Duration::from_secs(seconds));
+        let agent = |key: &str, status: AgentStatus, started_at, ended_at| AgentSummary {
+            key: key.to_string().into(),
+            tool_call_id: None,
+            session_id: None,
+            parent_key: None,
+            description: key.to_string().into(),
+            status,
+            waiting: false,
+            backgrounded: true,
+            elapsed: None,
+            total_tokens: None,
+            activity: None,
+            summary: None,
+            error: None,
+            started_at,
+            ended_at,
+        };
+        let mut agents = [
+            agent("ended first", AgentStatus::Finished, at(0), at(10)),
+            agent("working, newer", AgentStatus::Working, at(30), None),
+            agent("failed", AgentStatus::Failed, at(5), at(8)),
+            agent("ended last", AgentStatus::Stopped, at(1), at(40)),
+            agent("working, older", AgentStatus::Working, at(20), None),
+            agent("no end time", AgentStatus::Finished, at(50), None),
+        ];
+        agents.sort_by(agent_map_order);
+        let order = agents
+            .iter()
+            .map(|agent| agent.key.as_ref())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            order,
+            [
+                "working, older",
+                "working, newer",
+                "failed",
+                "ended last",
+                "ended first",
+                "no end time",
+            ]
+        );
+    }
+
+    #[test]
     fn test_agents_chip_dot() {
         let agent = |status: AgentStatus, waiting: bool| AgentSummary {
             key: "agent".into(),
@@ -3931,6 +4018,8 @@ mod tests {
             activity: None,
             summary: None,
             error: None,
+            started_at: None,
+            ended_at: None,
         };
         assert_eq!(
             agents_dot_state(&[agent(AgentStatus::Finished, false)]),

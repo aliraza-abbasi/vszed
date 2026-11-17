@@ -12,7 +12,8 @@ use workspace::{ModalView, Workspace};
 
 use super::{
     AgentStatus, AgentSummary, BackgroundTaskSummary, DotState, StatusDot, agent_count_label,
-    agent_summaries, background_task_summaries, format_token_count, thread_activity,
+    agent_map_order, agent_summaries, background_task_summaries, format_token_count,
+    thread_activity,
 };
 
 const NODE_WIDTH: Pixels = px(300.);
@@ -150,14 +151,17 @@ impl AgentMap {
             .iter()
             .map(|agent| {
                 let key = agent.key.clone();
+                let node_id = SharedString::from(format!("agent-map-agent-{}", agent.key));
+                let node_selector = node_id.to_string();
                 let agent_node = render_node(
-                    SharedString::from(format!("agent-map-agent-{}", agent.key)),
+                    node_id,
                     agent.dot_state(),
                     agent.description.clone(),
                     agent.meta(),
                     false,
                     cx,
                 )
+                .debug_selector(move || node_selector)
                 .tooltip(Tooltip::text(agent.description.clone()))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.select(Selection::Agent(key.clone()), cx);
@@ -205,6 +209,12 @@ impl AgentMap {
                     .push(agent),
                 None => top_level.push(agent),
             }
+        }
+        // Claude Code orders each column the same way, the session's agents and
+        // every agent's own.
+        top_level.sort_by(|left, right| agent_map_order(left, right));
+        for children in children_by_parent.values_mut() {
+            children.sort_by(|left, right| agent_map_order(left, right));
         }
         let session_node = self.render_session_node(cx);
         self.render_subtree(session_node, &top_level, &children_by_parent, cx)
