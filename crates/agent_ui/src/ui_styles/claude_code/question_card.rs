@@ -38,6 +38,9 @@ struct OptionRowContent {
     label: SharedString,
     description: Option<SharedString>,
     selected: bool,
+    /// Drawn under the label and description, like the extension's option
+    /// children: the "Other" field or a typed answer.
+    below_label: Option<AnyElement>,
 }
 
 fn option_marker(multi_select: bool, selected: bool, cx: &App) -> AnyElement {
@@ -95,7 +98,8 @@ fn option_row_body(content: OptionRowContent, cx: &App) -> Div {
                     Label::new(description)
                         .size(LabelSize::Small)
                         .color(Color::Muted)
-                })),
+                }))
+                .children(content.below_label),
         )
 }
 
@@ -327,12 +331,43 @@ impl ThreadView {
                     .flatten()
                     .filter(|_| selected);
                 let is_highlighted = row == highlighted_row && (is_focused || has_previews);
+                let other_field = other_editor.map(|editor| {
+                    div()
+                        .debug_selector(|| "claude-code-question-other-field".into())
+                        .w_full()
+                        .mt_1p5()
+                        .px_2()
+                        .py_1p5()
+                        .rounded(px(4.))
+                        .border_1()
+                        .border_color(colors.border)
+                        .bg(colors.editor_background)
+                        .text_sm()
+                        // The extension's field keeps Escape to itself, and
+                        // Tab moves focus out of it like a browser textarea.
+                        .on_action(|_: &editor::actions::Cancel, _, _| {})
+                        .capture_action(cx.listener(
+                            |this, _: &editor::actions::Tab, window, cx| {
+                                cx.stop_propagation();
+                                this.focus_claude_code_question_card(window, cx);
+                            },
+                        ))
+                        .capture_action(cx.listener(
+                            |this, _: &editor::actions::Backtab, window, cx| {
+                                cx.stop_propagation();
+                                this.focus_claude_code_question_card(window, cx);
+                            },
+                        ))
+                        .child(editor)
+                        .into_any_element()
+                });
                 option_row_body(
                     OptionRowContent {
                         multi_select: question.multi_select,
                         label,
                         description: option.and_then(|option| option.description.clone()),
                         selected,
+                        below_label: other_field,
                     },
                     cx,
                 )
@@ -343,36 +378,6 @@ impl ThreadView {
                 .when(is_highlighted, |this| this.bg(colors.ghost_element_hover))
                 .when(is_highlighted && has_previews, |this| {
                     this.border_l_2().border_color(accent)
-                })
-                .when_some(other_editor, |this, editor| {
-                    this.child(
-                        div()
-                            .w_full()
-                            .mt_1p5()
-                            .px_2()
-                            .py_1p5()
-                            .rounded(px(4.))
-                            .border_1()
-                            .border_color(colors.border)
-                            .bg(colors.editor_background)
-                            .text_sm()
-                            // The extension's field keeps Escape to itself, and
-                            // Tab moves focus out of it like a browser textarea.
-                            .on_action(|_: &editor::actions::Cancel, _, _| {})
-                            .capture_action(cx.listener(
-                                |this, _: &editor::actions::Tab, window, cx| {
-                                    cx.stop_propagation();
-                                    this.focus_claude_code_question_card(window, cx);
-                                },
-                            ))
-                            .capture_action(cx.listener(
-                                |this, _: &editor::actions::Backtab, window, cx| {
-                                    cx.stop_propagation();
-                                    this.focus_claude_code_question_card(window, cx);
-                                },
-                            ))
-                            .child(editor),
-                    )
                 })
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.choose_claude_code_question_row(row, window, cx);
@@ -1062,6 +1067,7 @@ impl ThreadView {
                             label: option.label.clone(),
                             description: option.description.clone(),
                             selected,
+                            below_label: None,
                         },
                         cx,
                     )
@@ -1073,31 +1079,26 @@ impl ThreadView {
                     })
                 });
                 let other_row = reviewed.shows_other().then(|| {
-                    let typed = reviewed.typed.clone();
+                    let typed_answer = reviewed.typed.clone().map(|typed| {
+                        div()
+                            .debug_selector(move || {
+                                format!("claude-code-question-typed-{entry_ix}-{question_ix}")
+                            })
+                            .child(Label::new(typed).size(LabelSize::Small).color(Color::Muted))
+                            .into_any_element()
+                    });
                     option_row_body(
                         OptionRowContent {
                             multi_select: question.multi_select,
                             label: OTHER_LABEL.into(),
                             description: None,
                             selected: true,
+                            below_label: typed_answer,
                         },
                         cx,
                     )
                     .debug_selector(move || {
                         format!("claude-code-question-other-{entry_ix}-{question_ix}")
-                    })
-                    .when_some(typed, |this, typed| {
-                        this.child(
-                            div()
-                                .w_full()
-                                .pl(MARKER_SIZE + px(10.))
-                                .debug_selector(move || {
-                                    format!("claude-code-question-typed-{entry_ix}-{question_ix}")
-                                })
-                                .child(
-                                    Label::new(typed).size(LabelSize::Small).color(Color::Muted),
-                                ),
-                        )
                     })
                 });
                 v_flex()

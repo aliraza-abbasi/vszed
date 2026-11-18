@@ -3522,6 +3522,18 @@ mod tests {
         let other_focused =
             cx.update(|window, cx| other_editor.focus_handle(cx).is_focused(window));
         assert!(other_focused, "the Other field takes focus");
+        let other_row = cx
+            .debug_bounds("claude-code-question-option-2")
+            .expect("the Other row is drawn");
+        let other_field = cx
+            .debug_bounds("claude-code-question-other-field")
+            .expect("the Other field is drawn");
+        assert!(
+            other_field.top() > other_row.top() + px(16.)
+                && other_field.left() > other_row.left() + px(16.)
+                && other_field.right() <= other_row.right(),
+            "the field sits under the Other label, not beside it: row {other_row:?}, field {other_field:?}"
+        );
         cx.simulate_keystrokes("1");
         cx.simulate_input(" SQLite");
         assert_eq!(
@@ -3574,8 +3586,17 @@ mod tests {
             cx,
         );
         assert!(cx.debug_bounds("claude-code-question-status-1").is_some());
-        assert!(cx.debug_bounds("claude-code-question-other-1-0").is_some());
-        assert!(cx.debug_bounds("claude-code-question-typed-1-0").is_some());
+        let answered_other = cx
+            .debug_bounds("claude-code-question-other-1-0")
+            .expect("the answered Other row is drawn");
+        let typed_answer = cx
+            .debug_bounds("claude-code-question-typed-1-0")
+            .expect("the typed answer is drawn");
+        assert!(
+            typed_answer.top() > answered_other.top() + px(16.)
+                && typed_answer.left() > answered_other.left() + px(16.),
+            "the typed answer sits under the Other label: row {answered_other:?}, answer {typed_answer:?}"
+        );
         assert!(
             cx.debug_bounds("claude-code-question-answer-1-0-0")
                 .is_none()
