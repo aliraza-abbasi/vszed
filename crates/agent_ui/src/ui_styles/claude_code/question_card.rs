@@ -498,18 +498,31 @@ impl ThreadView {
             .gap_1()
             .rounded(px(4.))
             .border_1()
-            .border_color(colors.border_variant)
-            .child(Label::new("1").color(Color::Muted))
-            .child(Label::new(SUBMIT_LABEL).weight(FontWeight::MEDIUM))
             .map(|this| {
+                // The extension fills this button only while it has keyboard
+                // focus. vszed fills it with the selection accent as soon as
+                // every question has an answer, so it reads as ready to send.
                 if all_answered {
-                    this.cursor_pointer()
-                        .hover(|style| style.bg(colors.ghost_element_hover))
+                    let on_accent = colors.editor_background;
+                    this.border_color(accent)
+                        .bg(accent)
+                        .child(Label::new("1").color(Color::Custom(on_accent.opacity(0.6))))
+                        .child(
+                            Label::new(SUBMIT_LABEL)
+                                .weight(FontWeight::MEDIUM)
+                                .color(Color::Custom(on_accent)),
+                        )
+                        .cursor_pointer()
+                        .hover(|style| style.opacity(0.9))
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.submit_claude_code_questions(window, cx);
                         }))
                 } else {
-                    this.opacity(0.5).cursor_not_allowed()
+                    this.border_color(colors.border_variant)
+                        .child(Label::new("1").color(Color::Muted))
+                        .child(Label::new(SUBMIT_LABEL).weight(FontWeight::MEDIUM))
+                        .opacity(0.5)
+                        .cursor_not_allowed()
                 }
             });
 
