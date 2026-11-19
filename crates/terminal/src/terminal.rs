@@ -65,11 +65,13 @@ use crate::alacritty::{
     AlacrittyTermConfig, AlacrittyTermLock, HyperlinkMatch, OutputParser, PtySender, RegexSearches,
     append_text_to_term, apply_config, clear_saved_screen, content_text, cursor_blinking,
     cursor_line, display_offset, display_only_term_config, find_from_terminal_point,
-    full_content_range, history_size, last_non_empty_lines, make_content, new_term, open_pty,
+    full_content_range, grid_escape_codes, history_size, last_non_empty_lines, make_content,
+    new_term, open_pty,
     palette_color, pty_options, pty_term_config, renderable_cells, resize, screen_lines,
     scroll_display, scroll_to_point, search_matches, selection_text, set_default_cursor_style,
     set_selection as set_term_selection, shrink_to_used, spawn_event_loop,
-    toggle_vi_mode as toggle_term_vi_mode, total_lines, update_selection as update_term_selection,
+    term_from_escape_codes, toggle_vi_mode as toggle_term_vi_mode, total_lines,
+    update_selection as update_term_selection,
     update_selection_to_vi_cursor, update_vi_cursor_for_scroll, used_lines, vi_goto_point,
     vi_motion,
 };
@@ -1035,6 +1037,8 @@ impl TerminalBuilder {
             output_processor: None,
             output_events_tx: Some(events_tx),
             output_generation: 0,
+            compacted_output: None,
+            drawn: false,
             title_override: None,
             events: VecDeque::with_capacity(10),
             last_content: Content {
@@ -1325,6 +1329,8 @@ impl TerminalBuilder {
                 output_processor: None,
                 output_events_tx: None,
                 output_generation: 0,
+                compacted_output: None,
+                drawn: false,
                 title_override: terminal_title_override,
                 events: VecDeque::with_capacity(10), //Should never get this high.
                 last_content: Default::default(),
@@ -1519,6 +1525,16 @@ enum TerminalType {
     DisplayOnly,
 }
 
+/// A finished display-only terminal's output, kept as the escape codes that rebuild
+/// its grid. ACP agents keep one terminal per command for the whole thread, and an
+/// emulator costs far more than its text.
+struct CompactedOutput {
+    escape_codes: Box<[u8]>,
+    total_lines: usize,
+    used_lines: usize,
+    viewport_lines: usize,
+}
+
 pub struct Terminal {
     terminal_type: TerminalType,
     /// Set for non-PTY terminals (see [`HeadlessTerminal`]); owns the spawned
@@ -1530,6 +1546,11 @@ pub struct Terminal {
     output_processor: Option<OutputParser>,
     output_events_tx: Option<futures::channel::mpsc::UnboundedSender<PtyEvent>>,
     output_generation: u64,
+    /// Set while a finished display-only terminal holds its output in place of an emulator.
+    compacted_output: Option<CompactedOutput>,
+    /// Whether a view has synced this terminal for drawing. A drawn terminal is never
+    /// compacted, so rebuilding it can't reset what someone is looking at.
+    drawn: bool,
     events: VecDeque<InternalEvent>,
     /// This is only used for mouse mode cell change detection
     last_mouse: Option<(Point, SelectionSide)>,
@@ -1993,6 +2014,7 @@ impl Terminal {
 
     /// Terminal byte streams already contain their control sequences and must not be normalized.
     pub fn write_raw_output(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
+        self.rebuild_compacted_output();
         let mut term = self.term.lock();
         self.output_processor
             .get_or_insert_with(OutputParser::new)
@@ -2024,6 +2046,7 @@ impl Terminal {
         self.output_generation = generation;
         self.term = term;
         self.output_processor = None;
+        self.compacted_output = None;
         // The new emulator already has the latest requested size; older resizes can truncate it.
         self.events.clear();
         self.last_content = Content {
@@ -2056,15 +2079,24 @@ impl Terminal {
     }
 
     pub fn total_lines(&self) -> usize {
-        total_lines(&self.term.lock_unfair())
+        match &self.compacted_output {
+            Some(compacted) => compacted.total_lines,
+            None => total_lines(&self.term.lock_unfair()),
+        }
     }
 
     pub fn viewport_lines(&self) -> usize {
-        screen_lines(&self.term.lock_unfair())
+        match &self.compacted_output {
+            Some(compacted) => compacted.viewport_lines,
+            None => screen_lines(&self.term.lock_unfair()),
+        }
     }
 
     pub fn used_lines(&self) -> usize {
-        used_lines(&self.term.lock_unfair())
+        match &self.compacted_output {
+            Some(compacted) => compacted.used_lines,
+            None => used_lines(&self.term.lock_unfair()),
+        }
     }
 
     //To test:
@@ -2118,6 +2150,116 @@ impl Terminal {
 
     pub fn shrink_to_used(&mut self) {
         shrink_to_used(&mut self.term.lock());
+        // Called once a display-only terminal's output is complete. Like a released
+        // PTY, the terminal outlives its command, so drop the parse buffer's
+        // reservation; `write_output` builds a new one if more output arrives.
+        self.output_processor = None;
+    }
+
+    /// Called once a display-only terminal's output is complete: shrinks it, and when
+    /// no view has drawn it, swaps its emulator for the escape codes that rebuild it.
+    /// Drawing it or writing to it rebuilds it as it was; reading its content uses a
+    /// throwaway copy and leaves it compacted.
+    pub fn compact_finished_output(&mut self) {
+        if self.compacted_output.is_some() {
+            return;
+        }
+        self.shrink_to_used();
+        if self.drawn
+            || !matches!(self.terminal_type, TerminalType::DisplayOnly)
+            || self.subprocess.is_some()
+        {
+            return;
+        }
+        let Some(events_tx) = self.output_events_tx.clone() else {
+            return;
+        };
+        let Some(generation) = self.output_generation.checked_add(1) else {
+            return;
+        };
+        let compacted = {
+            let term = self.term.lock_unfair();
+            let Some(escape_codes) = grid_escape_codes(&term) else {
+                return;
+            };
+            CompactedOutput {
+                escape_codes: escape_codes.into_boxed_slice(),
+                total_lines: total_lines(&term),
+                used_lines: used_lines(&term),
+                viewport_lines: screen_lines(&term),
+            }
+        };
+        let bounds = self.last_content.terminal_bounds;
+        let smallest_bounds = TerminalBounds::new(
+            bounds.line_height,
+            bounds.cell_width,
+            Bounds {
+                origin: bounds.bounds.origin,
+                size: Size {
+                    width: bounds.cell_width,
+                    height: bounds.line_height,
+                },
+            },
+        );
+        self.term = new_term(
+            &self.term_config,
+            smallest_bounds,
+            events_tx,
+            self.template.alternate_scroll,
+            generation,
+        );
+        self.output_generation = generation;
+        self.output_processor = None;
+        self.matches.clear();
+        self.last_content = Content {
+            terminal_bounds: bounds,
+            ..Default::default()
+        };
+        self.hyperlink_regex_searches = RegexSearches::new(
+            &self.template.path_hyperlink_regexes,
+            self.template.path_hyperlink_timeout,
+        );
+        self.compacted_output = Some(compacted);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn is_compacted(&self) -> bool {
+        self.compacted_output.is_some()
+    }
+
+    fn rebuild_compacted_output(&mut self) {
+        let Some(compacted) = self.compacted_output.take() else {
+            return;
+        };
+        let (Some(events_tx), Some(generation)) = (
+            self.output_events_tx.clone(),
+            self.output_generation.checked_add(1),
+        ) else {
+            self.compacted_output = Some(compacted);
+            return;
+        };
+        self.term = term_from_escape_codes(
+            &self.term_config,
+            self.last_content.terminal_bounds,
+            events_tx,
+            self.template.alternate_scroll,
+            generation,
+            &compacted.escape_codes,
+        );
+        self.output_generation = generation;
+    }
+
+    /// A throwaway emulator for reading a compacted terminal without rebuilding it.
+    fn compacted_term(&self, compacted: &CompactedOutput) -> Arc<AlacrittyTermLock> {
+        let (events_tx, _) = futures::channel::mpsc::unbounded();
+        term_from_escape_codes(
+            &self.term_config,
+            self.last_content.terminal_bounds,
+            events_tx,
+            self.template.alternate_scroll,
+            0,
+            &compacted.escape_codes,
+        )
     }
 
     pub fn scroll_line_up(&mut self) {
@@ -2493,6 +2635,8 @@ impl Terminal {
     }
 
     pub fn sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.drawn = true;
+        self.rebuild_compacted_output();
         let term = self.term.clone();
         let mut terminal = term.lock_unfair();
         //Note that the ordering of events matters for event processing
@@ -2519,13 +2663,19 @@ impl Terminal {
     }
 
     pub fn get_content(&self) -> String {
-        let term = self.term.lock_unfair();
-        content_text(&term)
+        match &self.compacted_output {
+            Some(compacted) => content_text(&self.compacted_term(compacted).lock_unfair()),
+            None => content_text(&self.term.lock_unfair()),
+        }
     }
 
     pub fn last_n_non_empty_lines(&self, n: usize) -> Vec<String> {
-        let terminal = self.term.lock_unfair();
-        last_non_empty_lines(&terminal, n)
+        match &self.compacted_output {
+            Some(compacted) => {
+                last_non_empty_lines(&self.compacted_term(compacted).lock_unfair(), n)
+            }
+            None => last_non_empty_lines(&self.term.lock_unfair(), n),
+        }
     }
 
     pub fn focus_in(&self) {
@@ -6200,6 +6350,208 @@ mod tests {
             "injecting output after a release should build a new parse buffer"
         );
         assert_content_eventually(&terminal, "injected_after_release", cx).await;
+    }
+
+    /// ACP agents get a display-only terminal per command, and those stay alive
+    /// for the whole thread, so a finished one must not keep its parse buffer.
+    #[gpui::test]
+    async fn test_shrink_to_used_drops_the_parse_buffer(cx: &mut TestAppContext) {
+        let terminal = cx.new(|cx| {
+            TerminalBuilder::new_display_only(
+                SettingsCursorShape::default(),
+                AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .subscribe(cx)
+        });
+
+        terminal.update(cx, |terminal, cx| {
+            terminal.write_output(b"agent_output\n", cx);
+        });
+        assert!(
+            terminal.read_with(cx, |terminal, _| terminal.output_processor.is_some()),
+            "display output should build the parse buffer"
+        );
+
+        terminal.update(cx, |terminal, _| terminal.shrink_to_used());
+        assert!(
+            terminal.read_with(cx, |terminal, _| terminal.output_processor.is_none()),
+            "finishing the output should drop the parse buffer"
+        );
+        assert!(
+            terminal
+                .read_with(cx, |terminal, _| terminal.get_content())
+                .contains("agent_output"),
+            "the finished output should stay visible"
+        );
+
+        terminal.update(cx, |terminal, cx| {
+            terminal.write_output(b"late_output\n", cx);
+        });
+        let content = terminal.read_with(cx, |terminal, _| terminal.get_content());
+        assert!(
+            content.contains("agent_output") && content.contains("late_output"),
+            "output after finishing should append to the same terminal, got: {content}"
+        );
+    }
+
+    type GridCellDump = (char, Color, Color, u16, Option<String>, Vec<char>);
+
+    fn dump_grid(terminal: &Terminal) -> Vec<Vec<GridCellDump>> {
+        use alacritty_terminal::{
+            grid::Dimensions as _,
+            index::{Column, Line},
+        };
+        let term = terminal.term.lock_unfair();
+        let grid = term.grid();
+        (grid.topmost_line().0..=grid.bottommost_line().0)
+            .map(|line| {
+                let row = &grid[Line(line)];
+                (0..grid.columns())
+                    .map(|column| {
+                        let cell = &row[Column(column)];
+                        (
+                            cell.c,
+                            cell.fg,
+                            cell.bg,
+                            cell.flags.bits(),
+                            cell.hyperlink().map(|link| link.uri().to_string()),
+                            cell.zerowidth().map(<[char]>::to_vec).unwrap_or_default(),
+                        )
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn display_terminal(cx: &mut TestAppContext) -> Entity<Terminal> {
+        cx.new(|cx| {
+            TerminalBuilder::new_display_only(
+                SettingsCursorShape::default(),
+                AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .subscribe(cx)
+        })
+    }
+
+    fn styled_display_output() -> Vec<u8> {
+        let mut output = String::new();
+        output.push_str("\x1b[31mred\x1b[0m plain \x1b[91mbright\x1b[0m\r\n");
+        output.push_str(
+            "\x1b[1;2;3;4:3;7;9;38;5;208;48;2;10;20;30;58;2;1;2;3mstyled\x1b[0m \x1b[4:2;8mhidden\x1b[0m\r\n",
+        );
+        output.push_str("wide 日本 e\u{301} done\r\n");
+        output.push_str("tab\there and\tagain\r\n");
+        output.push_str("\x1b]8;id=docs;https://zed.dev\x1b\\link\x1b]8;;\x1b\\ after\r\n");
+        output.push_str(&format!("\x1b[44m{}\x1b[0m\r\n", "w".repeat(250)));
+        for line in 0..20 {
+            output.push_str(&format!("\x1b[3{}mline {line}\x1b[0m\r\n", line % 8));
+        }
+        output.push_str("\x1b[32mpending");
+        output.into_bytes()
+    }
+
+    /// A finished display terminal no view has drawn keeps its output as escape
+    /// codes, and rebuilding it restores every cell: text, colors, attributes,
+    /// wide and zero-width characters, tabs, links, soft wraps and scrollback.
+    #[gpui::test]
+    async fn test_compacting_a_display_terminal_round_trips_its_grid(cx: &mut TestAppContext) {
+        let terminal = display_terminal(cx);
+        terminal.update(cx, |terminal, cx| {
+            terminal.write_raw_output(&styled_display_output(), cx);
+        });
+        let (grid, content, total_lines, used_lines, viewport_lines) =
+            terminal.read_with(cx, |terminal, _| {
+                (
+                    dump_grid(terminal),
+                    terminal.get_content(),
+                    terminal.total_lines(),
+                    terminal.used_lines(),
+                    terminal.viewport_lines(),
+                )
+            });
+        assert!(total_lines > viewport_lines, "the output should scroll");
+
+        terminal.update(cx, |terminal, _| terminal.compact_finished_output());
+        terminal.read_with(cx, |terminal, _| {
+            assert!(terminal.compacted_output.is_some());
+            assert!(terminal.output_processor.is_none());
+            assert_eq!(
+                super::total_lines(&terminal.term.lock_unfair()),
+                1,
+                "the compacted terminal should hold a one-cell emulator"
+            );
+            assert_eq!(terminal.get_content(), content);
+            assert_eq!(terminal.total_lines(), total_lines);
+            assert_eq!(terminal.used_lines(), used_lines);
+            assert_eq!(terminal.viewport_lines(), viewport_lines);
+        });
+
+        terminal.update(cx, |terminal, _| terminal.rebuild_compacted_output());
+        terminal.read_with(cx, |terminal, _| {
+            assert!(terminal.compacted_output.is_none());
+            assert_eq!(dump_grid(terminal), grid);
+            assert_eq!(terminal.get_content(), content);
+            assert_eq!(terminal.total_lines(), total_lines);
+            assert_eq!(terminal.used_lines(), used_lines);
+        });
+    }
+
+    /// Output that arrives after a terminal was compacted lands where the original
+    /// cursor was, in the style it had, exactly as on a terminal never compacted.
+    #[gpui::test]
+    async fn test_output_after_compacting_matches_an_uncompacted_terminal(
+        cx: &mut TestAppContext,
+    ) {
+        let first_output = b"\x1b[33mwarning\x1b[0m: overwritten\rX\x1b[35m";
+        let late_output = b"late\r\nnext line\r\n\x1b[2Aup";
+        let compacted = display_terminal(cx);
+        let uncompacted = display_terminal(cx);
+        for terminal in [&compacted, &uncompacted] {
+            terminal.update(cx, |terminal, cx| {
+                terminal.write_raw_output(first_output, cx);
+            });
+        }
+        compacted.update(cx, |terminal, _| terminal.compact_finished_output());
+        assert!(compacted.read_with(cx, |terminal, _| terminal.compacted_output.is_some()));
+        for terminal in [&compacted, &uncompacted] {
+            terminal.update(cx, |terminal, cx| {
+                terminal.write_raw_output(late_output, cx);
+            });
+        }
+        assert!(compacted.read_with(cx, |terminal, _| terminal.compacted_output.is_none()));
+        assert_eq!(
+            compacted.read_with(cx, |terminal, _| dump_grid(terminal)),
+            uncompacted.read_with(cx, |terminal, _| dump_grid(terminal)),
+        );
+        assert_eq!(
+            compacted.read_with(cx, |terminal, _| terminal.get_content()),
+            uncompacted.read_with(cx, |terminal, _| terminal.get_content()),
+        );
+    }
+
+    /// Rebuilding a terminal someone is looking at would reset its scroll position
+    /// and selection, so once a view has drawn it, it only shrinks.
+    #[gpui::test]
+    async fn test_a_drawn_display_terminal_is_not_compacted(cx: &mut TestAppContext) {
+        let terminal = display_terminal(cx);
+        terminal.update(cx, |terminal, cx| {
+            terminal.write_output(b"visible output\n", cx);
+            terminal.drawn = true;
+            terminal.compact_finished_output();
+        });
+        terminal.read_with(cx, |terminal, _| {
+            assert!(terminal.compacted_output.is_none());
+            assert!(terminal.output_processor.is_none());
+            assert!(terminal.get_content().contains("visible output"));
+        });
     }
 
     mod perf {

@@ -15,7 +15,10 @@ use std::{
     time::{Duration, Instant},
 };
 use url::Url;
-use util::paths::{PathStyle, UrlExt};
+use util::{
+    ResultExt as _,
+    paths::{PathStyle, UrlExt},
+};
 
 use crate::Range;
 
@@ -25,7 +28,9 @@ const WIDE_CHAR_SPACERS: Flags =
         .unwrap();
 
 pub(crate) struct RegexSearches {
-    url_regex: Option<RegexSearch>,
+    /// Compiled on first use: every terminal has one, and most never look for a link,
+    /// while a compiled URL regex holds tens of KB.
+    url_regex: Option<Option<RegexSearch>>,
     path_hyperlink_regexes: Vec<Regex>,
     path_hyperlink_timeout: Duration,
 }
@@ -59,10 +64,16 @@ impl RegexSearches {
         path_hyperlink_timeout: Duration,
     ) -> Self {
         Self {
-            url_regex: RegexSearch::new(URL_REGEX).ok(),
+            url_regex: None,
             path_hyperlink_regexes: Self::path_hyperlink_regexes(path_hyperlink_regexes),
             path_hyperlink_timeout,
         }
+    }
+
+    fn url_regex(&mut self) -> Option<&mut RegexSearch> {
+        self.url_regex
+            .get_or_insert_with(|| RegexSearch::new(URL_REGEX).log_err())
+            .as_mut()
     }
 
     fn path_hyperlink_regexes(
@@ -123,7 +134,7 @@ pub(crate) fn find_from_grid_point<T: EventListener>(
         Some((url, true, url_match))
     } else {
         let (line_start, line_end) = (term.line_search_left(point), term.line_search_right(point));
-        let url_match = regex_searches.url_regex.as_mut().and_then(|url_regex| {
+        let url_match = regex_searches.url_regex().and_then(|url_regex| {
             RegexIter::new(line_start, line_end, AlacDirection::Right, term, url_regex)
                 .find(|rm| rm.contains(&point))
                 .map(|url_match| {
@@ -536,6 +547,17 @@ mod tests {
             assert_eq!(captures.name("line").map(|capture| capture.as_str()), line);
         }
         Ok(())
+    }
+
+    #[test]
+    fn test_url_regex_is_compiled_on_first_use() {
+        let mut searches = RegexSearches::default();
+        assert!(
+            searches.url_regex.is_none(),
+            "a new terminal should not compile the URL regex"
+        );
+        assert!(searches.url_regex().is_some());
+        assert!(searches.url_regex.is_some());
     }
 
     #[test]

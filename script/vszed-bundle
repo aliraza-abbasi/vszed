@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+
+# Builds a vszed app bundle with script/bundle-mac, passing all arguments through
+# (for example `script/vszed-bundle -i` to install into /Applications).
+#
+# Environment variables:
+#   ZED_UPDATE_EXPLANATION  Compiled into the build to turn off Zed's auto-updater, which on
+#                           the stable channel would replace vszed with official Zed. Its text
+#                           is shown by "auto update: check". Defaults to the message below.
+#   MACOS_SIGNING_KEY       Optional code signing identity (a free self-signed certificate
+#                           works). When unset, the bundle is signed ad hoc.
+
+set -euo pipefail
+
+if [[ ! -x script/bundle-mac || ! -f crates/zed/Cargo.toml ]]; then
+    echo "Error: run script/vszed-bundle from the root of the vszed repository" >&2
+    exit 1
+fi
+
+export ZED_UPDATE_EXPLANATION="${ZED_UPDATE_EXPLANATION:-vszed is updated by rebuilding from source. Run 'zed: check for upstream release' to see the latest Zed release.}"
+
+if [[ -n "${MACOS_SIGNING_KEY:-}" ]]; then
+    export MACOS_SIGNING_KEY
+    echo "Signing with the identity in MACOS_SIGNING_KEY"
+else
+    echo "MACOS_SIGNING_KEY is not set, signing ad hoc"
+fi
+
+exec script/bundle-mac "$@"

@@ -1672,6 +1672,7 @@ pub struct Workspace {
     pub(crate) modal_layer: Entity<ModalLayer>,
     toast_layer: Entity<ToastLayer>,
     titlebar_item: Option<AnyView>,
+    leading_item: Option<AnyView>,
     window_tabs_item: Option<AnyView>,
     titlebar_focus_handle: FocusHandle,
     region_focus_handles: RegionFocusHandles,
@@ -2172,6 +2173,7 @@ impl Workspace {
             modal_layer,
             toast_layer,
             titlebar_item: None,
+            leading_item: None,
             window_tabs_item: None,
             titlebar_focus_handle: cx.focus_handle(),
             region_focus_handles: RegionFocusHandles::new(cx),
@@ -3527,6 +3529,17 @@ impl Workspace {
             }
             cx.notify();
         }
+    }
+
+    /// Sets a view rendered as a column to the left of the docks and center,
+    /// between the title bar and the status bar.
+    pub fn set_leading_item(&mut self, item: Option<AnyView>, cx: &mut Context<Self>) {
+        self.leading_item = item;
+        cx.notify();
+    }
+
+    pub fn leading_item(&self) -> Option<AnyView> {
+        self.leading_item.clone()
     }
 
     pub fn set_window_tabs_item(&mut self, item: AnyView, cx: &mut Context<Self>) {
@@ -10260,7 +10273,7 @@ impl Render for Workspace {
                     .relative()
                     .flex_1()
                     .flex()
-                    .flex_col()
+                    .children(self.leading_item.clone())
                     .child(
                         div()
                             .id("workspace")
@@ -10646,12 +10659,12 @@ impl Render for Workspace {
                                 })
                             }))
                             .children(self.render_notifications(window, cx)),
-                    )
-                    .when(self.status_bar_visible(cx), |parent| {
-                        parent.child(self.status_bar.clone())
-                    })
-                    .child(self.toast_layer.clone()),
+                    ),
             )
+            .when(self.status_bar_visible(cx), |parent| {
+                parent.child(self.status_bar.clone())
+            })
+            .child(self.toast_layer.clone())
     }
 }
 
