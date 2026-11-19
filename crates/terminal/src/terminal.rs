@@ -2118,6 +2118,10 @@ impl Terminal {
 
     pub fn shrink_to_used(&mut self) {
         shrink_to_used(&mut self.term.lock());
+        // Called once a display-only terminal's output is complete. Like a released
+        // PTY, the terminal outlives its command, so drop the parse buffer's
+        // reservation; `write_output` builds a new one if more output arrives.
+        self.output_processor = None;
     }
 
     pub fn scroll_line_up(&mut self) {
@@ -6200,6 +6204,52 @@ mod tests {
             "injecting output after a release should build a new parse buffer"
         );
         assert_content_eventually(&terminal, "injected_after_release", cx).await;
+    }
+
+    /// ACP agents get a display-only terminal per command, and those stay alive
+    /// for the whole thread, so a finished one must not keep its parse buffer.
+    #[gpui::test]
+    async fn test_shrink_to_used_drops_the_parse_buffer(cx: &mut TestAppContext) {
+        let terminal = cx.new(|cx| {
+            TerminalBuilder::new_display_only(
+                SettingsCursorShape::default(),
+                AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .subscribe(cx)
+        });
+
+        terminal.update(cx, |terminal, cx| {
+            terminal.write_output(b"agent_output\n", cx);
+        });
+        assert!(
+            terminal.read_with(cx, |terminal, _| terminal.output_processor.is_some()),
+            "display output should build the parse buffer"
+        );
+
+        terminal.update(cx, |terminal, _| terminal.shrink_to_used());
+        assert!(
+            terminal.read_with(cx, |terminal, _| terminal.output_processor.is_none()),
+            "finishing the output should drop the parse buffer"
+        );
+        assert!(
+            terminal
+                .read_with(cx, |terminal, _| terminal.get_content())
+                .contains("agent_output"),
+            "the finished output should stay visible"
+        );
+
+        terminal.update(cx, |terminal, cx| {
+            terminal.write_output(b"late_output\n", cx);
+        });
+        let content = terminal.read_with(cx, |terminal, _| terminal.get_content());
+        assert!(
+            content.contains("agent_output") && content.contains("late_output"),
+            "output after finishing should append to the same terminal, got: {content}"
+        );
     }
 
     mod perf {
