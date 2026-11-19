@@ -684,8 +684,18 @@ impl Terminal {
         if let Some(output) = &self.output {
             // A process may exit before its final output arrives. Refresh the
             // cached content without changing its completion time or status.
+            // The terminal stays uncompacted from here: compacting drops the parser,
+            // and late output can split an escape sequence across chunks.
             self.cache_output(output.exit_status.clone(), output.ended_at, cx);
         }
+    }
+
+    fn compact_finished_display(&mut self, cx: &mut Context<Self>) {
+        if self.is_process_backed() {
+            return;
+        }
+        self.terminal
+            .update(cx, |terminal, _| terminal.compact_finished_output());
     }
 
     pub(crate) fn finish_display(
@@ -699,9 +709,8 @@ impl Terminal {
         if std::mem::replace(&mut state.legacy_exited, true) || self.output.is_some() {
             return;
         }
-        self.terminal
-            .update(cx, |terminal, _| terminal.shrink_to_used());
         self.cache_output(Self::exit_status_from_v1(exit_status), Instant::now(), cx);
+        self.compact_finished_display(cx);
     }
 
     fn exit_status_from_v1(status: acp_v1::TerminalExitStatus) -> acp_v2::TerminalExitStatus {
@@ -829,9 +838,8 @@ impl Terminal {
                     .output
                     .as_ref()
                     .map_or_else(Instant::now, |output| output.ended_at);
-                self.terminal
-                    .update(cx, |terminal, _| terminal.shrink_to_used());
                 self.cache_output(status, ended_at, cx);
+                self.compact_finished_display(cx);
             }
         }
         cx.notify();
