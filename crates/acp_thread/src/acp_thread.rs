@@ -11056,6 +11056,106 @@ mod tests {
         );
     }
 
+    /// Agents keep a display terminal per command for the whole thread, so one that
+    /// exits before anything draws it gives up its emulator but keeps its output.
+    #[gpui::test]
+    async fn test_terminal_exit_compacts_an_undrawn_display_terminal(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(
+                    project,
+                    PathList::new(&[std::path::Path::new(path!("/test"))]),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        let terminal_id = acp_v1::TerminalId::new(uuid::Uuid::new_v4().to_string());
+        let lower = cx.new(|cx| {
+            ::terminal::TerminalBuilder::new_display_only(
+                ::terminal::terminal_settings::CursorShape::default(),
+                ::terminal::terminal_settings::AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .subscribe(cx)
+        });
+        thread.update(cx, |thread, cx| {
+            thread.on_terminal_provider_event(
+                TerminalProviderEvent::Created {
+                    terminal_id: terminal_id.clone(),
+                    label: "cargo test".to_string(),
+                    cwd: None,
+                    output_byte_limit: None,
+                    terminal: lower.clone(),
+                },
+                cx,
+            );
+            thread.on_terminal_provider_event(
+                TerminalProviderEvent::Output {
+                    terminal_id: terminal_id.clone(),
+                    data: b"\x1b[32mtest result: ok\x1b[0m\n".to_vec(),
+                },
+                cx,
+            );
+            thread.on_terminal_provider_event(
+                TerminalProviderEvent::Exit {
+                    terminal_id: terminal_id.clone(),
+                    status: acp_v1::TerminalExitStatus::new().exit_code(0),
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let terminal = thread.read_with(cx, |thread, _| {
+            thread
+                .terminal(acp_v2::TerminalId::new(terminal_id.0.clone()))
+                .expect("display terminal")
+        });
+        terminal.read_with(cx, |terminal, cx| {
+            assert_eq!(terminal.inner(), &lower);
+            assert!(lower.read(cx).is_compacted());
+            assert!(lower.read(cx).get_content().contains("test result: ok"));
+            let output = terminal.current_output(cx);
+            assert!(output.output.contains("test result: ok"));
+            assert_eq!(
+                output.exit_status.and_then(|status| status.exit_code),
+                Some(0)
+            );
+        });
+
+        thread.update(cx, |thread, cx| {
+            thread.on_terminal_provider_event(
+                TerminalProviderEvent::Output {
+                    terminal_id: terminal_id.clone(),
+                    data: b"late line\n".to_vec(),
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        terminal.read_with(cx, |terminal, cx| {
+            assert!(
+                !lower.read(cx).is_compacted(),
+                "late output rebuilds the terminal and keeps it live"
+            );
+            let output = terminal.current_output(cx);
+            assert!(output.output.contains("test result: ok"));
+            assert!(output.output.contains("late line"));
+        });
+    }
+
     #[gpui::test]
     async fn test_terminal_exit_preserves_visible_scrollback(cx: &mut gpui::TestAppContext) {
         init_test(cx);
