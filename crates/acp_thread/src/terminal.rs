@@ -689,8 +689,18 @@ impl Terminal {
         if let Some(output) = &self.output {
             // A process may exit before its final output arrives. Refresh the
             // cached content without changing its completion time or status.
+            // The terminal stays uncompacted from here: compacting drops the parser,
+            // and late output can split an escape sequence across chunks.
             self.cache_output(output.exit_status.clone(), output.ended_at, cx);
         }
+    }
+
+    fn compact_finished_display(&mut self, cx: &mut Context<Self>) {
+        if self.is_process_backed() {
+            return;
+        }
+        self.terminal
+            .update(cx, |terminal, _| terminal.compact_finished_output());
     }
 
     pub(crate) fn finish_display(
@@ -704,9 +714,8 @@ impl Terminal {
         if std::mem::replace(&mut state.legacy_exited, true) || self.output.is_some() {
             return;
         }
-        self.terminal
-            .update(cx, |terminal, _| terminal.shrink_to_used());
         self.cache_output(Self::exit_status_from_v1(exit_status), Instant::now(), cx);
+        self.compact_finished_display(cx);
     }
 
     fn exit_status_from_v1(status: acp_v1::TerminalExitStatus) -> acp_v2::TerminalExitStatus {
@@ -760,8 +769,9 @@ impl Terminal {
             !self.is_process_backed(),
             "Cannot patch a client-owned terminal"
         );
+        let data = end_bare_line_feeds(data);
         self.terminal
-            .update(cx, |terminal, cx| terminal.write_raw_output(data, cx));
+            .update(cx, |terminal, cx| terminal.write_raw_output(&data, cx));
         self.refresh_output(cx);
         cx.notify();
         Ok(())
@@ -793,8 +803,9 @@ impl Terminal {
                 Some(None)
             }
             MaybeUndefined::Value(output) => {
+                let data = end_bare_line_feeds(&output.data);
                 self.terminal.update(cx, |terminal, cx| {
-                    terminal.replace_display_output(&output.data, cx)
+                    terminal.replace_display_output(&data, cx)
                 })?;
                 Some(output.meta)
             }
@@ -834,9 +845,8 @@ impl Terminal {
                     .output
                     .as_ref()
                     .map_or_else(Instant::now, |output| output.ended_at);
-                self.terminal
-                    .update(cx, |terminal, _| terminal.shrink_to_used());
                 self.cache_output(status, ended_at, cx);
+                self.compact_finished_display(cx);
             }
         }
         cx.notify();
@@ -1010,6 +1020,47 @@ pub(crate) fn disable_pagers_through_env(env: &mut collections::HashMap<String, 
     env.insert("PAGER".into(), "".into());
     // Override user core.pager (e.g. delta) which Git prefers over PAGER
     env.insert("GIT_PAGER".into(), "cat".into());
+}
+
+/// Agents such as claude-agent-acp report the captured output of the commands
+/// they run, whose lines end in a bare LF. A terminal emulator only moves down a
+/// row on a bare LF, so each line would start where the previous one ended.
+/// Output that already uses CRLF, as PTY output does, is left as is.
+fn end_bare_line_feeds(data: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    let is_bare_line_feed = |index: usize| {
+        data.get(index) == Some(&b'\n')
+            && index.checked_sub(1).and_then(|previous| data.get(previous)) != Some(&b'\r')
+    };
+    if !(0..data.len()).any(is_bare_line_feed) {
+        return std::borrow::Cow::Borrowed(data);
+    }
+    let mut normalized = Vec::with_capacity(data.len() + data.len() / 8);
+    for (index, byte) in data.iter().enumerate() {
+        if is_bare_line_feed(index) {
+            normalized.push(b'\r');
+        }
+        normalized.push(*byte);
+    }
+    std::borrow::Cow::Owned(normalized)
+}
+
+#[cfg(test)]
+mod display_output_tests {
+    use super::end_bare_line_feeds;
+
+    #[test]
+    fn test_end_bare_line_feeds() {
+        assert_eq!(
+            end_bare_line_feeds(b"On branch main\nclean\n\ndone").as_ref(),
+            b"On branch main\r\nclean\r\n\r\ndone"
+        );
+        assert_eq!(end_bare_line_feeds(b"a\r\nb\r\n").as_ref(), b"a\r\nb\r\n");
+        assert!(matches!(
+            end_bare_line_feeds(b"\x1b[1mbold\x1b[0m"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert_eq!(end_bare_line_feeds(b"\nx").as_ref(), b"\r\nx");
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]

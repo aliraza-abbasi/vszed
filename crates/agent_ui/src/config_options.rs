@@ -82,12 +82,12 @@ fn split_config_options(
 }
 
 pub struct ConfigOptionsView {
-    config_options: Rc<dyn AgentSessionConfigOptions>,
+    pub(crate) config_options: Rc<dyn AgentSessionConfigOptions>,
     selectors: Vec<Entity<ConfigOptionSelector>>,
     has_overflow: bool,
     overflow_menu: PopoverMenuHandle<ContextMenu>,
-    agent_server: Rc<dyn AgentServer>,
-    fs: Arc<dyn Fs>,
+    pub(crate) agent_server: Rc<dyn AgentServer>,
+    pub(crate) fs: Arc<dyn Fs>,
     _refresh_task: Task<()>,
 }
 
@@ -1189,7 +1189,7 @@ fn get_current_select_value(
         })
 }
 
-fn set_config_option_and_default(
+pub(crate) fn set_config_option_and_default(
     config_options: Rc<dyn AgentSessionConfigOptions>,
     agent_server: Rc<dyn AgentServer>,
     config_id: acp::SessionConfigId,

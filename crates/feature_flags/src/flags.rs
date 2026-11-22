@@ -24,6 +24,11 @@ pub struct AcpBetaFeatureFlag;
 impl FeatureFlag for AcpBetaFeatureFlag {
     const NAME: &'static str = "acp-beta";
     type Value = PresenceFlag;
+
+    // vszed: release builds behave like the debug builds they were tested as; tests can turn it off.
+    fn enabled_for_all() -> bool {
+        !cfg!(feature = "test-support")
+    }
 }
 register_feature_flag!(AcpBetaFeatureFlag);
 

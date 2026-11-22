@@ -77,6 +77,10 @@ impl Workspace {
             .any(|(existing_id, _)| existing_id == id)
     }
 
+    pub fn has_notifications(&self) -> bool {
+        !self.notifications.is_empty()
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub fn notification_ids(&self) -> Vec<NotificationId> {
         self.notifications

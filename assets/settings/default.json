@@ -740,6 +740,10 @@
     "current_line_highlight": null,
     // Maximum number of columns to display in the minimap.
     "max_width_columns": 80,
+    // The line height of the minimap, relative to its font size. `null` uses
+    // the `buffer_line_height` setting, `{ "custom": 1.0 }` packs the lines
+    // as tightly as VS Code's minimap does.
+    "line_height": null,
   },
   // Enable middle-click paste on Linux.
   "middle_click_paste": true,

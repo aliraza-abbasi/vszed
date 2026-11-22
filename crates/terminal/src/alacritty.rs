@@ -2,14 +2,14 @@
 use std::num::NonZeroU32;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
-use std::{borrow::Cow, io, ops::RangeInclusive, path::PathBuf, sync::Arc};
+use std::{borrow::Cow, fmt::Write as _, io, ops::RangeInclusive, path::PathBuf, sync::Arc};
 
 mod hyperlinks;
 
 use alacritty_terminal::{
     event::{Event as AlacTermEvent, EventListener, Notify, WindowSize},
     event_loop::{EventLoop, Msg, Notifier},
-    grid::{Dimensions, Grid, GridIterator, Row, Scroll as AlacScroll},
+    grid::{Dimensions, Grid, GridCell, GridIterator, Row, Scroll as AlacScroll},
     index::{Boundary, Column, Direction as AlacDirection, Line, Point as AlacPoint},
     selection::{
         Selection as AlacSelection, SelectionRange as AlacSelectionRange,
@@ -37,7 +37,8 @@ use windows::Win32::{Foundation::HANDLE, System::Threading::GetProcessId};
 
 use crate::{
     Cell, Color, Content, Cursor, CursorShape, GridLinesChange, HoveredWord, Hyperlink,
-    HyperlinkData, IndexedCell, Modes, Point, PtyEvent, Range, RenderableCells, Scroll, Search,
+    HyperlinkData, IndexedCell, Modes, NamedColor, Point, PtyEvent, Range, RenderableCells, Scroll,
+    Search,
     Selection, SelectionRange, SelectionSide, SelectionType, TerminalBackendEvent, TerminalBounds,
     ViMotion,
     pty_info::ProcessIdGetter,
@@ -989,6 +990,232 @@ pub(super) fn content_text(term: &Term<ZedListener>) -> String {
     let start = AlacPoint::new(term.topmost_line(), Column(0));
     let end = AlacPoint::new(term.bottommost_line(), term.last_column());
     term.bounds_to_string(start, end)
+}
+
+/// Alacritty's default tab stops, which a rebuilt emulator starts with.
+const TAB_STOP_WIDTH: usize = 8;
+
+const STYLE_FLAGS: Flags = Flags::from_bits_truncate(
+    Flags::INVERSE.bits()
+        | Flags::BOLD.bits()
+        | Flags::ITALIC.bits()
+        | Flags::DIM.bits()
+        | Flags::HIDDEN.bits()
+        | Flags::STRIKEOUT.bits()
+        | Flags::ALL_UNDERLINES.bits(),
+);
+
+#[derive(Clone, PartialEq)]
+struct CellStyle {
+    foreground: Color,
+    background: Color,
+    flags: Flags,
+    underline_color: Option<Color>,
+}
+
+impl CellStyle {
+    fn plain() -> Self {
+        Self {
+            foreground: Color::Named(NamedColor::Foreground),
+            background: Color::Named(NamedColor::Background),
+            flags: Flags::empty(),
+            underline_color: None,
+        }
+    }
+
+    fn of(cell: &AlacCell) -> Self {
+        Self {
+            foreground: cell.fg,
+            background: cell.bg,
+            flags: cell.flags & STYLE_FLAGS,
+            underline_color: cell.underline_color(),
+        }
+    }
+
+    fn push_sgr(&self, output: &mut String) {
+        output.push_str("\x1b[0");
+        for (flag, code) in [
+            (Flags::BOLD, "1"),
+            (Flags::DIM, "2"),
+            (Flags::ITALIC, "3"),
+            (Flags::UNDERLINE, "4"),
+            (Flags::DOUBLE_UNDERLINE, "4:2"),
+            (Flags::UNDERCURL, "4:3"),
+            (Flags::DOTTED_UNDERLINE, "4:4"),
+            (Flags::DASHED_UNDERLINE, "4:5"),
+            (Flags::INVERSE, "7"),
+            (Flags::HIDDEN, "8"),
+            (Flags::STRIKEOUT, "9"),
+        ] {
+            if self.flags.contains(flag) {
+                output.push(';');
+                output.push_str(code);
+            }
+        }
+        push_sgr_color(output, self.foreground, 30, 90, 38);
+        push_sgr_color(output, self.background, 40, 100, 48);
+        if let Some(underline_color) = self.underline_color {
+            let underline_color = match underline_color {
+                Color::Named(named) if (named as usize) < 16 => Some(Color::Indexed(named as u8)),
+                Color::Named(_) => None,
+                color => Some(color),
+            };
+            if let Some(underline_color) = underline_color {
+                push_sgr_color(output, underline_color, 0, 0, 58);
+            }
+        }
+        output.push('m');
+    }
+}
+
+/// Default colors and the named colors outside the 16-color palette have no SGR
+/// code, and the reset that starts every style already selects the defaults.
+fn push_sgr_color(output: &mut String, color: Color, normal: usize, bright: usize, extended: u8) {
+    match color {
+        Color::Named(named) => {
+            let index = named as usize;
+            if index < 8 {
+                write!(output, ";{}", normal + index).ok();
+            } else if index < 16 {
+                write!(output, ";{}", bright + index - 8).ok();
+            }
+        }
+        Color::Indexed(index) => {
+            write!(output, ";{extended};5;{index}").ok();
+        }
+        Color::Spec(Rgb { r, g, b }) => {
+            write!(output, ";{extended};2;{r};{g};{b}").ok();
+        }
+    }
+}
+
+fn push_hyperlink(output: &mut String, hyperlink: Option<&AlacHyperlink>) {
+    match hyperlink {
+        Some(hyperlink) => {
+            output.push_str("\x1b]8;id=");
+            output.push_str(hyperlink.id());
+            output.push(';');
+            output.push_str(hyperlink.uri());
+            output.push_str("\x1b\\");
+        }
+        None => output.push_str("\x1b]8;;\x1b\\"),
+    }
+}
+
+/// The grid as text plus the SGR and OSC 8 codes that rebuild it in an emulator of
+/// the same size: soft-wrapped rows stay one logical line so they wrap at the same
+/// column again, and the cursor ends on the same line. `None` on the alternate
+/// screen, which has no scrollback to rebuild into.
+pub(super) fn grid_escape_codes(term: &Term<ZedListener>) -> Option<Vec<u8>> {
+    if term.mode().contains(TermMode::ALT_SCREEN) {
+        return None;
+    }
+    let grid = term.grid();
+    let columns = grid.columns();
+    let topmost_line = grid.topmost_line().0;
+    let cursor_line = grid.cursor.point.line.0;
+    let last_line = (topmost_line..=grid.bottommost_line().0)
+        .rev()
+        .find(|&line| !grid[Line(line)].is_clear())
+        .map_or(cursor_line, |line| line.max(cursor_line));
+
+    let plain = CellStyle::plain();
+    let mut output = String::new();
+    let mut current_style = plain.clone();
+    let mut current_hyperlink: Option<AlacHyperlink> = None;
+    for line in topmost_line..=last_line {
+        let row = &grid[Line(line)];
+        let used_columns = (0..columns)
+            .rev()
+            .find(|&column| !row[Column(column)].is_empty())
+            .map_or(0, |column| column + 1);
+        let mut column = 0;
+        while column < used_columns {
+            let cell = &row[Column(column)];
+            column += 1;
+            if cell
+                .flags
+                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+            {
+                continue;
+            }
+            let style = CellStyle::of(cell);
+            if style != current_style {
+                style.push_sgr(&mut output);
+                current_style = style;
+            }
+            let hyperlink = cell.hyperlink();
+            if hyperlink != current_hyperlink {
+                push_hyperlink(&mut output, hyperlink.as_ref());
+                current_hyperlink = hyperlink;
+            }
+            if cell.c == '\t' {
+                // A tab marks only its own cell and moves the cursor to the next stop,
+                // so its blank cells are skipped rather than written as spaces.
+                let next_stop = (column.div_ceil(TAB_STOP_WIDTH) * TAB_STOP_WIDTH)
+                    .min(columns - 1)
+                    .max(column);
+                let skipped_are_blank =
+                    (column..next_stop).all(|skipped| row[Column(skipped)].is_empty());
+                if skipped_are_blank {
+                    output.push('\t');
+                    column = next_stop;
+                } else {
+                    output.push(' ');
+                }
+                continue;
+            }
+            output.push(cell.c);
+            if let Some(zerowidth) = cell.zerowidth() {
+                output.extend(zerowidth);
+            }
+        }
+        let wraps = columns > 0 && row[Column(columns - 1)].flags.contains(Flags::WRAPLINE);
+        if line < last_line && !wraps {
+            // A newline that scrolls fills the new line with the current background.
+            if current_style != plain {
+                plain.push_sgr(&mut output);
+                current_style = plain.clone();
+            }
+            if current_hyperlink.take().is_some() {
+                push_hyperlink(&mut output, None);
+            }
+            output.push_str("\r\n");
+        }
+    }
+    // Output written after a rebuild continues where the original cursor was, in
+    // the style and link it had.
+    let cursor = &grid.cursor;
+    let lines_above_last = last_line - cursor_line;
+    if lines_above_last > 0 {
+        write!(output, "\x1b[{lines_above_last}A").ok();
+    }
+    if !cursor.input_needs_wrap {
+        write!(output, "\x1b[{}G", cursor.point.column.0 + 1).ok();
+    }
+    let cursor_style = CellStyle::of(&cursor.template);
+    if cursor_style != current_style {
+        cursor_style.push_sgr(&mut output);
+    }
+    let cursor_hyperlink = cursor.template.hyperlink();
+    if cursor_hyperlink != current_hyperlink {
+        push_hyperlink(&mut output, cursor_hyperlink.as_ref());
+    }
+    Some(output.into_bytes())
+}
+
+/// An emulator showing the output `grid_escape_codes` recorded from one of `bounds`.
+pub(super) fn term_from_escape_codes(
+    config: &AlacrittyTermConfig,
+    bounds: TerminalBounds,
+    events_tx: UnboundedSender<PtyEvent>,
+    alternate_scroll: AlternateScroll,
+    generation: u64,
+    escape_codes: &[u8],
+) -> Arc<AlacrittyTermLock> {
+    let term = new_term(config, bounds, events_tx, alternate_scroll, generation);
+    OutputParser::new().advance(&mut term.lock(), escape_codes);
+    term
 }
 
 pub(super) fn total_lines(term: &Term<ZedListener>) -> usize {

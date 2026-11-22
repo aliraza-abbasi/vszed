@@ -282,6 +282,7 @@ pub struct Dock {
     restoration: DockRestoreState,
     zoom_layer_open: bool,
     modal_layer: Entity<ModalLayer>,
+    header: Option<AnyView>,
     _subscriptions: [Subscription; 2],
 }
 
@@ -449,6 +450,7 @@ impl Dock {
                 restoration: DockRestoreState::Restoring { pending: None },
                 zoom_layer_open: false,
                 modal_layer,
+                header: None,
             }
         });
 
@@ -919,6 +921,21 @@ impl Dock {
         self.panel_entries.len()
     }
 
+    /// Returns the dock's panels in activation priority order.
+    pub fn panels(&self) -> impl Iterator<Item = &Arc<dyn PanelHandle>> {
+        self.panel_entries.iter().map(|entry| &entry.panel)
+    }
+
+    /// Sets a view rendered above the active panel while the dock is open.
+    pub fn set_header(&mut self, header: Option<AnyView>, cx: &mut Context<Self>) {
+        self.header = header;
+        cx.notify();
+    }
+
+    pub fn header(&self) -> Option<&AnyView> {
+        self.header.as_ref()
+    }
+
     pub fn activate_panel(&mut self, panel_ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         if Some(panel_ix) != self.active_panel_index {
             self.restoration.discard_pending();
@@ -1348,6 +1365,9 @@ impl Render for Dock {
                         .map(|this| match self.position().axis() {
                             Axis::Horizontal => this.w_full().h_full(),
                             Axis::Vertical => this.h_full().w_full(),
+                        })
+                        .when_some(self.header.clone(), |this, header| {
+                            this.flex().flex_col().child(header)
                         })
                         .child(
                             entry

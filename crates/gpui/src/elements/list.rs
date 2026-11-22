@@ -218,6 +218,8 @@ struct ItemLayout {
     index: usize,
     element: AnyElement,
     size: Size<Pixels>,
+    /// An off-screen item that is only rendered so it keeps receiving keyboard input.
+    rendered_for_focus: bool,
 }
 
 /// Frame state used by the [List] element after layout.
@@ -1109,6 +1111,7 @@ impl StateInner {
                         index: item_index,
                         element,
                         size: element_size,
+                        rendered_for_focus: false,
                     });
                     if item.contains_focused(window, cx) {
                         rendered_focused_item = true;
@@ -1149,6 +1152,7 @@ impl StateInner {
                         index: item_index,
                         element,
                         size: element_size,
+                        rendered_for_focus: false,
                     });
                     if item.contains_focused(window, cx) {
                         rendered_focused_item = true;
@@ -1253,6 +1257,7 @@ impl StateInner {
                         index: item_index,
                         element,
                         size,
+                        rendered_for_focus: true,
                     });
                     break;
                 }
@@ -1302,8 +1307,16 @@ impl StateInner {
                 let mut item_origin = bounds.origin + Point::new(padding.left, padding.top);
                 item_origin.y -= layout_response.scroll_top.offset_in_item;
                 for item in &mut layout_response.item_layouts {
+                    // An item rendered only to keep its focus goes below the list, where the
+                    // content mask hides it. Placed right after the last visible item, it
+                    // would show through the list's bottom padding.
+                    let origin = if item.rendered_for_focus {
+                        point(item_origin.x, item_origin.y.max(bounds.bottom()))
+                    } else {
+                        item_origin
+                    };
                     window.with_content_mask(Some(ContentMask { bounds }), |window| {
-                        item.element.prepaint_at(item_origin, window, cx);
+                        item.element.prepaint_at(origin, window, cx);
                     });
 
                     if let Some(autoscroll_bounds) = window.take_autoscroll()
@@ -1311,7 +1324,7 @@ impl StateInner {
                     {
                         if autoscroll_bounds.top() < bounds.top() {
                             let mut item_ix = item.index;
-                            let mut offset_in_item = autoscroll_bounds.top() - item_origin.y;
+                            let mut offset_in_item = autoscroll_bounds.top() - origin.y;
 
                             // The requested top can sit above this item's own
                             // top. Walk into earlier items so the offset stays
@@ -1347,7 +1360,7 @@ impl StateInner {
                             let mut height = bounds.size.height - padding.top - padding.bottom;
 
                             // Account for the height of the element down until the autoscroll bottom.
-                            height -= autoscroll_bounds.bottom() - item_origin.y;
+                            height -= autoscroll_bounds.bottom() - origin.y;
 
                             // Keep decreasing the scroll top until we fill all the available space.
                             while height > Pixels::ZERO {
@@ -1749,13 +1762,14 @@ mod test {
 
     use gpui::{ScrollDelta, ScrollEvent};
     use std::cell::{Cell, RefCell};
+    use std::collections::HashMap;
     use std::rc::Rc;
 
     use crate::{
-        self as gpui, AnyElement, AppContext, Bounds, Context, Element, FollowMode,
+        self as gpui, AnyElement, AppContext, Bounds, Context, Element, FocusHandle, FollowMode,
         InteractiveElement, IntoElement, ListOffset, ListSizingBehavior, ListState, ParentElement,
         Pixels, Render, Styled, TestAppContext, VisualTestContext, Window, canvas, div, list,
-        point, px, size,
+        point, prelude::FluentBuilder as _, px, size,
     };
 
     #[gpui::test]
@@ -3560,6 +3574,86 @@ mod test {
             "follow_tail should re-engage when the user drags the scrollbar to \
              the bottom of its track, even when content has grown during the drag \
              (so frozen_bottom < live_bottom)"
+        );
+    }
+
+    /// A focused item scrolled out of view is still rendered so it keeps receiving
+    /// keyboard input, but it must not show up in the list's bottom padding.
+    #[gpui::test]
+    fn test_offscreen_focused_item_stays_out_of_bottom_padding(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+
+        // Ten 50px items in a 200px list with 100px of bottom padding: scrolled to
+        // the end, items 8 and 9 fill the space above the padding.
+        let state = ListState::new(10, crate::ListAlignment::Top, px(0.));
+        let focus_handles = cx.update(|_, cx| {
+            (0..10)
+                .map(|_| cx.focus_handle())
+                .collect::<Vec<FocusHandle>>()
+        });
+        state.splice_focusable(0..10, focus_handles.iter().cloned().map(Some));
+        let item_bounds = Rc::new(RefCell::new(HashMap::new()));
+
+        struct TestView {
+            state: ListState,
+            focus_handles: Vec<FocusHandle>,
+            item_bounds: Rc<RefCell<HashMap<usize, Bounds<Pixels>>>>,
+        }
+        impl Render for TestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let focus_handles = self.focus_handles.clone();
+                let item_bounds = self.item_bounds.clone();
+                list(self.state.clone(), move |index, _, _| {
+                    let item_bounds = item_bounds.clone();
+                    div()
+                        .h(px(50.))
+                        .w_full()
+                        .when_some(focus_handles.get(index), |this, focus_handle| {
+                            this.track_focus(focus_handle)
+                        })
+                        .child(
+                            canvas(
+                                move |bounds, _, _| {
+                                    item_bounds.borrow_mut().insert(index, bounds);
+                                },
+                                |_, _, _, _| {},
+                            )
+                            .size_full(),
+                        )
+                        .into_any()
+                })
+                .pb(px(100.))
+                .w_full()
+                .h_full()
+            }
+        }
+
+        let view = cx.update(|_, cx| {
+            cx.new(|_| TestView {
+                state: state.clone(),
+                focus_handles: focus_handles.clone(),
+                item_bounds: item_bounds.clone(),
+            })
+        });
+        state.set_follow_mode(FollowMode::Tail);
+        cx.update(|window, cx| window.focus(&focus_handles[0], cx));
+
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(200.)), |_, _| {
+            view.clone().into_any_element()
+        });
+
+        let item_bounds = item_bounds.borrow();
+        assert_eq!(
+            item_bounds.get(&9).map(|bounds| bounds.top()),
+            Some(px(50.)),
+            "the last item sits just above the padding"
+        );
+        let focused_bounds = item_bounds
+            .get(&0)
+            .expect("the off-screen focused item is still rendered");
+        assert!(
+            focused_bounds.top() >= px(200.),
+            "the off-screen focused item must be below the list, got {focused_bounds:?}"
         );
     }
 
