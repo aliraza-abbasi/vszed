@@ -1002,10 +1002,11 @@ fn build_mode_menu(
                         Label::new(description.clone()).into_any_element()
                     })
                 })
-                .handler(move |_, cx| {
+                .handler(move |window, cx| {
                     config_options.set(
                         config_id.clone(),
                         acp_v2::SessionConfigOptionValue::id(value.clone()),
+                        window,
                         cx,
                     );
                 }),

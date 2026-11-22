@@ -2930,13 +2930,19 @@ mod tests {
                 })
                 .expect("workspace")
         };
+        let status_item_is_drawn = |cx: &mut VisualTestContext| {
+            cx.run_until_parked();
+            cx.debug_bounds("claude-code-status-item").is_some()
+        };
         assert!(!has_status_item(cx));
         set_ui_style("claude_code", cx);
-        cx.run_until_parked();
         assert!(has_status_item(cx));
+        assert!(status_item_is_drawn(cx));
+        // The status bar can't remove an item, so switching back hides it.
         set_ui_style("zed", cx);
-        cx.run_until_parked();
-        assert!(!has_status_item(cx));
+        assert!(!status_item_is_drawn(cx));
+        set_ui_style("claude_code", cx);
+        assert!(status_item_is_drawn(cx));
     }
 
     #[gpui::test]

@@ -33,9 +33,9 @@ use chrono::{DateTime, Datelike as _, Local};
 use collections::{HashMap, HashSet};
 use editor::Editor;
 use gpui::{
-    Animation, AnimationExt as _, AnyView, App, Context, ElementId, Entity, EntityId, FocusHandle,
-    Focusable as _, Global, Hsla, Pixels, Subscription, TextStyle, WeakEntity, pulsating_between,
-    px, rgba,
+    Animation, AnimationExt as _, AnyView, App, Context, ElementId, Empty, Entity, EntityId,
+    FocusHandle, Focusable as _, Global, Hsla, Pixels, Subscription, TextStyle, WeakEntity,
+    pulsating_between, px, rgba,
 };
 use language::Buffer;
 use markdown::{MarkdownFont, MarkdownStyle};
@@ -2954,28 +2954,38 @@ pub(crate) struct ClaudeCodeStatusItem {
 }
 
 impl Render for ClaudeCodeStatusItem {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !super::claude_code_style_enabled(cx) {
+            return Empty.into_any_element();
+        }
         let workspace = self.workspace.clone();
-        Button::new("claude-code-status-item", "Claude Code")
-            .label_size(LabelSize::Small)
-            .color(Color::Muted)
-            .start_icon(
-                Icon::new(IconName::AiClaude)
-                    .size(IconSize::XSmall)
-                    .color(Color::Muted),
+        div()
+            .debug_selector(|| "claude-code-status-item".into())
+            .child(
+                Button::new("claude-code-status-item", "Claude Code")
+                    .label_size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .start_icon(
+                        Icon::new(IconName::AiClaude)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .tooltip(ui::Tooltip::text("Open Claude Code"))
+                    .on_click(move |_, window, cx| {
+                        let workspace = workspace.clone();
+                        // The click can arrive while the workspace is updating its status bar.
+                        window.defer(cx, move |window, cx| {
+                            workspace
+                                .update(cx, |workspace, cx| {
+                                    super::thread_item::focus_or_open_thread_tab(
+                                        workspace, window, cx,
+                                    );
+                                })
+                                .log_err();
+                        });
+                    }),
             )
-            .tooltip(ui::Tooltip::text("Open Claude Code"))
-            .on_click(move |_, window, cx| {
-                let workspace = workspace.clone();
-                // The click can arrive while the workspace is updating its status bar.
-                window.defer(cx, move |window, cx| {
-                    workspace
-                        .update(cx, |workspace, cx| {
-                            super::thread_item::focus_or_open_thread_tab(workspace, window, cx);
-                        })
-                        .log_err();
-                });
-            })
+            .into_any_element()
     }
 }
 
@@ -2995,23 +3005,19 @@ impl StatusItemView for ClaudeCodeStatusItem {
 }
 
 fn sync_status_item(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
-    let enabled = super::claude_code_style_enabled(cx);
     let status_bar = workspace.status_bar().clone();
-    let position = status_bar
-        .read(cx)
-        .position_of_item::<ClaudeCodeStatusItem>();
-    match (enabled, position) {
-        (true, None) => {
+    match status_bar.read(cx).item_of_type::<ClaudeCodeStatusItem>() {
+        // The status bar can't remove an item, so once added it hides itself
+        // while the style is off.
+        Some(item) => item.update(cx, |_, cx| cx.notify()),
+        None if super::claude_code_style_enabled(cx) => {
             let workspace = cx.weak_entity();
             let item = cx.new(|_| ClaudeCodeStatusItem { workspace });
             status_bar.update(cx, |status_bar, cx| {
                 status_bar.add_right_item(item, window, cx);
             });
         }
-        (false, Some(position)) => {
-            status_bar.update(cx, |status_bar, cx| status_bar.remove_item_at(position, cx));
-        }
-        _ => {}
+        None => {}
     }
 }
 

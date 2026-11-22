@@ -39,6 +39,7 @@ impl ConfigOptionsHandle {
         &self,
         config_id: acp_v2::SessionConfigId,
         value: acp_v2::SessionConfigOptionValue,
+        window: &Window,
         cx: &mut App,
     ) {
         set_config_option_and_default(
@@ -47,6 +48,7 @@ impl ConfigOptionsHandle {
             config_id,
             value,
             self.fs.clone(),
+            window,
             cx,
         )
         .detach_and_log_err(cx);
@@ -137,7 +139,12 @@ impl ClaudeCodeModelPicker {
         items
     }
 
-    fn select_model(&mut self, value: acp_v2::SessionConfigValueId, cx: &mut Context<Self>) {
+    fn select_model(
+        &mut self,
+        value: acp_v2::SessionConfigValueId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let options = self.config_options.options();
         if let Some(model) =
             first_select_option(&options, &acp_v2::SessionConfigOptionCategory::Model)
@@ -146,13 +153,19 @@ impl ClaudeCodeModelPicker {
             self.config_options.set(
                 model.config_id.clone(),
                 acp_v2::SessionConfigOptionValue::id(value),
+                window,
                 cx,
             );
         }
         cx.emit(DismissEvent);
     }
 
-    fn set_effort(&mut self, level: acp_v2::SessionConfigValueId, cx: &mut Context<Self>) {
+    fn set_effort(
+        &mut self,
+        level: acp_v2::SessionConfigValueId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let options = self.config_options.options();
         if let Some(effort) =
             first_select_option(&options, &acp_v2::SessionConfigOptionCategory::ThoughtLevel)
@@ -161,6 +174,7 @@ impl ClaudeCodeModelPicker {
             self.config_options.set(
                 effort.config_id.clone(),
                 acp_v2::SessionConfigOptionValue::id(level),
+                window,
                 cx,
             );
         }
@@ -169,7 +183,7 @@ impl ClaudeCodeModelPicker {
     }
 
     /// Clicking the Effort row moves to the next level, wrapping around, like Claude Code.
-    fn cycle_effort(&mut self, cx: &mut Context<Self>) {
+    fn cycle_effort(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let options = self.config_options.options();
         let Some(slider) =
             first_select_option(&options, &acp_v2::SessionConfigOptionCategory::ThoughtLevel)
@@ -181,17 +195,18 @@ impl ClaudeCodeModelPicker {
             .current
             .map_or(0, |current| (current + 1) % slider.levels.len());
         if let Some(level) = slider.levels.get(next) {
-            self.set_effort(level.value.clone(), cx);
+            self.set_effort(level.value.clone(), window, cx);
         }
     }
 
-    fn toggle_ultracode(&mut self, cx: &mut Context<Self>) {
+    fn toggle_ultracode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let options = self.config_options.options();
         if let Some((option, enabled)) = ultracode_option(&options)
             && !self.config_options.is_read_only()
             && let Some(value) = toggled_option_value(option, !enabled)
         {
-            self.config_options.set(option.config_id.clone(), value, cx);
+            self.config_options
+                .set(option.config_id.clone(), value, window, cx);
         }
         self.highlighted = Some(PickerItem::Ultracode);
         cx.notify();
@@ -216,11 +231,11 @@ impl ClaudeCodeModelPicker {
         cx.notify();
     }
 
-    fn confirm(&mut self, _: &menu::Confirm, _window: &mut Window, cx: &mut Context<Self>) {
+    fn confirm(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
         match self.highlighted.clone() {
-            Some(PickerItem::Model(value)) => self.select_model(value, cx),
-            Some(PickerItem::Effort) => self.cycle_effort(cx),
-            Some(PickerItem::Ultracode) => self.toggle_ultracode(cx),
+            Some(PickerItem::Model(value)) => self.select_model(value, window, cx),
+            Some(PickerItem::Effort) => self.cycle_effort(window, cx),
+            Some(PickerItem::Ultracode) => self.toggle_ultracode(window, cx),
             None => cx.emit(DismissEvent),
         }
     }
@@ -290,8 +305,8 @@ impl Render for ClaudeCodeModelPicker {
                         cx.notify();
                     }
                 }))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.select_model(value.clone(), cx);
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.select_model(value.clone(), window, cx);
                 }))
                 .child(
                     v_flex()
@@ -337,7 +352,7 @@ impl Render for ClaudeCodeModelPicker {
                         cx.notify();
                     }
                 }))
-                .on_click(cx.listener(|this, _, _, cx| this.cycle_effort(cx)))
+                .on_click(cx.listener(|this, _, window, cx| this.cycle_effort(window, cx)))
                 .child(
                     h_flex()
                         .gap_1()
@@ -354,9 +369,9 @@ impl Render for ClaudeCodeModelPicker {
                                     .id(("claude-code-effort-level", index))
                                     .flex_1()
                                     .h_full()
-                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                    .on_click(cx.listener(move |this, _, window, cx| {
                                         cx.stop_propagation();
-                                        this.set_effort(level.value.clone(), cx);
+                                        this.set_effort(level.value.clone(), window, cx);
                                     }))
                             })),
                     ),
@@ -384,14 +399,14 @@ impl Render for ClaudeCodeModelPicker {
                         cx.notify();
                     }
                 }))
-                .on_click(cx.listener(|this, _, _, cx| this.toggle_ultracode(cx)))
+                .on_click(cx.listener(|this, _, window, cx| this.toggle_ultracode(window, cx)))
                 .child(Label::new("Ultracode"))
                 .child(
                     Switch::new("claude-code-ultracode-switch", ToggleState::from(enabled))
-                        .on_click(cx.listener(|this, _, _, cx| {
+                        .on_click(cx.listener(|this, _, window, cx| {
                             // The row would toggle it back.
                             cx.stop_propagation();
-                            this.toggle_ultracode(cx);
+                            this.toggle_ultracode(window, cx);
                         })),
                 )
         });
