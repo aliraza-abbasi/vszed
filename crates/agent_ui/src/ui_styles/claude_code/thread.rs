@@ -2089,6 +2089,74 @@ mod tests {
         assert_eq!(summaries_shown(cx), [false; 3]);
     }
 
+    /// Claude Code lets a thought open as soon as its text starts streaming, and
+    /// close again, while Claude is still thinking.
+    #[gpui::test]
+    async fn test_claude_code_streaming_thought_opens_and_closes(cx: &mut TestAppContext) {
+        let connection = StubAgentConnection::new();
+        let (thread_view, cx) = setup_thread_view(connection.clone(), cx).await;
+        set_ui_style("claude_code", cx);
+        let session_id = start_open_turn(&thread_view, cx).await;
+        cx.update(|_window, cx| {
+            connection.send_update(
+                session_id.clone(),
+                acp_v1::SessionUpdate::AgentThoughtChunk(acp_v1::ContentChunk::new(
+                    "Weighing what the user means.".into(),
+                )),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert!(
+            thread_view.read_with(cx, |view, cx| matches!(
+                view.thread.read(cx).status(),
+                ThreadStatus::Generating
+            )),
+            "the thought is still streaming"
+        );
+
+        // Thinking keeps streaming between the press and the release.
+        let click = |cx: &mut VisualTestContext| {
+            let bounds = cx
+                .debug_bounds("claude-code-thought-1-0")
+                .expect("thought header");
+            cx.simulate_mouse_down(
+                bounds.center(),
+                gpui::MouseButton::Left,
+                gpui::Modifiers::default(),
+            );
+            for _ in 0..3 {
+                cx.update(|_window, cx| {
+                    connection.send_update(
+                        session_id.clone(),
+                        acp_v1::SessionUpdate::AgentThoughtChunk(acp_v1::ContentChunk::new(
+                            " Still weighing it.".into(),
+                        )),
+                        cx,
+                    );
+                });
+                cx.run_until_parked();
+            }
+            cx.simulate_mouse_up(
+                bounds.center(),
+                gpui::MouseButton::Left,
+                gpui::Modifiers::default(),
+            );
+            cx.run_until_parked();
+        };
+        assert!(cx.debug_bounds("claude-code-thought-summary-1-0").is_none());
+        click(cx);
+        assert!(
+            cx.debug_bounds("claude-code-thought-summary-1-0").is_some(),
+            "a streaming thought opens"
+        );
+        click(cx);
+        assert!(
+            cx.debug_bounds("claude-code-thought-summary-1-0").is_none(),
+            "a streaming thought closes"
+        );
+    }
+
     fn claude_tool_call(
         id: &str,
         tool: &str,
