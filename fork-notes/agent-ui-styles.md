@@ -126,6 +126,7 @@ Notes:
   the card asks; other forms (MCP servers, the refusal fallback, URLs) keep Zed's form. Card
   state, what the user answered or declined (`question_outcomes`, by tool call id) and
   collapsed rows live in `ThreadActivity`.
-- Status bar item: `ClaudeCodeStatusItem` (`claude_code.rs`), added to and removed from every
-  workspace's status bar by a settings observer, like the sessions panel. Clicking it runs
-  `thread_item::focus_or_open_thread_tab`.
+- Status bar item: `ClaudeCodeStatusItem` (`claude_code.rs`), added to a workspace's status bar
+  by a settings observer the first time the style is on. Upstream's status bar can't remove an
+  item (#67219 dropped `position_of_item`/`remove_item_at`), so it draws nothing while the style
+  is off. Clicking it runs `thread_item::focus_or_open_thread_tab`.
