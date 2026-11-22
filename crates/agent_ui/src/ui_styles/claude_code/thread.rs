@@ -83,9 +83,13 @@ fn wavy_line(cx: &App) -> AnyElement {
 impl ThreadView {
     pub(super) fn render_claude_code_entries(&mut self, cx: &mut Context<Self>) -> List {
         // Claude Code's transcript spans the whole editor width, so Zed's
-        // `max_content_width` doesn't apply.
-        let centered_container = move |content: AnyElement| {
+        // `max_content_width` doesn't apply. A list doesn't give its items their
+        // own element ids, so each item gets one: rows of different entries
+        // share ids, such as every turn's first thought, and would otherwise
+        // share click and hover state.
+        let centered_container = move |index: usize, content: AnyElement| {
             h_flex()
+                .id(("claude-code-list-item", index))
                 .w_full()
                 .justify_center()
                 .child(div().w_full().child(content))
@@ -105,9 +109,10 @@ impl ThreadView {
                 if let Some(entry) = entries.get(index) {
                     let rendered =
                         this.render_claude_code_entry(index, entries.len(), entry, window, cx);
-                    centered_container(rendered).into_any_element()
+                    centered_container(index, rendered).into_any_element()
                 } else if this.generating_indicator_in_list {
-                    centered_container(this.render_claude_code_generating(cx)).into_any_element()
+                    centered_container(index, this.render_claude_code_generating(cx))
+                        .into_any_element()
                 } else {
                     Empty.into_any()
                 }
@@ -896,7 +901,9 @@ impl ThreadView {
             .filter_map(|(chunk_ix, chunk)| match chunk {
                 AssistantMessageChunk::Message { block, .. } => {
                     block.visible_content(cx).then(|| {
+                        // Its content blocks number from 0 in every chunk.
                         v_flex()
+                            .id(("claude-code-message-chunk", chunk_ix))
                             .w_full()
                             .gap_1()
                             .children(
@@ -2087,6 +2094,60 @@ mod tests {
         );
         click("claude-code-thought-1-4", cx);
         assert_eq!(summaries_shown(cx), [false; 3]);
+    }
+
+    /// A list doesn't give its items their own element ids, and every turn's
+    /// first thought is chunk 0 of its entry. With several turns on screen, a
+    /// thought must still open and close on a click.
+    #[gpui::test]
+    async fn test_claude_code_thought_toggles_with_several_turns_on_screen(
+        cx: &mut TestAppContext,
+    ) {
+        let connection = StubAgentConnection::new();
+        let (thread_view, cx) = setup_thread_view(connection.clone(), cx).await;
+        set_ui_style("claude_code", cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let answer = "A long answer line.\n\n".repeat(8);
+        for turn in 0..12 {
+            let thought_text = format!("Thought number {turn}.");
+            connection.set_next_prompt_updates(vec![
+                acp_v1::SessionUpdate::AgentThoughtChunk(acp_v1::ContentChunk::new(
+                    thought_text.as_str().into(),
+                )),
+                acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(
+                    answer.as_str().into(),
+                )),
+            ]);
+            thread
+                .update(cx, |thread, cx| thread.send_raw("go", cx))
+                .await
+                .expect("prompt should succeed");
+            cx.run_until_parked();
+        }
+
+        // Each turn adds a user message and an assistant message, so the last
+        // turns' thoughts are entries 21 and 23.
+        assert!(
+            cx.debug_bounds("claude-code-thought-21-0").is_some(),
+            "more than one turn's thought is on screen"
+        );
+        let click_last_thought = |cx: &mut VisualTestContext| {
+            let header = cx
+                .debug_bounds("claude-code-thought-23-0")
+                .expect("the last thought is drawn");
+            cx.simulate_click(header.center(), gpui::Modifiers::default());
+            cx.run_until_parked();
+        };
+        click_last_thought(cx);
+        assert!(
+            cx.debug_bounds("claude-code-thought-summary-23-0").is_some(),
+            "a click opens the thoughts"
+        );
+        click_last_thought(cx);
+        assert!(
+            cx.debug_bounds("claude-code-thought-summary-23-0").is_none(),
+            "a second click closes them"
+        );
     }
 
     /// Claude Code lets a thought open as soon as its text starts streaming, and
